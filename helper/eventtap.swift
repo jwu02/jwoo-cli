@@ -388,7 +388,7 @@ func usage() -> Never {
 			  (no flags)    stream raw input events as JSON lines on stdout
 			  --self-check  print one sample of each event type and exit
 			  --preflight   report the Input Monitoring grant and exit
-			  --request     ask macOS for Input Monitoring, then stream
+			  --request     ask macOS for Input Monitoring, report it, and exit
 
 			"""
 				.utf8))
@@ -431,9 +431,14 @@ guard arguments.isSubset(of: knownArguments) else {
 }
 
 /*
-Both report-only modes exit here, before a run loop or a tap exists. Neither
-can prompt, which is what lets the CLI ask on a startup path with no one at the
-keyboard to answer a TCC dialog.
+All three report-only modes exit here, before a run loop or a tap exists.
+
+`--self-check` and `--preflight` cannot prompt, which is what lets the CLI ask
+on a startup path with no one at the keyboard to answer a TCC dialog.
+`--request` is the one that does prompt — a background job cannot answer a TCC
+dialog, so a first run has to be at the keyboard (ADR-0002) — and it then
+reports the grant exactly as `--preflight` does, so the caller has one shape to
+read rather than two.
 */
 if arguments.contains("--self-check") {
 	selfCheck()
@@ -445,17 +450,24 @@ if arguments.contains("--preflight") {
 	exit(0)
 }
 
-mainRunLoop = CFRunLoopGetCurrent()
-
 /*
---request is the only path that prompts. A background job cannot answer a TCC
-prompt, so first run has to be at the keyboard (ADR-0002); everything else
-queries silently.
+Requested before the grant is read, because having just shown the prompt is the
+whole point of this mode.
+
+This exits rather than falling through to a tap, and that is load-bearing
+rather than tidy: the caller spawns this to raise a dialog and does not keep
+the process. A run that fell through would leave a capture helper holding a
+listen-only tap with nobody reading its stdout — the leak the EventStream's
+`stop()` exists to prevent, on the one path that never reaches it.
 */
 if arguments.contains("--request") {
 	note("requesting Input Monitoring — macOS should be showing a prompt")
 	CGRequestListenEventAccess()
+	preflight()
+	exit(0)
 }
+
+mainRunLoop = CFRunLoopGetCurrent()
 
 let access = IOHIDCheckAccess(listenEvent)
 let name = accessName(access)
