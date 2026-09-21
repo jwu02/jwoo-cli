@@ -39,8 +39,19 @@ system zone.
 
 ```console
 $ npm run build
-$ node --env-file=.env dist/cli.js
+$ node --env-file=.env dist/cli.js              # the dashboard
+$ node --env-file=.env dist/cli.js collect      # collect, without the dashboard
+$ node --env-file=.env dist/cli.js permissions  # report the macOS grants
 ```
+
+`collect` is a subcommand rather than a key inside the dashboard, because collection is not
+something that only exists inside a rendered Ink tree (ADR-0001). It runs in the foreground and
+stops when it exits — there is no background process. `SIGINT` and `SIGTERM` both end with a
+final Flush, so quitting does not lose the counters accumulated since the last Flush Interval.
+
+A missing macOS permission degrades collection rather than stopping the CLI: the Collectors it
+affects are disabled and named, and everything else carries on. `permissions` reports the same
+preflight on its own, as a question you can ask without collecting anything.
 
 ## Native helper
 
@@ -55,11 +66,18 @@ Monitoring**, and only that: a listen-only tap never needs Accessibility.
 ```console
 $ ./helper/bin/eventtap            # stream raw events
 $ ./helper/bin/eventtap --request  # ask macOS for Input Monitoring first
+$ ./helper/bin/eventtap --preflight    # report the grant as one JSON line and exit
 $ ./helper/bin/eventtap --self-check   # print one sample of each event type and exit
 ```
 
 If the grant is missing the helper prints a JSON error line and exits, rather than crashing or
 going quiet. Grant it in System Settings → Privacy & Security → Input Monitoring.
+
+`--preflight` is what the CLI's permission preflight calls. It asks `IOHIDCheckAccess` — the
+check ADR-0006 recorded as the only one to trust — and exits 0 whatever the answer, because a
+denied grant is the caller's ordinary case to report on rather than this process's failure.
+Neither report-only mode prompts, so the CLI can ask on a startup path with nobody at the
+keyboard.
 
 Rebuild it after changing `helper/eventtap.swift`, and commit the rebuilt binary alongside:
 

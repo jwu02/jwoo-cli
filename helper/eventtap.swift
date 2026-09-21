@@ -203,6 +203,48 @@ func emitError(code: String, message: String) {
 	emit(["type": "error", "code": code, "message": message])
 }
 
+// MARK: - Permissions
+
+/*
+IOHIDAccessType, and the name for it. `unknown` is a real third state rather
+than a stand-in for denied: TCC answers it before it has a record either way.
+*/
+func accessName(_ access: IOHIDAccessType) -> String {
+	switch access {
+	case accessGranted: return "granted"
+	case accessDenied: return "denied"
+	default: return "unknown"
+	}
+}
+
+/*
+The grant, as the CLI's preflight needs it.
+
+`IOHIDCheckAccess` rather than `AXIsProcessTrusted` or
+`CGPreflightPostEventAccess`, which the spike in ADR-0006 recorded as agreeing
+with it only because the grant happened to be present. It is queried silently:
+nothing here prompts, because the caller may be installing or starting without
+anyone at the keyboard.
+*/
+func preflight() {
+	let access = IOHIDCheckAccess(listenEvent)
+	let name = accessName(access)
+
+	/*
+	A denied or unknown grant is the CLI's normal case to report on, not this
+	process's failure: the exit code is 0 whatever the answer. Only an
+	unrecognised answer would be worth a non-zero code, and there is none —
+	`accessName` has a case for every value.
+	*/
+	emit([
+		"type": "preflight",
+		"inputMonitoring": name,
+		"message": access == accessGranted
+			? "Input Monitoring is granted."
+			: "Input Monitoring is \(name) for this helper. Grant it in System Settings > Privacy & Security > Input Monitoring.",
+	])
+}
+
 func note(_ message: String) {
 	FileHandle.standardError.write(Data("[eventtap] \(message)\n".utf8))
 }
@@ -341,10 +383,11 @@ func usage() -> Never {
 	FileHandle.standardError.write(
 		Data(
 			"""
-			usage: eventtap [--self-check] [--request]
+			usage: eventtap [--self-check] [--preflight] [--request]
 
 			  (no flags)    stream raw input events as JSON lines on stdout
 			  --self-check  print one sample of each event type and exit
+			  --preflight   report the Input Monitoring grant and exit
 			  --request     ask macOS for Input Monitoring, then stream
 
 			"""
@@ -382,13 +425,23 @@ the failed write itself is what notices and exits (see `emit`).
 signal(SIGPIPE, SIG_IGN)
 
 let arguments = Set(CommandLine.arguments.dropFirst())
-let knownArguments: Set<String> = ["--self-check", "--request"]
+let knownArguments: Set<String> = ["--self-check", "--preflight", "--request"]
 guard arguments.isSubset(of: knownArguments) else {
 	usage()
 }
 
+/*
+Both report-only modes exit here, before a run loop or a tap exists. Neither
+can prompt, which is what lets the CLI ask on a startup path with no one at the
+keyboard to answer a TCC dialog.
+*/
 if arguments.contains("--self-check") {
 	selfCheck()
+	exit(0)
+}
+
+if arguments.contains("--preflight") {
+	preflight()
 	exit(0)
 }
 
@@ -405,20 +458,15 @@ if arguments.contains("--request") {
 }
 
 let access = IOHIDCheckAccess(listenEvent)
-let accessName: String
-switch access {
-case accessGranted: accessName = "granted"
-case accessDenied: accessName = "denied"
-default: accessName = "unknown"
-}
+let name = accessName(access)
 
-note("Input Monitoring: \(accessName)")
+note("Input Monitoring: \(name)")
 
 guard access == accessGranted else {
 	emitError(
 		code: "inputMonitoringDenied",
 		message:
-			"Input Monitoring is \(accessName) for this helper. Grant it in System Settings > Privacy & Security > Input Monitoring, then run again."
+			"Input Monitoring is \(name) for this helper. Grant it in System Settings > Privacy & Security > Input Monitoring, then run again."
 	)
 	exit(2)
 }
@@ -449,7 +497,7 @@ guard let tap = eventTap else {
 	emitError(
 		code: "tapCreationFailed",
 		message:
-			"CGEvent.tapCreate returned nil with Input Monitoring \(accessName). The tap could not be created."
+			"CGEvent.tapCreate returned nil with Input Monitoring \(name). The tap could not be created."
 	)
 	exit(3)
 }

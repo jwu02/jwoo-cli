@@ -21,15 +21,17 @@ misleading loader error when it is used. Prepend the pinned version:
 export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 ```
 
-| Command                            | What it does                                                          |
-| ---------------------------------- | --------------------------------------------------------------------- |
-| `npm test`                         | The whole gate: prettier `--check`, `xo`, `tsc --noEmit`, then `ava`. |
-| `npx ava source/state.test.ts`     | One test file.                                                        |
-| `npx ava --match 'click counters'` | One test by name.                                                     |
-| `npm run build`                    | `tsc --project tsconfig.build.json` → `dist/`, tests excluded.        |
-| `npm run dev`                      | The same build, in watch mode.                                        |
-| `node --env-file=.env dist/cli.js` | Run the TUI. Needs `MONGO_URI`; see `.env.example`.                   |
-| `./helper/build.sh`                | Rebuild the native capture helper. Needs Xcode CLI tools.             |
+| Command                                        | What it does                                                          |
+| ---------------------------------------------- | --------------------------------------------------------------------- |
+| `npm test`                                     | The whole gate: prettier `--check`, `xo`, `tsc --noEmit`, then `ava`. |
+| `npx ava source/state.test.ts`                 | One test file.                                                        |
+| `npx ava --match 'click counters'`             | One test by name.                                                     |
+| `npm run build`                                | `tsc --project tsconfig.build.json` → `dist/`, tests excluded.        |
+| `npm run dev`                                  | The same build, in watch mode.                                        |
+| `node --env-file=.env dist/cli.js`             | Run the dashboard. Needs `MONGO_URI`; see `.env.example`.             |
+| `node --env-file=.env dist/cli.js collect`     | Collect and Flush, with no TUI.                                       |
+| `node --env-file=.env dist/cli.js permissions` | Report the macOS grants and exit.                                     |
+| `./helper/build.sh`                            | Rebuild the native capture helper. Needs Xcode CLI tools.             |
 
 The helper is not part of `npm test`: `prettier` and `xo` do not read `.swift`, so the JS gate
 neither checks nor covers it. Build it by hand after changing it and commit the binary with the
@@ -61,16 +63,60 @@ The narrow types are deliberately faithful about async-ness, and that is load-be
 is _synchronous_ because the driver's is — the `await` belongs on `toArray()`. A fake that lied
 about either would let a missing `await` pass every test while losing data against a real server.
 
-`cli.tsx` is the composition root and the only place a `MongoClient` is built. It owns the
-client's lifetime and closes it in a `finally` around `waitUntilExit()`, because a client left
-open keeps the process alive after the TUI has exited.
+`main.tsx` is the composition root and the only place a `MongoClient` is built. It owns the
+client's lifetime and closes it on every path, because a client left open keeps the process
+alive after the work has finished. `cli.tsx` is only the entry point above it: it parses argv
+and reports a failure's message rather than its stack.
+
+### Three subcommands, and no others
+
+`args.ts` parses argv into exactly three commands: no argument opens the dashboard, `collect`
+runs collection headlessly, `permissions` reports the macOS grants. Parsing is a pure function
+of argv, so what a command line means is testable without a process — `cli.tsx` is what hands it
+the real `process.argv` and lets meow exit on a bad one.
+
+A bare `dashboard` is not a second spelling of the default, and there are no flags to forward:
+`allowUnknownFlags` is off, so a typo'd `--dry-run` is refused rather than silently ignored.
+That refusal is meow's and happens by exiting, which is why the one test covering it runs the
+entry point in a child process — in-process it would take the test runner down with it.
+
+The collector must not be reachable only through the TUI (ADR-0001), which is why `collect` is a
+subcommand and not a key. `main.tsx` reaches `tui.tsx` — the module that imports ink and react —
+through a dynamic import, so a headless run never loads either.
+
+### The permission preflight degrades, it does not stop
+
+`permissions.ts` asks the helper (`--preflight`) rather than checking anything itself, because
+`IOHIDCheckAccess` is the check ADR-0006 says to trust and the grant follows an ancestor process
+rather than this script's path. A missing grant comes back as a report naming the Collectors it
+disables; the composition root then builds fewer Collectors. Nothing exits on `disabled`.
+
+It throws only when the helper cannot be _asked_ — a missing binary, a crash, a hang. That is a
+broken install, not a missing permission, and the two must not be confused.
 
 ### The read path is built; the collection path is not
 
-Only the history view is wired up. The native capture helper exists (`helper/`, issue #6) but
-nothing spawns it yet, and there is still no Collector — that is issue #7. Nothing calls
-`flush()` outside the tests. `TelemetryState`, the storage seam, the aggregation pipelines, and
-the Key Label table (`key-labels.ts`) are ported and tested.
+The history view is wired up. The native capture helper exists (`helper/`, issue #6), but there
+is still no Collector and nothing spawns the helper — that is issue #7. `cli.tsx`'s factory
+returns no Collectors, so `collect` starts, reports the grant, and waits for a signal with
+nothing to Flush. `TelemetryState`, the storage seam, the aggregation pipelines, and the Key
+Label table (`key-labels.ts`) are ported and tested.
+
+`session.ts` is where the Flush Interval and the final Flush live. It is a plain module with
+`run()`/`stop()`, and `run()` resolves only once the final Flush and the close have finished —
+`await`ing it is a complete shutdown, not the start of one. The signal listeners are released
+_after_ the run rather than inside the handler, so a second Ctrl-C cannot cut a Flush short.
+
+**A Flush in flight blocks the final one.** Telemetry State is cleared only after a successful
+write, so a Flush still waiting on the database has not cleared it — and a final Flush started
+alongside would snapshot the same counters and insert them twice. `stop()` awaits the in-flight
+Flush first. `Shutdown.finalFlush` then reports whether the counters actually made it, and
+`main.tsx` sets a non-zero exit code when they did not, because a shell reads the exit code and
+not the log.
+
+The shutdown source is injectable. `processSignal` is the real one and the only place
+`process.on` is called; a test raises a signal through a fake, because a real SIGTERM inside the
+suite would take ava down with it.
 
 `snapshot()` and `clear()` are separate methods on purpose: Telemetry State is cleared only
 after a successful Flush, which is what makes retrying the same interval possible. A failed
@@ -102,6 +148,12 @@ silence, so a consumer can tell "no input" from "no permission". `--self-check` 
 of each event type and exits without creating a tap — it is the only way to check the wire format
 with no permission and no live input, and it asserts the event mask has not drifted.
 
+`--preflight` prints the Input Monitoring grant as one JSON line and exits **0 whatever the
+answer**, because a denied grant is the caller's ordinary case to report on rather than this
+process's failure. Both report-only modes exit before a run loop or a tap exists, so neither can
+prompt — which is what lets the CLI ask on a startup path with nobody at the keyboard. It is the
+only permission check the helper makes, and `permissions.ts` is its only caller.
+
 ### Time arithmetic is the subtle part
 
 `local-time.ts` and `ranges.ts` exist because a local day is not always 24 hours. Boundaries are
@@ -121,11 +173,15 @@ is the output a test asserts against.
 
 ### React layering
 
-The TUI is Ink 7 on React 19, and the `.tsx` extension marks the whole of it: `cli.tsx`,
+The TUI is Ink 7 on React 19, and the `.tsx` extension marks the whole of it: `tui.tsx`,
 `app.tsx`, `history-view.tsx` and `use-history.ts` are the only modules that import `ink` or
 `react`. Everything else is plain TypeScript, which is what ADR-0001 requires of the Collector
 so that the move to a separate process is a different entry point rather than a rewrite. Tests
 render through `ink-testing-library`.
+
+`main.tsx` also carries the `.tsx` extension and imports neither ink nor react; it reaches
+`tui.tsx` dynamically. That is a constraint to keep, not a coincidence: a module on the
+`collect` path that started importing ink statically would drag it into a headless run.
 
 `use-history.ts` holds the loading state machine — three states rather than a value plus a flag,
 because "nothing yet", "nothing there" and "could not ask" draw completely differently — while

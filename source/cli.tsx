@@ -1,41 +1,36 @@
 #!/usr/bin/env node
-import process from 'node:process';
-import {render} from 'ink';
-import App from './app.js';
-import {loadConfig} from './config.js';
-import {MongoHistorySource} from './history.js';
-
 /*
-The composition root.
+The entry point.
 
-Argument parsing, the subcommand structure and the permission preflight arrive
-with #8; collection is not wired up yet either (#7), so this reads history and
-writes nothing. What it does own is the client: one is built here and closed
-here, because a `MongoClient` left open keeps the process alive after the TUI
-has gone.
+Argument parsing, the subcommands and the permission preflight live behind it;
+what is left here is deciding what a command line means and what a failure
+prints. A `ConfigError` or a `PreflightError` is reported rather than thrown:
+its message is the useful part, and a stack trace is not.
 
   Usage
-    $ jwoo-cli
+    $ jwoo-cli            the dashboard: history, read from Atlas
+    $ jwoo-cli collect    collect input and Flush it, without the dashboard
+    $ jwoo-cli permissions  report the macOS grants collection needs
 */
-async function main(): Promise<void> {
-	const source = new MongoHistorySource(loadConfig());
 
-	try {
-		const instance = render(<App source={source} />);
-		// Quitting is not the only way out — Ctrl-C takes the default path —
-		// so the client is released on any exit, not just `q`.
-		await instance.waitUntilExit();
-	} finally {
-		await source.close();
-	}
-}
+import process from 'node:process';
+import {parseArguments} from './args.js';
+import {type CollectorFactory, run} from './main.js';
+import {HelperPermissionSource} from './permissions.js';
 
 /*
-Reported rather than thrown. A missing `MONGO_URI` is a configuration mistake,
-and a stack trace is not the useful part of that message.
+Nothing builds Collectors yet: there is no way to read the helper's event stream
+and nothing calls `TelemetryState`'s increment helpers outside the tests (#7).
+The factory is the seam that issue fills in, and until it does, `collect` starts,
+reports the grant, and waits for a signal with nothing to Flush.
 */
+const collectorsFrom: CollectorFactory = _report => [];
+
 try {
-	await main();
+	await run(parseArguments(), {
+		permissions: new HelperPermissionSource(),
+		collectors: collectorsFrom,
+	});
 } catch (error: unknown) {
 	process.stderr.write(
 		`${error instanceof Error ? error.message : String(error)}\n`,
