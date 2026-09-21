@@ -20,7 +20,11 @@ repo impossible to clone and run.
 
 - The TCC grant attaches to a stable helper path instead of the `node` binary. This matters: nvm
   and fnm change the resolved `node` path on every version bump, silently invalidating the grant.
-- A listen-only tap needs only Input Monitoring, a much lighter ask than Accessibility.
+  **Qualified by ADR-0006:** the spike observed the grant following the helper to a path TCC had
+  never seen, which suggests it is attributed to an ancestor process and inherited rather than
+  resolved per-helper-path. Not yet confirmed — see that ADR before designing a preflight on it.
+- A listen-only tap needs only Input Monitoring, a much lighter ask than Accessibility. Confirmed
+  by ADR-0006.
 - Observing Fn is possible; synthesising it is not. macOS discards userland-posted Fn events.
 - The helper needs a one-time interactive permission grant. A background job cannot answer a TCC
   prompt, so first run must be at the keyboard.
