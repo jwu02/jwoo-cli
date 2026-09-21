@@ -29,6 +29,11 @@ export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 | `npm run build`                    | `tsc --project tsconfig.build.json` → `dist/`, tests excluded.        |
 | `npm run dev`                      | The same build, in watch mode.                                        |
 | `node --env-file=.env dist/cli.js` | Run the TUI. Needs `MONGO_URI`; see `.env.example`.                   |
+| `./helper/build.sh`                | Rebuild the native capture helper. Needs Xcode CLI tools.             |
+
+The helper is not part of `npm test`: `prettier` and `xo` do not read `.swift`, so the JS gate
+neither checks nor covers it. Build it by hand after changing it and commit the binary with the
+source.
 
 One test reads outside this repo: `key-labels.test.ts` imports `jwoo/lib/telemetry/key-layout.ts`
 to check the Key Label wire format against the website's reader. `jwoo` has to be checked out
@@ -62,14 +67,40 @@ open keeps the process alive after the TUI has exited.
 
 ### The read path is built; the collection path is not
 
-Only the history view is wired up. There is no Collector and no native capture helper yet — those
-are issues #6 and #7 — and nothing calls `flush()` outside the tests. `TelemetryState`, the
-storage seam, the aggregation pipelines, and the Key Label table (`key-labels.ts`) are ported and
-tested.
+Only the history view is wired up. The native capture helper exists (`helper/`, issue #6) but
+nothing spawns it yet, and there is still no Collector — that is issue #7. Nothing calls
+`flush()` outside the tests. `TelemetryState`, the storage seam, the aggregation pipelines, and
+the Key Label table (`key-labels.ts`) are ported and tested.
 
 `snapshot()` and `clear()` are separate methods on purpose: Telemetry State is cleared only
 after a successful Flush, which is what makes retrying the same interval possible. A failed
 Flush returns `undefined` and leaves the state intact.
+
+### The native helper emits raw events and nothing else
+
+`helper/eventtap.swift` owns a listen-only `CGEventTap` and prints one JSON event per line on
+stdout — keycode, `flagsRaw`, `timestampNs`, mouse position and button. It is built by
+`helper/build.sh` and the binary is committed, because requiring Xcode CLI tools on install would
+make the repo impossible to clone and run (ADR-0002).
+
+**`flagsRaw` is emitted uninterpreted on purpose.** The measured trap (ADR-0006) is that
+F1–F12 set `kCGEventFlagMaskSecondaryFn` too, so their raw flags are byte-identical to a bare Fn
+press — `0x800100`. Fn is identifiable _only_ as keycode 63 on a `flagsChanged` event; nothing
+may infer it from the flag bit. Any decoding rule added to `eventtap.swift` would be untestable
+here, and belongs in TypeScript instead (ADR-0003):
+
+- **The helper never maps a keycode to a Key Label.** It has no label table and does not know
+  what a Key Label is; `key-labels.ts` does that on the TypeScript side.
+- **It does no DPI conversion.** `TelemetryState.addMouseMovement(pixels)` takes pixels and
+  applies `MOUSE_DPI` itself.
+- **It does not de-duplicate auto-repeat**, even though macOS exposes
+  `kCGKeyboardEventAutorepeat`. A held-keys set in TypeScript is testable against synthetic
+  events; a flag is not.
+
+Failures are reported as a JSON line with a `type` of `error` and a non-zero exit, never as
+silence, so a consumer can tell "no input" from "no permission". `--self-check` prints one sample
+of each event type and exits without creating a tap — it is the only way to check the wire format
+with no permission and no live input, and it asserts the event mask has not drifted.
 
 ### Time arithmetic is the subtle part
 

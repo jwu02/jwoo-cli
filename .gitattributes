@@ -1,1 +1,5 @@
 * text=auto eol=lf
+
+# The capture helper's built binary. Committed on purpose (ADR-0002), but it is
+# not text: line-ending normalisation would corrupt it.
+helper/bin/eventtap binary
