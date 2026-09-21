@@ -1,29 +1,10 @@
 #!/usr/bin/env node
-import React from 'react';
 import {render} from 'ink';
-import meow from 'meow';
 import App from './app.js';
 
-const cli = meow(
-	`
-	Usage
-	  $ jwoo-cli
-
-	Options
-		--name  Your name
-
-	Examples
-	  $ jwoo-cli --name=Jane
-	  Hello, Jane
-`,
-	{
-		importMeta: import.meta,
-		flags: {
-			name: {
-				type: 'string',
-			},
-		},
-	},
-);
-
-render(<App name={cli.flags.name} />);
+// Argument parsing arrives with the CLI structure (#8). Until then the entry
+// point is just the TUI:
+//
+//   Usage
+//     $ jwoo-cli
+render(<App />);
