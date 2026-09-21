@@ -5,7 +5,13 @@
 		"rootDir": "source",
 		// Iterator helpers (Iterator#reduce, #toArray, #toSorted) target the
 		// `esnext` runtime by default but are real in Node 22.
-		"lib": ["DOM", "DOM.Iterable", "ES2023", "ESNext.Iterator"]
+		"lib": ["DOM", "DOM.Iterable", "ES2023", "ESNext.Iterator"],
+		// TypeScript 6 no longer pulls `@types` packages in automatically, so
+		// `import process from 'node:process'` resolves to nothing without this.
+		// Listing it here rather than leaning on a transitive copy: the build
+		// program excludes the tests, and it was only the tests' dependency on
+		// ava's globals that used to drag `@types/node` in by accident.
+		"types": ["node"]
 	},
 	"include": ["source"]
 }

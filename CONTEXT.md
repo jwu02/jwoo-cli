@@ -46,7 +46,7 @@ _Avoid_: movement, mouse movement
 
 **Heatmap**:
 The rendering of Key Counts as a coloured keyboard. A presentation of Key Counts, not the
-counts themselves.
+counts themselves. The website's rendering; the CLI draws a Key Ranking instead — see below.
 
 ### Accumulation and persistence
 
@@ -79,6 +79,27 @@ Key Labels map onto Physical Keys; the reader discards any label it does not rec
 error.
 _Avoid_: using Physical Key for a Key Label or vice versa — they are different identities either
 side of a one-way mapping
+
+Note that the mapping is the _website's_ reader. The CLI has no `key-layout.ts` and no Physical
+Key: it ranks Key Labels as they arrive, so a label the website would discard still appears here.
+
+## The history view
+
+**Range**:
+The interval the history view shows: Today, from local midnight, or This week, from local Monday
+midnight. Calendar-aligned in the viewer's own timezone rather than a rolling window, and the
+unit the reader buckets in — hourly for Today, daily for This week.
+_Avoid_: period, window, span, timeframe (and "24h"/"30d", which are the website's rolling
+ranges rather than these)
+
+**Key Ranking**:
+The rendering of Key Counts as a list ordered by count, each Key Label drawn as a bar proportional
+to the largest count and labelled with its own. A presentation of Key Counts, not the counts
+themselves, and the CLI's rendering where the website's is a Heatmap. It is **not** a Heatmap: it
+draws no keyboard, so it does not need the Label → Physical Key mapping, and it orders by count
+where Key Counts order by label.
+_Avoid_: leaderboard, top keys, keyboard heatmap, and Heatmap itself — the two render the same
+Key Counts and are still different things
 
 ## Deliberately absent
 

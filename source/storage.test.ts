@@ -110,6 +110,7 @@ const config: Config = {
 	mouseDpi: 72,
 	collectionTtlSeconds: 31_536_000,
 	heatmapTtlSeconds: 2_592_000,
+	timeZone: 'UTC',
 };
 
 function stateWithActivity() {

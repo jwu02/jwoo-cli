@@ -8,6 +8,7 @@ means, and the loader stays a pure function of its input.
 */
 
 import process from 'node:process';
+import {isValidTimeZone} from './local-time.js';
 
 export class ConfigError extends Error {
 	override readonly name = 'ConfigError';
@@ -22,6 +23,14 @@ export type Config = {
 	readonly mouseDpi: number;
 	readonly collectionTtlSeconds: number;
 	readonly heatmapTtlSeconds: number;
+	/*
+	The zone the history view buckets its days and hours in. Resolved rather
+	than read straight from `TZ`, because the two ways that can go wrong are
+	silent: `resolvedOptions().timeZone` is typed `string` but is `undefined`
+	when `TZ` names something Intl cannot resolve, and `Etc/Unknown` when `TZ`
+	is empty.
+	*/
+	readonly timeZone: string;
 };
 
 const ONE_YEAR_IN_SECONDS = 31_536_000;
@@ -71,5 +80,21 @@ export function loadConfig(env: Environment = process.env): Config {
 		mouseDpi: positiveInteger(env['MOUSE_DPI'], 72, 'MOUSE_DPI'),
 		collectionTtlSeconds: ONE_YEAR_IN_SECONDS,
 		heatmapTtlSeconds: THIRTY_DAYS_IN_SECONDS,
+		timeZone: resolveTimeZone(env),
 	};
+}
+
+/*
+`TZ` first, then whatever the machine reports, then UTC. Each candidate is
+checked before it is taken, so a bad value degrades to the next one instead of
+reaching a formatter that would throw on it.
+*/
+function resolveTimeZone(env: Environment): string {
+	const declared = env['TZ'];
+	if (isValidTimeZone(declared)) {
+		return declared;
+	}
+
+	const system = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+	return isValidTimeZone(system) ? system : 'UTC';
 }

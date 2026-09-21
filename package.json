@@ -28,6 +28,7 @@
 	},
 	"devDependencies": {
 		"@sindresorhus/tsconfig": "^8.1.0",
+		"@types/node": "^22.20.4",
 		"@types/react": "^19.3.0",
 		"@vdemedes/prettier-config": "^2.0.1",
 		"ava": "^8.0.1",
