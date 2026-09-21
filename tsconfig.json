@@ -2,7 +2,10 @@
 	"extends": "@sindresorhus/tsconfig",
 	"compilerOptions": {
 		"outDir": "dist",
-		"rootDir": "source"
+		"rootDir": "source",
+		// Iterator helpers (Iterator#reduce, #toArray, #toSorted) target the
+		// `esnext` runtime by default but are real in Node 22.
+		"lib": ["DOM", "DOM.Iterable", "ES2023", "ESNext.Iterator"]
 	},
 	"include": ["source"]
 }

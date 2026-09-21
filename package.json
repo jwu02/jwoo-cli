@@ -23,6 +23,7 @@
 	],
 	"dependencies": {
 		"ink": "^7.1.1",
+		"mongodb": "^7.6.0",
 		"react": "^19.3.0"
 	},
 	"devDependencies": {
