@@ -1,6 +1,5 @@
 import test from 'ava';
 import {
-	HELPER_PATH,
 	type HelperPreflight,
 	HelperPermissionSource,
 	type PermissionReport,
@@ -129,8 +128,4 @@ test('a helper that cannot be run is an error, not a missing permission', async 
 	});
 
 	await t.throwsAsync(source.preflight(), {instanceOf: PreflightError});
-});
-
-test('the helper path is the committed binary beside the source', t => {
-	t.true(HELPER_PATH.endsWith('helper/bin/eventtap'));
 });

@@ -27,6 +27,21 @@ export type Collector = {
 };
 
 /*
+The helper's event stream, as much of it as the Session needs: it starts and
+stops, and nothing else is its business.
+
+Narrow on purpose, and declared here rather than alongside the implementation
+for the same reason `storage.ts` declares its own slice of the driver — the
+Session's job is owning a lifetime, and it should not need to know that there is
+a child process at the other end of it. A test can hand it a stand-in without
+spawning anything.
+*/
+export type EventStream = {
+	start(): void;
+	stop(): void;
+};
+
+/*
 What a shutdown looks like once it has finished, rather than the moment it
 arrives: the signal that caused it, and whether the counters made it to storage
 on the way out. `finalFlush` false means Telemetry State was still holding
@@ -95,6 +110,12 @@ export type SessionOptions = {
 	not one this Session has to know to skip.
 	*/
 	readonly collectors: readonly Collector[];
+	/*
+	Started alongside the Collectors and stopped alongside them, because the
+	events have to be flowing before anything is listening and the capture
+	process must not outlive the run.
+	*/
+	readonly stream?: EventStream;
 	readonly flushIntervalSeconds: number;
 	readonly shutdown: ShutdownSignal;
 	readonly logger?: Pick<Console, 'warn'>;
@@ -109,6 +130,7 @@ export class CollectionSession {
 	readonly #store: TelemetryStore;
 	readonly #state: TelemetryState;
 	readonly #collectors: readonly Collector[];
+	readonly #stream: EventStream | undefined;
 	readonly #intervalMs: number;
 	readonly #shutdown: ShutdownSignal;
 	readonly #logger: Pick<Console, 'warn'>;
@@ -137,6 +159,7 @@ export class CollectionSession {
 		this.#store = options.store;
 		this.#state = options.state;
 		this.#collectors = options.collectors;
+		this.#stream = options.stream;
 		this.#intervalMs = options.flushIntervalSeconds * 1000;
 		this.#shutdown = options.shutdown;
 		this.#logger = options.logger ?? console;
@@ -217,6 +240,14 @@ export class CollectionSession {
 	*/
 	async run(): Promise<Shutdown> {
 		try {
+			/*
+			The stream first, so the helper is already producing by the time a
+			Collector is listening. Starting it the other way round would drop
+			whatever arrived in between, and losing input is the one thing a
+			Collector must not do quietly.
+			*/
+			this.#stream?.start();
+
 			for (const collector of this.#collectors) {
 				collector.start();
 				this.#started += 1;
@@ -247,6 +278,18 @@ export class CollectionSession {
 
 		this.#ended = true;
 		clearTimeout(this.#timer);
+
+		/*
+		The stream is closed before the Collectors, in the reverse of the order it
+		was opened in. Nothing is then still being produced while the final Flush
+		takes its Snapshot, so the last interval's counts are whole rather than
+		taken mid-arrival.
+
+		Not conditional on any Collector having started: the stream is started
+		before them for exactly that reason, so a Collector that threw on the way
+		up still leaves a helper running if this is skipped.
+		*/
+		this.#stream?.stop();
 
 		// Only the Collectors that actually started, so a Collector that threw on
 		// the way up is not stopped as though it were running.

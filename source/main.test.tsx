@@ -12,9 +12,12 @@ import {
 	type RunOptions,
 	run,
 } from './main.js';
+import {KeyboardCollector} from './keyboard.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
+import {keyEventAt} from './raw-event.js';
 import {
 	type Collector,
+	type EventStream,
 	type ShutdownReason,
 	type ShutdownSignal,
 } from './session.js';
@@ -32,6 +35,13 @@ const CONFIG: Config = {
 	heatmapTtlSeconds: 1,
 	timeZone: 'Europe/London',
 };
+
+/*
+NonCoalesced, which every captured event carried, as `keyboard.test.ts` does.
+Spelled here rather than imported from a test file, which ava would then run
+twice.
+*/
+const BARE = 256;
 
 class FakeStore implements TelemetryStore {
 	readonly snapshots: Array<Record<string, unknown>> = [];
@@ -143,6 +153,21 @@ function logger(): Logger & {lines: string[]; warnings: string[]} {
 	};
 }
 
+/*
+The Session asks a stream to start and stop and nothing else, so a trace of
+those two calls is the whole of what "the Session owned it" means.
+*/
+function tracedStream(trace: string[]): EventStream {
+	return {
+		start() {
+			trace.push('start');
+		},
+		stop() {
+			trace.push('stop');
+		},
+	};
+}
+
 function collector(): Collector & {started: number; stopped: number} {
 	return {
 		started: 0,
@@ -178,7 +203,7 @@ function harness(report: PermissionReport): Harness {
 		reports.push(seen);
 		const built = collector();
 		collectors.push(built);
-		return [built];
+		return {collectors: [built]};
 	};
 
 	return {
@@ -230,10 +255,10 @@ test('a missing grant disables both Collectors without stopping the CLI', async 
 });
 
 /*
-The Flush the issue asks for. Nothing increments Telemetry State yet (#7), so
-this drives the Session's shutdown path directly: what is being asserted is that
-the signal reaches a Flush before the store closes, not where the counters came
-from.
+The Flush the issue asks for. The counters are added straight to Telemetry State
+here, so what is under test is that a signal reaches a Flush before the store
+closes — not where the counting came from. The factory's own half of that is
+covered below.
 */
 test('collect Flushes on shutdown before the store closes', async t => {
 	const test_ = harness(granted());
@@ -251,6 +276,72 @@ test('collect Flushes on shutdown before the store closes', async t => {
 	t.is(test_.store.snapshots.length, 1);
 	t.is(test_.store.snapshots[0]?.['leftClicks'], 1);
 	t.is(test_.store.closed, 1);
+});
+
+/*
+The gap the two tests above leave, and the one that matters most.
+
+Both reach into Telemetry State directly — `test_.options.state?.addLeftClick()`
+— so both would pass a `runCollect` that handed the Collectors a *different*
+state from the one it flushes. That run counts into a state nothing reads, and
+because the Session skips a Flush when its own state shows no activity, it
+writes nothing at all and still reports success.
+
+So this one counts through the factory's own context, using a real Collector,
+and requires the count to come out of the store.
+*/
+test('a Collector counts into the State the Session flushes', async t => {
+	const test_ = harness(granted());
+
+	/*
+	Raised before the run begins, which the fake delivers to the first listener
+	to arrive. That makes the whole run resolve without a race, and the factory
+	has still run by the time it does — so the press below has been counted by
+	the time the final Flush takes its Snapshot.
+	*/
+	test_.shutdown.fire('SIGINT');
+
+	await run(
+		{kind: 'collect'},
+		{
+			...test_.options,
+			collectors(_report, state) {
+				const keyboard = new KeyboardCollector({state});
+				keyboard.handle(keyEventAt('keyDown', 0, BARE));
+				return {collectors: [keyboard]};
+			},
+		},
+	);
+
+	t.is(test_.store.snapshots.length, 1);
+	t.deepEqual(test_.store.snapshots[0]?.['keyCounts'], {A: 1});
+});
+
+/*
+The half of the wiring that is invisible from outside, and the reason a run can
+look healthy while collecting nothing: a factory that builds a stream the
+Session never hears about compiles, starts every Collector, and feeds them no
+events at all.
+
+Deliberately not reached through `options.stream`. That option exists so a test
+can avoid a capture process, and going through it would test the arrangement the
+tests use rather than the one the CLI does.
+*/
+test('a stream the factory supplies is started and stopped by the Session', async t => {
+	const test_ = harness(granted());
+	const trace: string[] = [];
+
+	test_.shutdown.fire('SIGINT');
+
+	await run(
+		{kind: 'collect'},
+		{
+			...test_.options,
+			collectors: () => ({collectors: [], stream: tracedStream(trace)}),
+		},
+	);
+
+	t.deepEqual(trace, ['start', 'stop']);
 });
 
 /*

@@ -2,6 +2,7 @@ import test from 'ava';
 import {
 	type Collector,
 	CollectionSession,
+	type EventStream,
 	type SessionOptions,
 	type ShutdownReason,
 	type ShutdownSignal,
@@ -90,6 +91,7 @@ function build(options: Partial<SessionOptions> = {}): TestSession {
 			store,
 			state,
 			collectors: options.collectors ?? [],
+			stream: options.stream,
 			flushIntervalSeconds: options.flushIntervalSeconds ?? 300,
 			shutdown: signal,
 		}),
@@ -105,6 +107,40 @@ function collector(): Collector & {started: number; stopped: number} {
 		},
 		stop() {
 			this.stopped += 1;
+		},
+	};
+}
+
+/*
+A stand-in for the helper's stream, recording the order it was opened and closed
+relative to the Collectors. Ordering is the whole point of it: events have to be
+flowing before anything is listening, and must have stopped before the final
+Flush takes its Snapshot.
+*/
+type Traced = {readonly log: string[]};
+
+function eventStream(trace: Traced): EventStream {
+	return {
+		start() {
+			trace.log.push('stream:start');
+		},
+		stop() {
+			trace.log.push('stream:stop');
+		},
+	};
+}
+
+function tracedCollector(trace: Traced, name: string) {
+	return {
+		started: 0,
+		stopped: 0,
+		start() {
+			this.started += 1;
+			trace.log.push(`${name}:start`);
+		},
+		stop() {
+			this.stopped += 1;
+			trace.log.push(`${name}:stop`);
 		},
 	};
 }
@@ -301,6 +337,65 @@ test('Every Collector is started and stopped once', async t => {
 	t.is(mouse.stopped, 1);
 	t.is(keyboard.started, 1);
 	t.is(keyboard.stopped, 1);
+});
+
+/*
+The stream's lifetime, which the Session owns rather than any Collector: the
+Collectors and the helper have to start and stop together, and a stream hidden
+inside one Collector's `start()` is a lifetime nobody can see.
+
+The order is the assertion, not just the calls. Events have to be flowing before
+anything is listening, and the helper must have stopped before the final Flush
+takes its Snapshot — otherwise the last interval is read while counts are still
+arriving.
+*/
+test('the stream is opened before the Collectors and closed before the Flush', async t => {
+	const trace: Traced = {log: []};
+	const mouse = tracedCollector(trace, 'mouse');
+	const keyboard = tracedCollector(trace, 'keyboard');
+	const {session, signal, state} = build({
+		collectors: [mouse, keyboard],
+		stream: eventStream(trace),
+	});
+	state.addLeftClick();
+
+	const running = session.run();
+	signal.fire('SIGINT');
+	await running;
+
+	t.deepEqual(trace.log, [
+		'stream:start',
+		'mouse:start',
+		'keyboard:start',
+		'stream:stop',
+		'mouse:stop',
+		'keyboard:stop',
+	]);
+});
+
+test('a Collector that throws on start still closes the stream', async t => {
+	/*
+	The stream is started before the Collectors, so skipping it on the failure
+	path would leave a capture process running with nothing to feed — which is
+	the leak the whole lifetime exists to prevent.
+	*/
+	const trace: Traced = {log: []};
+	const broken: Collector = {
+		start() {
+			trace.log.push('broken:start');
+			throw new Error('the helper could not be spawned');
+		},
+		stop() {
+			trace.log.push('broken:stop');
+		},
+	};
+	const {session} = build({collectors: [broken], stream: eventStream(trace)});
+
+	await t.throwsAsync(session.run(), {
+		message: 'the helper could not be spawned',
+	});
+
+	t.deepEqual(trace.log, ['stream:start', 'broken:start', 'stream:stop']);
 });
 
 test('stop() is idempotent, so a signal racing a quit flushes once', async t => {

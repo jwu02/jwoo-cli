@@ -10,16 +10,7 @@ about the wrong process.
 */
 
 import {execFile} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-
-/*
-Committed beside the source, and resolved from this module rather than from the
-working directory, so the CLI can be run from anywhere. `dist/permissions.js`
-sits one level under the repo root, as `source/permissions.ts` does.
-*/
-export const HELPER_PATH = fileURLToPath(
-	new URL('../helper/bin/eventtap', import.meta.url),
-);
+import {HELPER_PATH} from './helper.js';
 
 const DEFAULT_TIMEOUT_MS = 5000;
 

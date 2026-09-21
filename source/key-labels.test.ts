@@ -13,6 +13,7 @@ the disagreement loud.
 */
 
 import test from 'ava';
+import {labelForEvent} from './key-character.js';
 import {LABEL_FOR_KEYCODE, labelForKeycode} from './key-labels.js';
 
 /*
@@ -226,6 +227,28 @@ const DELIBERATE_SILENT_DROPS: readonly string[] = [
 ];
 
 /*
+`DELIBERATE_SILENT_DROPS` is the only set allowed to be unresolved, so this
+assertion has no expected list of its own — empty is the only passing value.
+
+**This test is expected to fail until `jwoo`'s `key-layout.ts` is updated**, and
+that is the point rather than a broken build. What it currently reports is the
+UK character set the Collector gained with this change but the website has no
+Physical Key for: `£` from Shift+3, `€` from Option+2, and the rest of the
+Option layer.
+
+Those are labels the website is now *choosing* to drop — `key-layout.ts` says of
+`€` and `£` that they are "deliberately NOT tracked as heatmap labels" — and
+that comment and this test disagree. Only its author can settle which is right,
+so the disagreement is left visible rather than resolved by whichever repo was
+edited last.
+
+The way out is a website change: give the labels a Physical Key. It is never to
+add them to `DELIBERATE_SILENT_DROPS` (that means the drop is intended, and
+nothing records the decision to revisit it) and never to delete them from the
+character table (that throws away the data the website would need).
+*/
+
+/*
 The labels `_SPECIAL_KEY_LABELS` in the Python `collectors/keyboard.py` could
 produce, each with the keycode that produces it. That table is not carried over
 as a second table here: pynput handed back a `Key` enum member for these keys
@@ -295,6 +318,57 @@ test('no Windows table is carried', t => {
 });
 
 /*
+The flag bits a chord can carry, as `keyboard.test.ts` declares them. The sweep
+below is over the *input* space, so it has to spell the inputs out rather than
+borrow the tables it is checking.
+
+NonCoalesced is in every chord because every captured event carried it.
+SecondaryFn is swept alone as well as with Shift and Option, because Fn is what
+turns the arrows and Delete into their overlay labels.
+*/
+const BARE = 256;
+const SHIFT = 131_072;
+const OPTION = 524_288;
+const SECONDARY_FN = 8_388_608;
+
+const CHORDS = [
+	BARE,
+	BARE | SHIFT,
+	BARE | OPTION,
+	BARE | SHIFT | OPTION,
+	BARE | SECONDARY_FN,
+	BARE | SECONDARY_FN | SHIFT,
+];
+
+/*
+Every Key Label the Collector can produce, as a function of the wire format
+rather than of the tables behind it.
+
+Sweeping keycode and chord through `labelForEvent` is what makes the test below
+a statement about the Collector. Enumerating the tables instead would only check
+that the tables agree with the website, and would stay green for a label
+reachable through a chord no table entry happens to name — which is exactly the
+kind of entry a hand-written character table gets wrong.
+
+The keycode range covers every `kVK_*` macOS defines, which stops at 126, and
+`255` is beyond it: an unmapped keycode must produce nothing rather than throw.
+*/
+function everyLabel(): string[] {
+	const labels = new Set<string>();
+
+	for (const keycode of [...Array.from({length: 128}).keys(), 255]) {
+		for (const flagsRaw of CHORDS) {
+			const label = labelForEvent({keycode, flagsRaw});
+			if (label !== undefined) {
+				labels.add(label);
+			}
+		}
+	}
+
+	return [...labels].toSorted();
+}
+
+/*
 The other half of the wire format. `jwoo/lib/telemetry/key-layout.ts` maps Key
 Labels onto Physical Keys and drops what it does not recognise, silently, so
 "every label we emit resolves there" is a property worth an assertion rather
@@ -306,6 +380,12 @@ one, which is the drift ADR-0004 is about. This is the one test that needs the
 sibling `jwoo` checkout, and it fails with a module-not-found when it is
 absent rather than skipping: a pin that quietly stops checking is worse than
 no pin.
+
+Split into the labels the website is *meant* to drop and those it is not,
+because one flat list cannot tell the two apart. A single `deepEqual` against
+`DELIBERATE_SILENT_DROPS` fails with two arrays of similar-looking strings and
+leaves the reader to diff them by eye; this way a new label that the website
+has not been taught fails on its own name.
 */
 test('every label the collector can produce resolves in the website', async t => {
 	const keyLayoutPath = new URL(
@@ -324,10 +404,19 @@ test('every label the collector can produce resolves in the website', async t =>
 	const recognised = new Set(
 		keyLayout.PHYSICAL_KEYS.flatMap(physicalKey => physicalKey.labels),
 	);
-	const unresolved = LABEL_FOR_KEYCODE.values()
-		.filter(label => !recognised.has(label))
-		.toArray()
-		.toSorted();
+	const unresolved = everyLabel().filter(label => !recognised.has(label));
 
-	t.deepEqual(unresolved, DELIBERATE_SILENT_DROPS);
+	const drops = new Set(DELIBERATE_SILENT_DROPS);
+
+	t.deepEqual(
+		unresolved.filter(label => drops.has(label)),
+		DELIBERATE_SILENT_DROPS,
+		'the deliberate drops must stay exactly these, and none may go unrecognised by accident',
+	);
+
+	t.deepEqual(
+		unresolved.filter(label => !drops.has(label)),
+		[],
+		'the labels above are the ones the website must gain a Physical Key for',
+	);
 });

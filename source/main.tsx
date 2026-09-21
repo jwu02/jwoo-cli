@@ -19,6 +19,7 @@ import {type PermissionReport, type PermissionSource} from './permissions.js';
 import {
 	type Collector,
 	CollectionSession,
+	type EventStream,
 	processSignal,
 	type ShutdownSignal,
 } from './session.js';
@@ -26,12 +27,36 @@ import {TelemetryState} from './state.js';
 import {MongoTelemetryStore, type TelemetryStore} from './storage.js';
 
 /*
+What a factory hands back: the Collectors, and the helper stream they read if
+they read one.
+
+The stream is part of the answer rather than a separate option because whether
+there is one at all is the same question as whether there are Collectors. A
+denied grant means no Collectors, and a stream started anyway would spawn a
+helper with no tap to open — which reports an exit and a problem on the
+degraded path that is supposed to be quiet.
+*/
+export type CollectorSetup = {
+	readonly collectors: readonly Collector[];
+	readonly stream?: EventStream;
+};
+
+/*
 Given the preflight report, hands back the Collectors that should run. The
 decision about what a missing grant disables stays in `permissions.ts` — the
 report names it — and the factory only decides what to build, or whether to
 build nothing at all.
+
+The state is handed over rather than built by the factory, because the Session
+flushes *this* state. A factory that built its own would give the Collectors
+somewhere to count that nothing ever reads: the Session's own state would report
+no activity, `run()` skips a Flush entirely on that, and the run would end
+cleanly having written nothing at all.
 */
-export type CollectorFactory = (report: PermissionReport) => Collector[];
+export type CollectorFactory = (
+	report: PermissionReport,
+	state: TelemetryState,
+) => CollectorSetup;
 
 export type Logger = Pick<Console, 'log' | 'warn'>;
 
@@ -40,6 +65,16 @@ export type RunOptions = {
 	readonly collectors: CollectorFactory;
 	readonly shutdown?: ShutdownSignal;
 	readonly logger?: Logger;
+	/*
+	The helper's event stream, if the Collectors were built over one. Owned by
+	the Session rather than by a Collector, because the Collectors and the
+	helper have to start and stop together and a stream hidden inside one
+	Collector's `start()` is a lifetime nobody can see.
+
+	An option for the same reason the store is: a test of the dispatch should
+	not spawn a capture process, and there is no fake tap to point it at.
+	*/
+	readonly stream?: EventStream;
 	/*
 	The store and the history source are options for the same reason the rest
 	are, and each one builds a `MongoClient`: a test of the dispatch should not
@@ -99,15 +134,36 @@ async function runCollect(options: RunOptions): Promise<void> {
 	const config = options.config ?? loadConfig();
 	const report = await runPermissions(options);
 
+	/*
+	Built here, once, and handed to the Collectors below as well as to the
+	Session. Two states is the quiet failure this arrangement exists to prevent,
+	and it is quieter than it looks: the Session skips a Flush when its own
+	state has no activity, so a run counting into a different state writes
+	nothing, flushes nothing, and still reports success.
+
+	The DPI comes from Config for the same reason. Mouse Distance is pixels over
+	DPI, and `addMouseMovement` applies it — against the DPI *this* state was
+	built with, not the one the Collector might have preferred.
+	*/
+	const state =
+		options.state ?? new TelemetryState({mouseDpi: config.mouseDpi});
+
+	/*
+	A missing grant degrades collection rather than stopping the CLI: the factory
+	is given the report and builds only what it allows, and whatever it does
+	build still runs. Nothing here exits on `disabled`.
+
+	The stream comes from the factory for the same reason there is no default
+	one here — see `CollectorSetup`. The option overrides it, because a test of
+	the dispatch supplies its own rather than spawning a capture process.
+	*/
+	const setup = options.collectors(report, state);
+
 	const session = new CollectionSession({
 		store: options.store ?? new MongoTelemetryStore(config),
-		state: options.state ?? new TelemetryState(),
-		/*
-		A missing grant degrades collection rather than stopping the CLI: the
-		factory is given the report and builds only what it allows, and whatever
-		it does build still runs. Nothing here exits on `disabled`.
-		*/
-		collectors: options.collectors(report),
+		state,
+		collectors: setup.collectors,
+		stream: options.stream ?? setup.stream,
 		flushIntervalSeconds: config.flushIntervalSeconds,
 		shutdown: options.shutdown ?? processSignal,
 		logger,
