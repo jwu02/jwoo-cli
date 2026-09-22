@@ -97,12 +97,17 @@ export type HelperError = {
 
 /*
 The line `--preflight` prints. It shares the parser's shape only because it is
-JSON on the same wire; `permissions.ts` owns its meaning and has its own reader
-for it, which is why nothing here validates `inputMonitoring`.
+JSON on the same wire; `permissions.ts` owns what the answer means.
+
+`inputMonitoring` is narrowed to the helper's own three-value vocabulary and
+validated here like any other field: the set of values is what the helper can
+say, not what a grant means. `unknown` is a third state rather than a polite
+synonym for `denied`, and the type — not a comment beside a string — is what
+keeps it one.
 */
 export type PreflightEvent = {
 	readonly type: 'preflight';
-	readonly inputMonitoring: string;
+	readonly inputMonitoring: 'granted' | 'denied' | 'unknown';
 	readonly message: string;
 };
 
@@ -110,6 +115,13 @@ export type RawEvent =
 	KeyEvent | MouseMovedEvent | MouseButtonEvent | HelperError | PreflightEvent;
 
 const BUTTONS = new Set<string>(['left', 'right', 'other']);
+
+/*
+The helper's own vocabulary for the grant. Written here rather than in
+`permissions.ts` because it describes what the helper says, not what a grant
+means — and this is the one place a line's fields are validated.
+*/
+const PREFLIGHT_ACCESS = new Set<string>(['granted', 'denied', 'unknown']);
 
 /*
 One line of the helper's stdout, or `undefined` for anything that is not a
@@ -232,8 +244,19 @@ function preflight(event: Record<string, unknown>): PreflightEvent | undefined {
 	const {inputMonitoring} = event;
 	const {message} = event;
 
-	return typeof inputMonitoring === 'string' && typeof message === 'string'
-		? {type: 'preflight', inputMonitoring, message}
+	/*
+	Both fields must be present — a missing `message` is dropped rather than
+	defaulted to empty, the same rule every other field on this wire follows —
+	and the access value must be one of the helper's three.
+	*/
+	return typeof inputMonitoring === 'string' &&
+		typeof message === 'string' &&
+		PREFLIGHT_ACCESS.has(inputMonitoring)
+		? {
+				type: 'preflight',
+				inputMonitoring: inputMonitoring as PreflightEvent['inputMonitoring'],
+				message,
+			}
 		: undefined;
 }
 

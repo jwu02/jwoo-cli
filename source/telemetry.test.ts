@@ -21,7 +21,11 @@ cannot pass against a report shape the CLI would never produce.
 */
 function granted(): TestSource {
 	return build(
-		permissionReport({inputMonitoring: 'granted', message: 'granted'}),
+		permissionReport({
+			type: 'preflight',
+			inputMonitoring: 'granted',
+			message: 'granted',
+		}),
 	);
 }
 
@@ -149,6 +153,7 @@ different states rather than the same state with a flag beside it.
 test('a missing grant reads as disabled, with the helper’s own words', t => {
 	const {source} = build(
 		permissionReport({
+			type: 'preflight',
 			inputMonitoring: 'denied',
 			message: 'Input Monitoring is denied for this helper.',
 		}),
@@ -168,6 +173,7 @@ the preflight went to the trouble of keeping.
 test('an unknown grant reads as disabled too', t => {
 	const {source} = build(
 		permissionReport({
+			type: 'preflight',
 			inputMonitoring: 'unknown',
 			message: 'Input Monitoring is unknown.',
 		}),

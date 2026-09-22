@@ -115,8 +115,18 @@ on claiming to be live.
 rather than this script's path. A missing grant comes back as a report naming the Collectors it
 disables; the composition root then builds fewer Collectors. Nothing exits on `disabled`.
 
-It throws only when the helper cannot be _asked_ — a missing binary, a crash, a hang. That is a
-broken install, not a missing permission, and the two must not be confused.
+It throws only when the helper cannot be _asked_ — a missing binary, a crash, a hang — or when the
+helper answered and its stdout carried no report, which is treated as the same broken install.
+Neither is a missing permission, and the two must not be confused.
+
+**The helper's stdout has one reader.** `raw-event.ts`'s line parser is the only place a line is
+decoded, and `helper.ts` is the only module that reads the helper's stdout — the stream and
+`preflightFrom` (split it, parse each line through the shared parser, last preflight line wins)
+both go through that parser. `permissions.ts` holds only policy — what the answer means for which
+Collectors — and contains no line parsing or JSON decoding; its report function takes the parsed
+`PreflightEvent` wire type, whose access field is narrowed to the helper's three-value vocabulary
+in the format module. A preflight line with no message is dropped like any other malformed line,
+so stdout that carries only such lines reports "printed no permission report".
 
 ### The live view reads a third seam
 

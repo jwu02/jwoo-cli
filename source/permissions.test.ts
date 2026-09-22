@@ -2,35 +2,28 @@ import {mkdtemp, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'ava';
+import {type PreflightEvent} from './raw-event.js';
 import {
-	type HelperPreflight,
 	HelperPermissionSource,
 	type PermissionReport,
 	PreflightError,
-	parsePreflightLine,
 	permissionReport,
 } from './permissions.js';
 
 /*
-The helper's own line, as `./helper/bin/eventtap --preflight` prints it. Built
-from the wire format rather than from anything the code under test exports, so a
-change to the format is visible here.
+The helper's answer as the wire carries it — built as an object of the format
+module's type rather than written out by hand, so a change to the format shows
+up here as a type error. These tests are about policy, not parsing: the reading
+of stdout lives with the transport tests.
 */
-function helperLine(access: string): string {
-	return `${JSON.stringify({
+function helperPreflight(
+	access: PreflightEvent['inputMonitoring'],
+): PreflightEvent {
+	return {
 		type: 'preflight',
 		inputMonitoring: access,
 		message: `Input Monitoring is ${access} for this helper.`,
-	})}\n`;
-}
-
-function helperPreflight(access: string): HelperPreflight {
-	const report = parsePreflightLine(helperLine(access));
-	if (report === undefined) {
-		throw new Error(`the helper's own ${access} line did not parse`);
-	}
-
-	return report;
+	};
 }
 
 type DisabledReport = Extract<PermissionReport, {status: 'disabled'}>;
@@ -101,30 +94,6 @@ test('each disability note names the grant and where to grant it', t => {
 	}
 });
 
-test('a line that is not the helper preflight report does not parse', t => {
-	t.is(
-		parsePreflightLine('{"type":"error","code":"inputMonitoringDenied"}\n'),
-		undefined,
-	);
-	t.is(parsePreflightLine(''), undefined);
-	t.is(parsePreflightLine('not json'), undefined);
-	t.is(
-		parsePreflightLine('{"type":"preflight","inputMonitoring":"maybe"}\n'),
-		undefined,
-	);
-});
-
-/*
-`stdout` carries the report and stderr carries diagnostics; the parser is handed
-stdout, so anything else on it must be skipped rather than believed.
-*/
-test('the report is found among other lines on stdout', t => {
-	t.is(
-		parsePreflightLine(`noise\n${helperLine('denied')}`)?.inputMonitoring,
-		'denied',
-	);
-});
-
 test('a helper that cannot be run is an error, not a missing permission', async t => {
 	const source = new HelperPermissionSource({
 		helperPath: '/nonexistent/eventtap',
@@ -168,6 +137,33 @@ test('a helper that answers but prints no report says so, with the shared hint',
 
 	t.regex(error.message, /printed no permission report/v);
 	t.regex(error.message, /helper\/build\.sh/v);
+});
+
+test('a preflight line with no message is no report at all', async t => {
+	/*
+	The spec's one approved behavior delta, seen from the policy seam: a helper
+	that answered with a messageless preflight line used to produce a granted
+	report with an empty message. Drop-rather-than-default now holds across the
+	whole wire format, so stdout that carries only such lines carries no answer
+	at all.
+	*/
+	const directory = await mkdtemp(join(tmpdir(), 'preflight-'));
+	t.teardown(async () => {
+		await rm(directory, {recursive: true, force: true});
+	});
+	const messageless = join(directory, 'eventtap');
+	await writeFile(
+		messageless,
+		'#!/bin/sh\necho \'{"type":"preflight","inputMonitoring":"granted"}\'\n',
+		{mode: 0o755},
+	);
+
+	const source = new HelperPermissionSource({helperPath: messageless});
+	const error = await t.throwsAsync(source.preflight(), {
+		instanceOf: PreflightError,
+	});
+
+	t.regex(error.message, /printed no permission report/v);
 });
 
 test('a helper that never answers is cut off by the timeout', async t => {

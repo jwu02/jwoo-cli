@@ -1,13 +1,18 @@
 /*
 Everything that talks to the capture helper: where its binary is, its event
-stream, its one-shot runs, the fire-and-forget grant request, and where its
-problems are reported.
+stream, its one-shot runs, the reading of a one-shot answer, the fire-and-forget
+grant request, and where its problems are reported.
 
 One module rather than a path in one place and a stream in another, because
 they are one question — `permissions.ts` asks this binary about the grant and
 the Collectors run it, and a path copied between modules is a copy that can
 drift. The failure that drift produces is worth naming: two callers would be
 talking to different processes, and both would look like they were working.
+
+The helper's stdout has one reader: `raw-event.ts`'s line parser. Both ways
+this module reads it — the stream and the one-shot answer below — parse every
+line through that parser and never re-decode one, so a change to the wire
+format lands in one place and every consumer sees it.
 
 The stream is the one part of collection that touches the OS, and it is
 deliberately thin. Everything subtle — which key a keycode is, what a flag
@@ -33,7 +38,12 @@ import {execFile, spawn, type ChildProcessByStdio} from 'node:child_process';
 import {type Readable} from 'node:stream';
 import process from 'node:process';
 import {fileURLToPath} from 'node:url';
-import {type HelperError, type RawEvent, parseEventLine} from './raw-event.js';
+import {
+	type HelperError,
+	type PreflightEvent,
+	type RawEvent,
+	parseEventLine,
+} from './raw-event.js';
 import {type EventStream as StartStop} from './session.js';
 
 export const HELPER_PATH = fileURLToPath(
@@ -369,6 +379,32 @@ export async function runHelperOnce(
 			},
 		);
 	});
+}
+
+/*
+Reads a one-shot run's stdout for the preflight answer.
+
+Beside `runHelperOnce` because scanning stdout is transport, not policy: what a
+grant means is `permissions.ts`'s to say, and finding what the helper said is
+this module's. Every line goes through the one shared parser — which is what
+makes this a reader of the wire format rather than a second description of it —
+and the last preflight line wins, so a diagnostic that happens to start with a
+brace and parse cannot preempt the report printed after it.
+
+`undefined` is "no report", the ordinary shape of a stdout that carried nothing
+recognisable, and it is the caller's to report rather than a reason to throw.
+*/
+export function preflightFrom(stdout: string): PreflightEvent | undefined {
+	let report: PreflightEvent | undefined;
+
+	for (const line of stdout.split('\n')) {
+		const event = parseEventLine(line);
+		if (event?.type === 'preflight') {
+			report = event;
+		}
+	}
+
+	return report;
 }
 
 /*

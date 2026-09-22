@@ -111,14 +111,41 @@ test('an error line is a real event, not a failure to parse', t => {
 
 test('a preflight line parses even though the stream never carries one', t => {
 	// `--preflight` exits before a tap exists, so this cannot appear on the
-	// event stream. It parses anyway because `permissions.ts` and the stream
-	// share one description of what a line is, and the alternative is two that
-	// can disagree.
+	// event stream. It parses anyway because the helper's stdout has one
+	// reader: the scan that finds the preflight answer in it parses its lines
+	// through this same parser, and the alternative is a second description
+	// that can disagree.
 	const event = parse(
 		'{"message":"Input Monitoring is granted.","type":"preflight","inputMonitoring":"granted"}',
 	);
 
-	t.is(event.type, 'preflight');
+	t.deepEqual(event, {
+		type: 'preflight',
+		inputMonitoring: 'granted',
+		message: 'Input Monitoring is granted.',
+	});
+});
+
+test('a preflight access value outside the vocabulary is dropped', t => {
+	// The helper answers granted, denied, or unknown and nothing else, so the
+	// value is validated here like any other field. A mistyped value coerced
+	// into one of the three would look exactly like a missing grant.
+	t.is(
+		parseEventLine(
+			'{"type":"preflight","inputMonitoring":"maybe","message":"Input Monitoring is maybe."}',
+		),
+		undefined,
+	);
+});
+
+test('a preflight line with no message is dropped', t => {
+	// Drop-rather-than-default, the rule every other field on this wire
+	// follows. This is the spec's one approved behavior delta: the preflight
+	// reader used to parse such a line with an empty message.
+	t.is(
+		parseEventLine('{"type":"preflight","inputMonitoring":"granted"}'),
+		undefined,
+	);
 });
 
 // ---------------------------------------------------------------------------

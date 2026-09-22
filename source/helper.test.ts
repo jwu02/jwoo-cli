@@ -10,6 +10,9 @@ capture. It is the same reason the helper has that mode at all.
 The other fixtures are not the helper. They are `/bin/cat` and a path that does
 not exist, chosen because each produces something the helper cannot be asked to
 produce on demand — a line split across two reads, and a failure to start.
+
+The preflight reader's tests at the bottom are the exception to all of this: a
+pure function over whole-stdout strings, it needs no process at all.
 */
 
 import {execFileSync} from 'node:child_process';
@@ -19,7 +22,12 @@ import {join} from 'node:path';
 import process from 'node:process';
 import {setTimeout as delay} from 'node:timers/promises';
 import test from 'ava';
-import {EventStream, HELPER_PATH, type StreamProblem} from './helper.js';
+import {
+	EventStream,
+	HELPER_PATH,
+	type StreamProblem,
+	preflightFrom,
+} from './helper.js';
 import {type RawEvent} from './raw-event.js';
 
 test('the helper path is the committed binary beside the source', t => {
@@ -267,4 +275,62 @@ test('the helper path resolves to the committed binary', t => {
 	const stdout = execFileSync(HELPER_PATH, ['--preflight'], {encoding: 'utf8'});
 
 	t.regex(stdout, /"type":"preflight"/v);
+});
+
+// ---------------------------------------------------------------------------
+// Reading a one-shot answer out of stdout
+//
+// The preflight reader is transport, not policy: given the whole stdout of a
+// run, it finds the report. These drive it as a pure function over strings,
+// beside the one-shot runner it reads for.
+// ---------------------------------------------------------------------------
+
+/*
+`--preflight`'s answer, as the helper prints it: one JSON line on stdout. Built
+from the wire format rather than from anything the code under test exports, so
+a change to the format is visible here.
+*/
+function preflightLine(access: string): string {
+	return `${JSON.stringify({
+		type: 'preflight',
+		inputMonitoring: access,
+		message: `Input Monitoring is ${access} for this helper.`,
+	})}\n`;
+}
+
+test('the preflight reader finds the report among other lines', t => {
+	/*
+	`stdout` carries the report and stderr carries diagnostics, but nothing
+	enforces that downstream — anything else on stdout is skipped rather than
+	believed.
+	*/
+	t.is(
+		preflightFrom(`noise\n${preflightLine('denied')}`)?.inputMonitoring,
+		'denied',
+	);
+});
+
+test('the preflight reader keeps the last preflight line', t => {
+	/*
+	Last wins, so a diagnostic that happens to start with a brace and parse
+	cannot preempt the report printed after it.
+	*/
+	const stdout = preflightLine('denied') + preflightLine('granted');
+
+	t.is(preflightFrom(stdout)?.inputMonitoring, 'granted');
+});
+
+test('stdout with no preflight line yields no report', t => {
+	/*
+	An error line parses as an event like any other and is still not the
+	answer: the reader keeps preflight lines and nothing else.
+	*/
+	t.is(preflightFrom(''), undefined);
+	t.is(
+		preflightFrom(
+			'{"message":"no tap","code":"inputMonitoringDenied","type":"error"}\n',
+		),
+		undefined,
+	);
+	t.is(preflightFrom('noise\nnot json\n'), undefined);
 });
