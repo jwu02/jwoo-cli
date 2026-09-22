@@ -1,3 +1,6 @@
+import {mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import test from 'ava';
 import {
 	type HelperPreflight,
@@ -127,5 +130,74 @@ test('a helper that cannot be run is an error, not a missing permission', async 
 		helperPath: '/nonexistent/eventtap',
 	});
 
-	await t.throwsAsync(source.preflight(), {instanceOf: PreflightError});
+	const error = await t.throwsAsync(source.preflight(), {
+		instanceOf: PreflightError,
+	});
+
+	/*
+	"Run", not "check permissions": the runner is the one asking, and a timeout
+	or a crash is a failure to run. The hint is the shared one — the same
+	sentence the stream reports for the same failure.
+	*/
+	t.regex(error.message, /Could not run \/nonexistent\/eventtap/v);
+	t.regex(error.message, /helper\/build\.sh/v);
+});
+
+/*
+`--preflight` exits 0 whatever the grant is, so an exit code can never carry
+the answer: a helper that fails is a helper that cannot be asked. The failure
+would go silent exactly here — a run that resolved on a non-zero exit would
+come back as "printed no permission report", and one that coerced the exit
+into the report would come back as a missing grant.
+*/
+test('a non-zero helper exit is a broken install, never a denied grant', async t => {
+	const source = new HelperPermissionSource({helperPath: '/usr/bin/false'});
+	const error = await t.throwsAsync(source.preflight(), {
+		instanceOf: PreflightError,
+	});
+
+	t.regex(error.message, /Could not run \/usr\/bin\/false/v);
+	t.regex(error.message, /helper\/build\.sh/v);
+});
+
+test('a helper that answers but prints no report says so, with the shared hint', async t => {
+	const source = new HelperPermissionSource({helperPath: '/usr/bin/true'});
+	const error = await t.throwsAsync(source.preflight(), {
+		instanceOf: PreflightError,
+	});
+
+	t.regex(error.message, /printed no permission report/v);
+	t.regex(error.message, /helper\/build\.sh/v);
+});
+
+test('a helper that never answers is cut off by the timeout', async t => {
+	/*
+	A hang is the third way the helper cannot be asked, and the only one the
+	timeout answers. The fixture has to ignore its arguments — the source always
+	passes `--preflight` — so a script of its own rather than a system tool,
+	every one of which would reject the flag and exit at once.
+	*/
+	const directory = await mkdtemp(join(tmpdir(), 'preflight-'));
+	t.teardown(async () => {
+		await rm(directory, {recursive: true, force: true});
+	});
+	const hanging = join(directory, 'eventtap');
+	await writeFile(hanging, '#!/bin/sh\nsleep 5\n', {mode: 0o755});
+
+	const source = new HelperPermissionSource({
+		helperPath: hanging,
+		timeoutMs: 100,
+	});
+	const error = await t.throwsAsync(source.preflight(), {
+		instanceOf: PreflightError,
+	});
+
+	t.regex(error.message, /Could not run/v);
+	t.regex(error.message, /helper\/build\.sh/v);
+
+	/*
+	Node's own failure message ends in a newline; the composer flattens it, so
+	the shared sentence stays one sentence.
+	*/
+	t.false(error.message.includes('\n'), 'the sentence stays one line');
 });

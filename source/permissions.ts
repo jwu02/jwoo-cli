@@ -7,53 +7,18 @@ a missing grant. `IOHIDCheckAccess` is the only check to trust here, and the
 helper is the only thing that can make it: the grant follows an ancestor process
 rather than this script's path (ADR-0006), so asking from Node would be asking
 about the wrong process.
+
+The asking itself — running the helper and waiting for its answer — is the
+helper module's one-shot runner. What is left here is policy: what the answer
+means, and what is worth saying when no answer comes.
 */
 
-import {execFile} from 'node:child_process';
-import {HELPER_PATH} from './helper.js';
-
-const DEFAULT_TIMEOUT_MS = 5000;
-
-/*
-Wrapped by hand rather than with `promisify`, whose inferred return type drops
-the `stdout` the callback supplies — reading it would then be an `any`, and this
-is exactly the value that decides whether collection runs.
-*/
-async function runHelper(
-	file: string,
-	args: string[],
-	options: {timeout: number},
-): Promise<{stdout: string; stderr: string}> {
-	return new Promise((resolve, reject) => {
-		execFile(file, args, options, (error, stdout, stderr) => {
-			if (error) {
-				reject(asError(error));
-				return;
-			}
-
-			resolve({stdout, stderr});
-		});
-	});
-}
-
-/*
-An `Error` whatever the driver handed back. `execFile` rejects with an
-`ExecFileException`, which carries the useful part — its `code` — alongside a
-`message`; anything else would stringify to `[object Object]` on the way to the
-user.
-*/
-function asError(error: unknown): Error {
-	if (error instanceof Error) {
-		return error;
-	}
-
-	const message =
-		typeof error === 'object' && error !== null && 'message' in error
-			? String(error.message)
-			: 'the helper could not be run';
-
-	return new Error(message);
-}
+import {
+	DEFAULT_RUN_TIMEOUT_MS,
+	HELPER_PATH,
+	REBUILD_HINT,
+	runHelperOnce,
+} from './helper.js';
 
 export class PreflightError extends Error {
 	override readonly name = 'PreflightError';
@@ -174,7 +139,7 @@ export class HelperPermissionSource implements PermissionSource {
 
 	constructor({
 		helperPath = HELPER_PATH,
-		timeoutMs = DEFAULT_TIMEOUT_MS,
+		timeoutMs = DEFAULT_RUN_TIMEOUT_MS,
 	}: HelperPermissionSourceOptions = {}) {
 		this.#helperPath = helperPath;
 		this.#timeoutMs = timeoutMs;
@@ -188,19 +153,25 @@ export class HelperPermissionSource implements PermissionSource {
 	async preflight(): Promise<PermissionReport> {
 		let stdout: string;
 		try {
-			({stdout} = await runHelper(this.#helperPath, ['--preflight'], {
-				timeout: this.#timeoutMs,
+			({stdout} = await runHelperOnce(['--preflight'], {
+				helperPath: this.#helperPath,
+				timeoutMs: this.#timeoutMs,
 			}));
 		} catch (error: unknown) {
+			/*
+			The runner has already composed the sentence — path, cause, rebuild
+			hint — so this wraps the failure as a `PreflightError` and changes
+			nothing about what it says.
+			*/
 			throw new PreflightError(
-				`Could not check permissions with ${this.#helperPath}: ${error instanceof Error ? error.message : String(error)}. Rebuild it with ./helper/build.sh.`,
+				error instanceof Error ? error.message : String(error),
 			);
 		}
 
 		const report = parsePreflightLine(stdout);
 		if (report === undefined) {
 			throw new PreflightError(
-				`${this.#helperPath} --preflight printed no permission report. Rebuild it with ./helper/build.sh.`,
+				`${this.#helperPath} --preflight printed no permission report. ${REBUILD_HINT}`,
 			);
 		}
 

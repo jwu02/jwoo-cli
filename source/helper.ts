@@ -1,6 +1,7 @@
 /*
 Everything that talks to the capture helper: where its binary is, its event
-stream, the fire-and-forget grant request, and where its problems are reported.
+stream, its one-shot runs, the fire-and-forget grant request, and where its
+problems are reported.
 
 One module rather than a path in one place and a stream in another, because
 they are one question — `permissions.ts` asks this binary about the grant and
@@ -28,7 +29,7 @@ than from the working directory, so the CLI can be run from anywhere.
 does.
 */
 
-import {spawn, type ChildProcessByStdio} from 'node:child_process';
+import {execFile, spawn, type ChildProcessByStdio} from 'node:child_process';
 import {type Readable} from 'node:stream';
 import process from 'node:process';
 import {fileURLToPath} from 'node:url';
@@ -38,6 +39,32 @@ import {type EventStream as StartStop} from './session.js';
 export const HELPER_PATH = fileURLToPath(
 	new URL('../helper/bin/eventtap', import.meta.url),
 );
+
+/*
+The rebuild step, written once. The one broken-install message that does not
+fit the sentence below — a run that answered but printed no report — pairs it
+with its own lead-in.
+*/
+export const REBUILD_HINT = 'Rebuild it with ./helper/build.sh.';
+
+/*
+The one sentence for a helper that cannot be run — a missing binary, a crash,
+a hang — composed here rather than at each call site, so the same failure reads
+the same sentence whichever adapter hit it: the stream reports it as a problem,
+the one-shot runner rejects with it, and `permissions.ts` passes it through as
+a `PreflightError` without recomposing.
+
+`cause` is why the run failed, never what the helper answered: `--preflight`
+exits 0 whatever the grant is, so anything that reaches this sentence is a
+broken install and not a permission answer. It is flattened to one line —
+Node's failure messages end in newlines and carry stderr, and this is one
+sentence.
+*/
+export function brokenInstallMessage(path: string, cause: string): string {
+	const reason = cause.replaceAll(/\s+/gv, ' ').trim();
+
+	return `Could not run ${path}: ${reason}. ${REBUILD_HINT}`;
+}
 
 /*
 A helper line that could not be used. Reported rather than thrown: one bad line
@@ -213,7 +240,7 @@ export class EventStream implements StartStop {
 				error: {
 					type: 'error',
 					code: 'helperUnavailable',
-					message: `Could not run ${this.#helperPath}: ${error.message}. Rebuild it with ./helper/build.sh.`,
+					message: brokenInstallMessage(this.#helperPath, error.message),
 				},
 			});
 		});
@@ -289,6 +316,59 @@ function readLines(
 	}
 
 	return remainder;
+}
+
+/*
+How long a one-shot run may take to answer, before the run is a hang and a
+hang is a broken install.
+*/
+export const DEFAULT_RUN_TIMEOUT_MS = 5000;
+
+export type RunHelperOnceOptions = {
+	readonly helperPath?: string;
+	readonly timeoutMs?: number;
+};
+
+/*
+The one-shot run: arguments in, both pipes out.
+
+The counterpart to the stream for the modes that answer and exit rather than
+capture — `--preflight` today. `permissions.ts` asks its question through this
+rather than wrapping a child process of its own, so asking the helper a
+one-shot question goes through one code path and the timeout's default has one
+home.
+
+Wrapped by hand rather than with `promisify`, whose inferred return type drops
+the `stdout` the callback supplies — reading it would then be an `any`, and
+this is exactly the value the caller decides on.
+
+Rejects on any failure to run — spawn failure, non-zero exit, timeout — with
+the broken-install sentence already composed. That is load-bearing: the
+helper's `--preflight` exits 0 whatever the grant is, so a rejection here is
+always a broken install, never a denied grant.
+*/
+export async function runHelperOnce(
+	args: readonly string[],
+	{
+		helperPath = HELPER_PATH,
+		timeoutMs = DEFAULT_RUN_TIMEOUT_MS,
+	}: RunHelperOnceOptions = {},
+): Promise<{stdout: string; stderr: string}> {
+	return new Promise((resolve, reject) => {
+		execFile(
+			helperPath,
+			args,
+			{timeout: timeoutMs},
+			(error, stdout, stderr) => {
+				if (error) {
+					reject(new Error(brokenInstallMessage(helperPath, error.message)));
+					return;
+				}
+
+				resolve({stdout, stderr});
+			},
+		);
+	});
 }
 
 /*

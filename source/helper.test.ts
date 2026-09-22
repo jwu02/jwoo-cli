@@ -26,8 +26,9 @@ test('the helper path is the committed binary beside the source', t => {
 	/*
 	The path is relative to the *compiled* module, so a wrong number of `../` is
 	invisible until something tries to run the helper — which on a machine
-	without the grant is a path nobody exercises. Two callers depend on the
-	answer and neither can check the other's copy.
+	without the grant is a path nobody exercises. Every caller — the stream, the
+	one-shot runner, `permissions.ts` — takes it from here, which is what lets
+	one test catch a wrong `../` for all of them.
 	*/
 	t.true(HELPER_PATH.endsWith('helper/bin/eventtap'));
 });
@@ -257,15 +258,11 @@ test('stop before start does nothing', t => {
 });
 
 test('the helper path resolves to the committed binary', t => {
-	// `permissions.ts` resolves the same file from the same relative place. If
-	// this ever disagrees with it, one of the two is talking to the wrong
-	// process.
 	/*
-	The synchronous form, for the reason `permissions.ts` gives for wrapping
-	`execFile` by hand: `promisify`'s inferred return type drops the `stdout` the
-	callback supplies, and that is the value under test. Synchronous rather than
-	hand-wrapped because a `--preflight` run answers and exits, so there is
-	nothing here worth being concurrent with.
+	The synchronous form, for the same reason the one-shot runner wraps
+	`execFile` by hand. Synchronous rather than hand-wrapped because a
+	`--preflight` run answers and exits, so there is nothing here worth being
+	concurrent with.
 	*/
 	const stdout = execFileSync(HELPER_PATH, ['--preflight'], {encoding: 'utf8'});
 
