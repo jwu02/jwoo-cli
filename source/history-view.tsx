@@ -12,9 +12,11 @@ orders by count where Key Counts order by label, and it draws no keyboard.
 */
 
 import {Box, Text} from 'ink';
+import {COUNT_FORMAT, twoDigits} from './format.js';
 import {type HistoryData} from './history.js';
 import {localFields, weekdayOf} from './local-time.js';
 import {bucketUnit, type Range} from './ranges.js';
+import {TotalsView} from './totals-view.js';
 import {type LoadState} from './use-history.js';
 
 /*
@@ -33,15 +35,6 @@ const SPARKLINE_LABEL_WIDTH = 15;
 const SPARKLINE_LEVELS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-
-/*
-Pinned to a locale rather than taking the machine's, so the tests assert the
-same digits everywhere.
-*/
-const COUNT_FORMAT = new Intl.NumberFormat('en-GB');
-const METRES_FORMAT = new Intl.NumberFormat('en-GB', {
-	maximumFractionDigits: 1,
-});
 
 export function HistoryView({state, range}: {state: LoadState; range: Range}) {
 	return (
@@ -71,16 +64,8 @@ function Dashboard({data}: {data: HistoryData}) {
 	);
 
 	return (
-		<Box flexDirection="column" marginTop={1}>
-			<Row label="Clicks" value={COUNT_FORMAT.format(clicks)} />
-			<Row
-				label="Mouse Distance"
-				value={`${METRES_FORMAT.format(data.totals.movementMeters)} m`}
-			/>
-			<Row
-				label="Press Total"
-				value={COUNT_FORMAT.format(data.totals.pressTotal)}
-			/>
+		<Box flexDirection="column">
+			<TotalsView totals={data.totals} />
 
 			<Box marginTop={1} flexDirection="column">
 				<Sparkline
@@ -121,17 +106,6 @@ function Dashboard({data}: {data: HistoryData}) {
 					</>
 				)}
 			</Box>
-		</Box>
-	);
-}
-
-function Row({label, value}: {label: string; value: string}) {
-	return (
-		<Box>
-			<Box width={16}>
-				<Text>{label}</Text>
-			</Box>
-			<Text bold>{value}</Text>
 		</Box>
 	);
 }
@@ -235,10 +209,6 @@ function bucketLabel(bucket: string, data: HistoryData): string {
 	return bucketUnit(data.range) === 'hour'
 		? `${twoDigits(fields.hour)}:${twoDigits(fields.minute)}`
 		: `${WEEKDAYS[weekdayOf(fields)]!} ${fields.day}`;
-}
-
-function twoDigits(value: number): string {
-	return String(value).padStart(2, '0');
 }
 
 function rangeLabel(range: Range): string {

@@ -83,6 +83,28 @@ side of a one-way mapping
 Note that the mapping is the _website's_ reader. The CLI has no `key-layout.ts` and no Physical
 Key: it ranks Key Labels as they arrive, so a label the website would discard still appears here.
 
+## The live view
+
+The dashboard's second view: what the run that is happening now has observed. It is available
+only while the CLI is running, because that is all there is to show — there is no stored form of
+a run in progress.
+
+**Live Totals**:
+Clicks, Mouse Distance and Press Total since the CLI started, rather than since the last Flush
+Interval. They are Telemetry State plus everything this run has already Flushed, which is why
+they do not fall back to zero at each Flush.
+_Avoid_: session totals, current counters, live counts, and any reading that could be mistaken
+for a Range — a Range is a calendar interval read from storage, which is the other view
+
+**Last Flush**:
+When the most recent Flush was attempted, and whether it wrote anything. Not the last Flush
+Interval: an interval with no Activity attempts no write, so a line that moved anyway would
+report a write that never happened.
+
+A run with no grant has no Live Totals at all, rather than totals of zero — see Collector
+Disabled. The two are the same numbers and are not the same thing, and telling them apart is
+what this view is for.
+
 ## The history view
 
 **Range**:

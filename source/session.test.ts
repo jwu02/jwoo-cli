@@ -3,6 +3,7 @@ import {
 	type Collector,
 	CollectionSession,
 	type EventStream,
+	type FlushAttempt,
 	type SessionOptions,
 	type ShutdownReason,
 	type ShutdownSignal,
@@ -94,6 +95,7 @@ function build(options: Partial<SessionOptions> = {}): TestSession {
 			stream: options.stream,
 			flushIntervalSeconds: options.flushIntervalSeconds ?? 300,
 			shutdown: signal,
+			onFlush: options.onFlush,
 		}),
 	};
 }
@@ -417,6 +419,98 @@ test('the shutdown listener is released once the Session has ended', async t => 
 	await running;
 
 	t.is(signal.uninstalled, 1);
+});
+
+/*
+The way a dashboard ends. `q` is not a signal: the terminal is in raw mode while
+the view is drawn, so the SIGINT it would otherwise generate is never sent, and
+the only thing that knows the run is over is the caller that stopped it. Without
+this, `run()` waits for a signal that cannot arrive.
+*/
+test('stop() ends the run, with no signal to name', async t => {
+	const {session, store, state} = build({flushIntervalSeconds: 300});
+	state.addLeftClick();
+
+	const running = session.run();
+	const stopped = await session.stop();
+	const shutdown = await running;
+
+	t.is(shutdown.reason, 'stop');
+	t.is(shutdown.signal, undefined);
+	t.true(shutdown.finalFlush);
+	t.deepEqual(shutdown, stopped, 'run() reports the same shutdown');
+	t.is(store.snapshots.length, 1);
+	t.is(store.closed, 1);
+});
+
+/*
+What a view outside the Session needs to draw a live total: Telemetry State is
+cleared by a successful Flush, so the counters it was holding have to be handed
+over at the moment they are written or they are gone.
+*/
+test('a Flush is reported with the counters it wrote', async t => {
+	const attempts: FlushAttempt[] = [];
+	const {session, signal, state} = build({
+		onFlush(attempt) {
+			attempts.push(attempt);
+		},
+	});
+	state.addLeftClick();
+	state.addKeyPress('A');
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+	await running;
+
+	t.is(attempts.length, 1);
+	t.true(attempts[0]?.ok);
+	t.is(attempts[0]?.snapshot.leftClicks, 1);
+	t.is(attempts[0]?.snapshot.keysPressed, 1);
+	t.true(attempts[0]?.at instanceof Date);
+});
+
+/*
+A failed Flush is reported as a failure and still carries its counters, because
+the observer must not add them to a running total: Telemetry State was not
+cleared, so they are still in there and would be counted twice.
+*/
+test('a failed Flush is reported as one, counters and all', async t => {
+	const attempts: FlushAttempt[] = [];
+	const {session, signal, state} = build({
+		store: new FakeStore(Infinity),
+		onFlush(attempt) {
+			attempts.push(attempt);
+		},
+	});
+	state.addLeftClick();
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+	await running;
+
+	t.is(attempts.length, 1);
+	t.false(attempts[0]?.ok);
+	t.is(attempts[0]?.snapshot.leftClicks, 1);
+});
+
+/*
+An idle interval attempts no write at all, and a view that heard about one would
+move its last-Flush line without anything having been sent.
+*/
+test('an interval with no Activity reports nothing', async t => {
+	const attempts: FlushAttempt[] = [];
+	const {session, signal} = build({
+		flushIntervalSeconds: 300,
+		onFlush(attempt) {
+			attempts.push(attempt);
+		},
+	});
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+	await running;
+
+	t.deepEqual(attempts, []);
 });
 
 /*

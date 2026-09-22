@@ -64,6 +64,21 @@ export type ShutdownReason = {
 };
 
 /*
+A Flush attempt, as an observer outside the Session sees it: when it was tried,
+whether it wrote anything, and the counters it was holding.
+
+`snapshot` is what was handed to storage, and it is the reason this exists. A
+successful Flush clears Telemetry State, so a caller that wants the run's totals
+— rather than just the current interval's — has to be told what was written as
+it was written.
+*/
+export type FlushAttempt = {
+	readonly at: Date;
+	readonly ok: boolean;
+	readonly snapshot: Snapshot;
+};
+
+/*
 Shutdown arrives from a source rather than from `process.on` directly, so a test
 can fire one without signalling the test runner — a real SIGTERM raised inside
 the suite would take ava down on the way to its own assertion.
@@ -119,6 +134,14 @@ export type SessionOptions = {
 	readonly flushIntervalSeconds: number;
 	readonly shutdown: ShutdownSignal;
 	readonly logger?: Pick<Console, 'warn'>;
+	/*
+	Called after every Flush attempt, successful or not.
+
+	Not called when there was no Activity: no write was attempted, so there is
+	nothing that happened and nothing for a view to draw. A last-Flush line that
+	moved on every idle interval would claim a write that never took place.
+	*/
+	readonly onFlush?: (attempt: FlushAttempt) => void;
 };
 
 /*
@@ -134,6 +157,7 @@ export class CollectionSession {
 	readonly #intervalMs: number;
 	readonly #shutdown: ShutdownSignal;
 	readonly #logger: Pick<Console, 'warn'>;
+	readonly #onFlush: ((attempt: FlushAttempt) => void) | undefined;
 
 	#timer: NodeJS.Timeout | undefined;
 	/*
@@ -145,6 +169,15 @@ export class CollectionSession {
 	#started = 0;
 	#closed = false;
 	#unsubscribe: (() => void) | undefined;
+	/*
+	Ends the wait in `#runUntilShutdown` when `stop()` is what ended the run.
+
+	A signal is not the only way out. A dashboard quits on `q`, and the terminal
+	is in raw mode, so no SIGINT is ever generated for that — the only thing that
+	finds out is the caller that asked for the stop. Without this, `run()` would
+	be left waiting for a signal that is never coming.
+	*/
+	#endRun: (() => void) | undefined;
 	/*
 	The Flush in flight, if any. Telemetry State is cleared only after a
 	successful write, so a Flush that is still waiting on the database has *not*
@@ -163,11 +196,21 @@ export class CollectionSession {
 		this.#intervalMs = options.flushIntervalSeconds * 1000;
 		this.#shutdown = options.shutdown;
 		this.#logger = options.logger ?? console;
+		this.#onFlush = options.onFlush;
 	}
 
+	/*
+	`undefined` is a run that `stop()` ended rather than a signal, which is why
+	the promise is not typed as a `ShutdownReason`: there is no signal to name,
+	and inventing one would be a lie a caller could not tell from the truth.
+	*/
 	async #runUntilShutdown(): Promise<Shutdown> {
-		const reason = await new Promise<ShutdownReason>(resolve => {
+		const reason = await new Promise<ShutdownReason | undefined>(resolve => {
 			this.#unsubscribe = this.#shutdown.onShutdown(resolve);
+			this.#endRun = () => {
+				resolve(undefined);
+			};
+
 			this.#scheduleFlush();
 		});
 
@@ -175,9 +218,13 @@ export class CollectionSession {
 		// so a second signal cannot cut the Flush below short.
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
+		this.#endRun = undefined;
 
 		const {finalFlush} = await this.stop();
-		return {reason: 'signal', signal: reason.signal, finalFlush};
+
+		return reason === undefined
+			? {reason: 'stop', signal: undefined, finalFlush}
+			: {reason: 'signal', signal: reason.signal, finalFlush};
 	}
 
 	#scheduleFlush(): void {
@@ -216,20 +263,30 @@ export class CollectionSession {
 
 		const snapshot: Snapshot = this.#state.snapshot();
 		const result = await this.#store.flush(snapshot);
+		const isWritten = result !== undefined;
 
-		if (result === undefined) {
+		if (isWritten) {
+			this.#state.clear();
+		} else {
 			this.#logger.warn('Flush failed; counters will retry on the next Flush');
-			return false;
 		}
 
-		this.#state.clear();
-		return true;
+		/*
+		Reported last, and after the clear rather than before it, so an observer
+		that adds this Snapshot to a running total is never in a position to
+		count it twice: on success Telemetry State no longer holds it, and on
+		failure the observer is told not to add it at all.
+		*/
+		this.#onFlush?.({at: new Date(), ok: isWritten, snapshot});
+
+		return isWritten;
 	}
 
 	/*
-	Runs until a signal arrives, then shuts down. The returned promise resolves
-	only once the final Flush and the close have finished, so `await`ing it is a
-	complete shutdown and not merely the start of one.
+	Runs until a signal arrives or `stop()` is called, then shuts down. The
+	returned promise resolves only once the final Flush and the close have
+	finished, so `await`ing it is a complete shutdown and not merely the start of
+	one — whichever of the two ended it.
 
 	The signal listeners are installed before the promise can resolve, so a
 	caller that waits cannot miss one. They are also removed *after* the run has
@@ -263,9 +320,14 @@ export class CollectionSession {
 	}
 
 	/*
-	Idempotent, because a signal and a failed Collector can both bring the run
-	down, and a second Flush of the same interval would write it twice. Returns
-	the first run's outcome on a second call.
+	Ends the run: a signal, a failed Collector and a caller that wants it over
+	all arrive here, and it is also what releases the promise `run()` handed
+	back.
+
+	Idempotent, because more than one of those can happen at once, and a second
+	Flush of the same interval would write it twice. Returns the first run's
+	outcome on a second call, which is why the signal is missing from it: after
+	a SIGTERM, only `run()` can say which signal it was.
 	*/
 	async stop(): Promise<Shutdown> {
 		if (this.#ended) {
@@ -317,6 +379,13 @@ export class CollectionSession {
 			this.#closed = true;
 			await this.#store.close();
 		}
+
+		/*
+		Last, so that whoever is awaiting `run()` is released with the same
+		complete shutdown `stop()` hands back — the final Flush written and the
+		store closed — rather than partway through one.
+		*/
+		this.#endRun?.();
 
 		return {reason: 'stop', signal: undefined, finalFlush: this.#finalFlush};
 	}

@@ -5,9 +5,11 @@ import {
 	type HistoryData,
 	type HistorySource,
 	type LoadResult,
+	type Totals,
 } from './history.js';
 import {
 	type CollectorFactory,
+	type DashboardView,
 	type Logger,
 	type RunOptions,
 	run,
@@ -23,6 +25,7 @@ import {
 } from './session.js';
 import {TelemetryState} from './state.js';
 import {type FlushResult, type TelemetryStore} from './storage.js';
+import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
 
 const CONFIG: Config = {
 	mongoUri: 'mongodb://example.invalid',
@@ -394,15 +397,17 @@ test('permissions reports the grant and collects nothing', async t => {
 });
 
 /*
-The dashboard path is the one that mounts ink, so this asserts the contract
-around it rather than the view: the source is closed on the way out, and it is
-the one the caller supplied rather than a `MongoClient` built behind its back.
+The dashboard path is the one that mounts ink, so these assert the contract
+around it rather than the view: which sources the caller's are, that they are
+released on the way out, and that the run behind them starts and stops with the
+view.
+
+`renderApp` returns immediately in every case here, which is what a `q` looks
+like from `main`'s side — the view comes down, and the composition root is what
+tells the run to stop.
 */
-test('the dashboard renders through the supplied history source and closes it', async t => {
-	const test_ = harness(granted());
-	const closed: number[] = [];
-	const rendered: HistorySource[] = [];
-	const source: HistorySource = {
+function stubHistory(closed: number[] = []): HistorySource {
+	return {
 		async load(): Promise<LoadResult> {
 			return {ok: true, data: data()};
 		},
@@ -410,22 +415,115 @@ test('the dashboard renders through the supplied history source and closes it', 
 			closed.push(1);
 		},
 	};
+}
+
+test('the dashboard renders through the supplied sources, and stops the run', async t => {
+	const test_ = harness(granted());
+	const closed: number[] = [];
+	const source = stubHistory(closed);
+	const rendered: DashboardView[] = [];
+	test_.options.state?.addLeftClick();
 
 	await run(
 		{kind: 'dashboard'},
 		{
 			...test_.options,
 			historySource: source,
-			async renderApp(passed) {
-				rendered.push(passed);
+			async renderApp(view) {
+				rendered.push(view);
 			},
 		},
 	);
 
-	t.deepEqual(rendered, [source], 'the caller supplies the source, not Mongo');
+	t.deepEqual(
+		rendered.map(view => view.history),
+		[source],
+		'the caller supplies the source, not Mongo',
+	);
+	t.is(rendered[0]?.timeZone, 'Europe/London', 'the zone comes from Config');
 	t.deepEqual(closed, [1], 'closed even though rendering returned');
-	t.is(test_.permissions.calls.length, 0, 'the dashboard does not preflight');
+
+	/*
+	The dashboard collects, and the view coming down is what ends the run — `q`
+	never generates a signal, so nothing else would.
+	*/
+	t.is(test_.collectors[0]?.started, 1);
+	t.is(test_.collectors[0]?.stopped, 1);
+	t.is(test_.store.snapshots.length, 1, 'the final Flush happened anyway');
+	t.is(test_.store.closed, 1);
+	t.deepEqual(test_.logger.lines, ['Stopped.']);
 });
+
+/*
+The dashboard asks the same question `collect` does. It is not only for the
+Collectors: the report is what lets the live view tell a machine nobody has
+touched from a machine with no grant, which is the distinction the view exists
+to draw.
+*/
+test('a missing grant reaches the live view as a disabled reading', async t => {
+	const test_ = harness(denied());
+	const readings: LiveTelemetry[] = [];
+
+	await run(
+		{kind: 'dashboard'},
+		{
+			...test_.options,
+			historySource: stubHistory(),
+			async renderApp(view) {
+				readings.push(view.telemetry.read());
+			},
+		},
+	);
+
+	t.is(test_.permissions.calls.length, 1, 'the dashboard preflights');
+	t.deepEqual(readings, [
+		{
+			status: 'disabled',
+			message: 'Input Monitoring is denied for this helper.',
+		},
+	]);
+});
+
+/*
+The wiring between the run and the view, which neither module's own test can
+see: the Session reports each Flush attempt and the source is what hears about
+it. Without it the dashboard draws counters that never move.
+
+Read after the run rather than during it, so the final Flush has landed and
+there is nothing to wait for.
+*/
+test('a Flush is counted into the live totals', async t => {
+	const test_ = harness(granted());
+	let telemetry: TelemetrySource | undefined;
+	test_.options.state?.addLeftClick();
+
+	await run(
+		{kind: 'dashboard'},
+		{
+			...test_.options,
+			historySource: stubHistory(),
+			async renderApp(view) {
+				telemetry = view.telemetry;
+			},
+		},
+	);
+
+	const reading = telemetry?.read();
+	t.deepEqual(totalsOf(reading), {
+		leftClicks: 1,
+		rightClicks: 0,
+		movementMeters: 0,
+		pressTotal: 0,
+	});
+	t.true(
+		reading?.status === 'collecting' && reading.lastFlush?.ok === true,
+		'the Flush that cleared Telemetry State was reported',
+	);
+});
+
+function totalsOf(reading: LiveTelemetry | undefined): Totals | undefined {
+	return reading?.status === 'collecting' ? reading.totals : undefined;
+}
 
 /*
 A quit is not the only way out of the dashboard, and the source must be closed
@@ -440,20 +538,56 @@ test('the history source is closed even when rendering throws', async t => {
 			{kind: 'dashboard'},
 			{
 				...test_.options,
-				historySource: {
-					async load(): Promise<LoadResult> {
-						return {ok: true, data: data()};
-					},
-					async close(): Promise<void> {
-						closed.push(1);
-					},
-				},
+				historySource: stubHistory(closed),
 				async renderApp() {
 					throw new Error('no tty');
 				},
 			},
 		),
 		{message: 'no tty'},
+	);
+
+	t.deepEqual(closed, [1]);
+	t.is(test_.store.closed, 1, 'and the run behind it was stopped');
+});
+
+/*
+A Collector that cannot start is a broken install rather than a missing grant,
+so it still reaches the caller — through the view's lifetime rather than in
+spite of it.
+*/
+test('a Collector that throws on start stops the dashboard and propagates', async t => {
+	const test_ = harness(granted());
+	const closed: number[] = [];
+
+	await t.throwsAsync(
+		run(
+			{kind: 'dashboard'},
+			{
+				...test_.options,
+				historySource: stubHistory(closed),
+				collectors: () => ({
+					collectors: [
+						{
+							start() {
+								throw new Error('no tap');
+							},
+							stop() {
+								// Never reached: the Collector that threw is not stopped.
+							},
+						},
+					],
+				}),
+				async renderApp(view) {
+					/*
+					What `tui.tsx` does: the view stays up until the run ends, and
+					the run has already ended badly here.
+					*/
+					await view.ended;
+				},
+			},
+		),
+		{message: 'no tap'},
 	);
 
 	t.deepEqual(closed, [1]);

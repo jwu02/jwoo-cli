@@ -4,19 +4,37 @@ The dashboard, mounted.
 Split out from `main.tsx` so that the only module which statically imports ink
 and react is one that a headless `collect` never loads (ADR-0001). Nothing here
 decides anything: it mounts the App, waits for it to be exited, and returns. The
-store's lifetime is the caller's — `main.tsx` closes it in a `finally`.
+sources' lifetime is the caller's — `main.tsx` stops the session and closes the
+history source in a `finally`.
 */
 
 import {render} from 'ink';
 import App from './app.js';
-import {type HistorySource} from './history.js';
+import {type DashboardView} from './main.js';
 
-export async function renderApp(source: HistorySource): Promise<void> {
-	const instance = render(<App source={source} />);
+export async function renderApp({
+	history,
+	telemetry,
+	timeZone,
+	ended,
+}: DashboardView): Promise<void> {
+	const instance = render(
+		<App history={history} telemetry={telemetry} timeZone={timeZone} />,
+	);
 
 	/*
-	Quitting is not the only way out — Ctrl-C takes the default path — so the
-	dashboard ends on any exit, not just `q`.
+	Quitting is not the only way out. A signal ends the run without the view
+	asking, and the frame left behind would go on showing counters as though
+	they were still moving. `unmount()` is idempotent, so this is safe on the
+	ordinary path too, where the run is ended after the view already has.
+	*/
+	void ended.then(() => {
+		instance.unmount();
+	});
+
+	/*
+	Ctrl-C takes the default path as well as `q`, so the dashboard ends on any
+	exit rather than only on the key.
 	*/
 	await instance.waitUntilExit();
 }

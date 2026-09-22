@@ -44,10 +44,20 @@ $ node --env-file=.env dist/cli.js collect      # collect, without the dashboard
 $ node --env-file=.env dist/cli.js permissions  # report the macOS grants
 ```
 
+The dashboard collects while it is open, and shows two views of what it collects: Today and This
+week, read back from Atlas, and a live view of the run in progress. `t` and `w` switch the range,
+`l` the live view, `q` quits.
+
 `collect` is a subcommand rather than a key inside the dashboard, because collection is not
 something that only exists inside a rendered Ink tree (ADR-0001). It runs in the foreground and
 stops when it exits — there is no background process. `SIGINT` and `SIGTERM` both end with a
 final Flush, so quitting does not lose the counters accumulated since the last Flush Interval.
+
+The live view draws what the run has observed since it started — not since the last Flush, which
+would fall back to zero every five minutes — along with when the last Flush was attempted and
+whether it succeeded. A machine whose Input Monitoring grant is missing draws as disabled rather
+than as zeroes, because nothing has arrived yet and nothing is being collected are the same
+numbers and not the same thing.
 
 A missing macOS permission degrades collection rather than stopping the CLI: the Collectors it
 affects are disabled and named, and everything else carries on. `permissions` reports the same

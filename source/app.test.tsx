@@ -7,6 +7,7 @@ import {
 	type LoadResult,
 } from './history.js';
 import {type Range} from './ranges.js';
+import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
 
 /*
 Serial for the same reason as `use-history.test.tsx`: each case mounts a real
@@ -56,6 +57,40 @@ class StubHistorySource implements HistorySource {
 	}
 }
 
+/*
+The live numbers are as distinctive as the history's, so a frame can only be
+satisfied by the view that was asked for. Nothing here reads the source: what is
+under test is which view is drawn, and the live view's own arithmetic belongs to
+`live-view.test.tsx`.
+*/
+const LIVE_PRESS_TOTAL = 999;
+
+class StubTelemetrySource implements TelemetrySource {
+	reading: LiveTelemetry = {
+		status: 'collecting',
+		totals: {
+			leftClicks: 3,
+			rightClicks: 1,
+			movementMeters: 12.5,
+			pressTotal: LIVE_PRESS_TOTAL,
+		},
+		lastFlush: undefined,
+	};
+
+	read(): LiveTelemetry {
+		return this.reading;
+	}
+}
+
+function dashboard(
+	history: HistorySource,
+	telemetry: TelemetrySource = new StubTelemetrySource(),
+) {
+	return (
+		<App history={history} telemetry={telemetry} timeZone="Europe/London" />
+	);
+}
+
 async function settle(): Promise<void> {
 	for (let turn = 0; turn < 2; turn += 1) {
 		// eslint-disable-next-line no-await-in-loop -- the turns must be sequential; that is the point.
@@ -67,7 +102,7 @@ async function settle(): Promise<void> {
 
 test.serial('the landing view is the history for today', async t => {
 	const source = new StubHistorySource();
-	const {lastFrame} = render(<App source={source} />);
+	const {lastFrame} = render(dashboard(source));
 	await settle();
 
 	// The default landing view, and the one that works before anything has
@@ -78,7 +113,7 @@ test.serial('the landing view is the history for today', async t => {
 
 test.serial('w switches the view to this week', async t => {
 	const source = new StubHistorySource();
-	const {stdin, lastFrame} = render(<App source={source} />);
+	const {stdin, lastFrame} = render(dashboard(source));
 	await settle();
 
 	stdin.write('w');
@@ -90,7 +125,7 @@ test.serial('w switches the view to this week', async t => {
 
 test.serial('t switches back to today', async t => {
 	const source = new StubHistorySource();
-	const {stdin, lastFrame} = render(<App source={source} />);
+	const {stdin, lastFrame} = render(dashboard(source));
 	await settle();
 
 	stdin.write('w');
@@ -100,6 +135,57 @@ test.serial('t switches back to today', async t => {
 
 	t.deepEqual(source.requests, ['today', 'week', 'today']);
 	t.regex(lastFrame() ?? '', /Press Total\s+1,111/v);
+});
+
+test.serial('l switches to the live view', async t => {
+	const source = new StubHistorySource();
+	/*
+	Unmounted rather than left to the end of the run: the live view polls, and a
+	component still mounted when the test finishes leaves a timer behind that
+	ava waits on.
+	*/
+	const {stdin, lastFrame, unmount} = render(dashboard(source));
+	t.teardown(() => {
+		unmount();
+	});
+	await settle();
+
+	stdin.write('l');
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.regex(frame, /since the CLI started/v);
+	t.regex(
+		frame,
+		new RegExp(String.raw`Press Total\s+${LIVE_PRESS_TOTAL}`, 'v'),
+	);
+
+	// The history's numbers are gone rather than drawn under a second heading.
+	t.false(frame.includes('1,111'));
+	// Nothing was re-read: the range did not change, only the view.
+	t.deepEqual(source.requests, ['today']);
+});
+
+/*
+There is no key that toggles back to "whatever was showing". A range key is the
+way back, which is what makes the heading above the numbers unambiguous.
+*/
+test.serial('a range key is the way back from the live view', async t => {
+	const source = new StubHistorySource();
+	const {stdin, lastFrame, unmount} = render(dashboard(source));
+	t.teardown(() => {
+		unmount();
+	});
+	await settle();
+
+	stdin.write('l');
+	await settle();
+	stdin.write('t');
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.regex(frame, /Press Total\s+1,111/v);
+	t.false(frame.includes('since the CLI started'));
 });
 
 /*

@@ -28,7 +28,7 @@ export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 | `npx ava --match 'click counters'`             | One test by name.                                                     |
 | `npm run build`                                | `tsc --project tsconfig.build.json` → `dist/`, tests excluded.        |
 | `npm run dev`                                  | The same build, in watch mode.                                        |
-| `node --env-file=.env dist/cli.js`             | Run the dashboard. Needs `MONGO_URI`; see `.env.example`.             |
+| `node --env-file=.env dist/cli.js`             | The dashboard, which collects while it is open. Needs `MONGO_URI`.    |
 | `node --env-file=.env dist/cli.js collect`     | Collect and Flush, with no TUI.                                       |
 | `node --env-file=.env dist/cli.js permissions` | Report the macOS grants and exit.                                     |
 | `./helper/build.sh`                            | Rebuild the native capture helper. Needs Xcode CLI tools.             |
@@ -51,12 +51,13 @@ it. `config.ts` is the only place any environment variable is read.
 
 ## Architecture
 
-### Two seams, and no database in the test suite
+### Seams, and no database in the test suite
 
 `storage.ts` (write) and `history.ts` (read) are mirrored seams. Each declares its own narrow
 slice of the driver's types — `Collection`, `Database`, `AggregationCursor` — and nothing else
 in the codebase imports `mongodb`. Every test drives a hand-written in-memory fake; there is no
-test database and no test container.
+test database and no test container. `telemetry.ts` is the third, and the only one with no
+database behind it at all — see _The live view reads a third seam_ below.
 
 The narrow types are deliberately faithful about async-ness, and that is load-bearing.
 `Collection.insertOne` returns a Promise because the driver's does, and `Collection.aggregate`
@@ -84,6 +85,14 @@ The collector must not be reachable only through the TUI (ADR-0001), which is wh
 subcommand and not a key. `main.tsx` reaches `tui.tsx` — the module that imports ink and react —
 through a dynamic import, so a headless run never loads either.
 
+**The dashboard collects too.** It runs the same preflight and the same Session `collect` does,
+and mounts the view over the run; `collect` is the way to run without a view, not the way to
+collect. The dependency runs the other way round as well: `q` arrives as input in a raw-mode
+terminal and never generates a SIGINT, so a view that comes down is what ends the run —
+`stop()` releases the promise `run()` handed back. On a signal the reverse happens: the run ends
+and `DashboardView.ended` is what brings the frame down, so a TUI cannot outlive its run and go
+on claiming to be live.
+
 ### The permission preflight degrades, it does not stop
 
 `permissions.ts` asks the helper (`--preflight`) rather than checking anything itself, because
@@ -94,13 +103,26 @@ disables; the composition root then builds fewer Collectors. Nothing exits on `d
 It throws only when the helper cannot be _asked_ — a missing binary, a crash, a hang. That is a
 broken install, not a missing permission, and the two must not be confused.
 
-### The read path is built; the collection path is not
+### The live view reads a third seam
 
-The history view is wired up. The native capture helper exists (`helper/`, issue #6), but there
-is still no Collector and nothing spawns the helper — that is issue #7. `cli.tsx`'s factory
-returns no Collectors, so `collect` starts, reports the grant, and waits for a signal with
-nothing to Flush. `TelemetryState`, the storage seam, the aggregation pipelines, and the Key
-Label table (`key-labels.ts`) are ported and tested.
+`telemetry.ts` sits beside `storage.ts` and `history.ts`: `TelemetrySource.read()` returns the
+counters for the run that is happening now. The in-process implementation reads Telemetry State,
+and the read is **synchronous** — there is nothing to await, and saying otherwise would be a
+pretence. Moving collection to a separate process makes it a socket and the read a promise, and
+that change lands in `telemetry.ts` and `use-telemetry.ts` and nowhere near the view, which asks
+a `TelemetrySource` and does not know what is behind it.
+
+**A successful Flush clears Telemetry State**, so a view reading the accumulator alone would
+watch every counter fall back to zero at the Flush Interval and call that live. The Session
+therefore reports each Flush attempt through `onFlush`, with the Snapshot it wrote, and the
+source adds a _successful_ one to a running total. Gating on success is load-bearing rather than
+defensive: a failed Flush leaves Telemetry State whole so the same counters are retried, and
+adding them here as well would count the same presses twice.
+
+The grant belongs to the reading rather than to the view. `LiveTelemetry` is a union of
+`collecting` and `disabled` instead of totals plus an `enabled` flag, because a machine with no
+grant produces counters that are zero in exactly the way a machine nobody has touched does — and
+the user who has just granted the permission is the one who cannot tell them apart.
 
 `session.ts` is where the Flush Interval and the final Flush live. It is a plain module with
 `run()`/`stop()`, and `run()` resolves only once the final Flush and the close have finished —
@@ -174,10 +196,16 @@ is the output a test asserts against.
 ### React layering
 
 The TUI is Ink 7 on React 19, and the `.tsx` extension marks the whole of it: `tui.tsx`,
-`app.tsx`, `history-view.tsx` and `use-history.ts` are the only modules that import `ink` or
-`react`. Everything else is plain TypeScript, which is what ADR-0001 requires of the Collector
-so that the move to a separate process is a different entry point rather than a rewrite. Tests
-render through `ink-testing-library`.
+`app.tsx`, `history-view.tsx`, `live-view.tsx`, `totals-view.tsx`, `use-history.ts` and
+`use-telemetry.ts` are the only modules that import `ink` or `react`. Everything else is plain
+TypeScript, which is what ADR-0001 requires of the Collector so that the move to a separate
+process is a different entry point rather than a rewrite. Tests render through
+`ink-testing-library`.
+
+The two views draw the same three lines — Clicks, Mouse Distance, Press Total — and share
+`totals-view.tsx` rather than each spelling them, with the number formats alongside in
+`format.ts`. Only the heading above the block says which view it is, so a difference between
+them would be a bug rather than a difference of meaning.
 
 `main.tsx` also carries the `.tsx` extension and imports neither ink nor react; it reaches
 `tui.tsx` dynamically. That is a constraint to keep, not a coincidence: a module on the
@@ -186,10 +214,19 @@ render through `ink-testing-library`.
 `use-history.ts` holds the loading state machine — three states rather than a value plus a flag,
 because "nothing yet", "nothing there" and "could not ask" draw completely differently — while
 `history-view.tsx` is presentational and synchronous, tested by rendering a fixed `LoadState`.
+`use-telemetry.ts` and `live-view.tsx` split the same way: the hook polls and holds nothing but
+the timer, and the view takes a reading and a zone. The polling is mounted with `live-view.tsx`
+rather than held in `app.tsx`, so the history view does not redraw once a second for a view that
+is not on screen.
+
+**Unmount the Ink root in any test that leaves the live view mounted.** A pending `setInterval`
+holds ava's worker open, and the run ends in `✘ Timed out while running tests` rather than in a
+failed assertion. `t.teardown(() => { unmount(); })` is the whole fix.
 
 `HistorySource` must be referentially stable: `app.tsx` takes it as a prop and the load effect
 is keyed on it, so constructing one inside a component body reloads forever. That is why
-`cli.tsx` builds it and passes it down.
+`main.tsx` builds it and passes it down. The same goes for `TelemetrySource`, which `App` hands
+to the live view.
 
 A failed read resolves to `{ok: false, message}` rather than rejecting. A rejection raised
 inside an effect is an unhandled rejection, which ends the process by default — the TUI would
