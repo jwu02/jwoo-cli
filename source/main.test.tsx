@@ -14,7 +14,7 @@ import {
 	type RunOptions,
 	run,
 } from './main.js';
-import {type StreamProblem} from './event-stream.js';
+import {type StreamProblem} from './helper.js';
 import {KeyboardCollector} from './keyboard.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
 import {type HelperError, keyEventAt, type RawEvent} from './raw-event.js';

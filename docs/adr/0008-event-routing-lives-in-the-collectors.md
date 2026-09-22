@@ -19,7 +19,7 @@ states no event ownership.
 
 - A new Collector is one module and no switch; a new wire event type must be considered in
   each Collector's ignore list instead of one switch. The forcing functions are the
-  `--self-check` pin in `event-stream.test.ts`, which fails until a new wire type is added
+  `--self-check` pin in `helper.test.ts`, which fails until a new wire type is added
   to it, and the delivery tests, which drive real Collectors over every wire type.
 - The helper's `error` line stays an event like any other: delivered by the stream, ignored
   by the Collectors, and reported by the wiring that consumes it. This was previously a

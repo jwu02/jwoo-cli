@@ -24,7 +24,7 @@ import {
 	EventStream as HelperStream,
 	requestInputMonitoring as askForInputMonitoring,
 	type StreamProblem,
-} from './event-stream.js';
+} from './helper.js';
 import {MongoHistorySource, type HistorySource} from './history.js';
 import {KeyboardCollector} from './keyboard.js';
 import {MouseCollector} from './mouse.js';
@@ -63,7 +63,7 @@ The helper's stream as the wiring reaches for it: the Session's slice of it,
 plus the one thing the Collectors need, which is somewhere to attach the handler
 their events arrive on.
 
-Structural rather than the class in `event-stream.ts`, which has private fields
+Structural rather than the class in `helper.ts`, which has private fields
 and so cannot be stood in for — and a stand-in is the whole point of the seam.
 */
 export type EventSource = EventStream & {

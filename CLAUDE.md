@@ -79,7 +79,7 @@ delivery is executed rather than described.
 Collector, and each ignores by name what it does not own — the shape `mouse.ts` always had, and
 the one `keyboard.ts` now shares. Nothing outside a Collector states which events are its, so a
 new Collector is a new module and one entry in the list. A new wire event type is forced into
-view by the `--self-check` pin in `event-stream.test.ts`, which fails until it is considered,
+view by the `--self-check` pin in `helper.test.ts`, which fails until it is considered,
 and the delivery tests in `main.test.tsx` are what execute the ownership for every type the
 format carries. The helper's failure line is delivered like any other event, owned by nobody,
 and reported by that wiring.
