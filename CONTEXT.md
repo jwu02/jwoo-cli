@@ -59,11 +59,18 @@ _Avoid_: dump, export, freeze
 
 **Flush**:
 Writing a Snapshot to storage. Telemetry State is cleared only on a successful Flush; a failed
-Flush leaves it intact so the same data is retried on the next interval.
+Flush leaves it intact so the same data is retried on the next interval, overwriting what the
+failed attempt wrote rather than adding to it (ADR-0009).
 _Avoid_: save, persist, sync, upload, commit
 
 **Flush Interval**:
 How long Telemetry State accumulates before a Flush is attempted.
+
+**Era**:
+The Activity accumulated between one successful Flush and the next — what one Telemetry State
+holds while it is being written. A Flush that fails stays in its era: the retry writes the same
+era's documents again, under the same stamp, rather than opening a new one (ADR-0009).
+_Avoid_: epoch, generation, attempt (an attempt is one try; an era can span several)
 
 **Telemetry Document**:
 One flushed interval's mouse and keyboard totals.

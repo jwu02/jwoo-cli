@@ -60,7 +60,7 @@ test database and no test container. `telemetry.ts` is the third, and the only o
 database behind it at all — see _The live view reads a third seam_ below.
 
 The narrow types are deliberately faithful about async-ness, and that is load-bearing.
-`Collection.insertOne` returns a Promise because the driver's does, and `Collection.aggregate`
+`Collection.replaceOne` returns a Promise because the driver's does, and `Collection.aggregate`
 is _synchronous_ because the driver's is — the `await` belongs on `toArray()`. A fake that lied
 about either would let a missing `await` pass every test while losing data against a real server.
 

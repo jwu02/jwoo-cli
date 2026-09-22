@@ -17,14 +17,48 @@ pass every test here while losing data against a real server.
 */
 
 class FakeCollection implements Collection {
-	readonly name: string;
+	readonly collectionName: string;
 	readonly indexes = new Map<string, number>();
 	readonly documents: Array<Record<string, unknown>> = [];
-	failInsertsWith?: Error;
+	failWritesWith?: Error;
+	/*
+	Records the write and *then* rejects, standing in for a write whose
+	acknowledgement was lost rather than its effect — a timeout after the
+	server applied it.
+	*/
+	failAfterWriteWith?: Error;
 	failIndexesWith?: Error;
 
 	constructor(name: string) {
-		this.name = name;
+		this.collectionName = name;
+	}
+
+	/*
+	Upsert semantics as the driver has them: `upsert: false` matches nothing
+	and writes nothing, which is what catches a store that dropped the option
+	it depends on.
+	*/
+	#upsert(
+		filter: {_id: string},
+		replacement: Record<string, unknown>,
+		options: {upsert: boolean},
+	): {upsertedId?: string; matchedCount?: number} {
+		const existing = this.documents.findIndex(
+			document => document['_id'] === filter._id,
+		);
+
+		if (existing === -1) {
+			if (!options.upsert) {
+				return {matchedCount: 0};
+			}
+
+			this.documents.push(replacement);
+			return {upsertedId: String(replacement['_id'])};
+		}
+
+		// Replaced in place, so a document's position says which Flush wrote it.
+		this.documents[existing] = replacement;
+		return {matchedCount: 1};
 	}
 
 	async createIndex(
@@ -39,15 +73,22 @@ class FakeCollection implements Collection {
 		return 'createdAt_1';
 	}
 
-	async insertOne(
-		document: Record<string, unknown>,
-	): Promise<{insertedId: string}> {
-		if (this.failInsertsWith) {
-			throw this.failInsertsWith;
+	async replaceOne(
+		filter: {_id: string},
+		replacement: Record<string, unknown>,
+		options: {upsert: boolean},
+	): Promise<{upsertedId?: string; matchedCount?: number}> {
+		if (this.failAfterWriteWith) {
+			const error = this.failAfterWriteWith;
+			this.#upsert(filter, replacement, options);
+			throw error;
 		}
 
-		this.documents.push(document);
-		return {insertedId: `id-${this.documents.length}`};
+		if (this.failWritesWith) {
+			throw this.failWritesWith;
+		}
+
+		return this.#upsert(filter, replacement, options);
 	}
 }
 
@@ -151,11 +192,12 @@ test('flush writes a telemetry document and a key count document', async t => {
 
 	const result = await store.flush(stateWithActivity().snapshot());
 
-	// The two collections hand out independent id sequences.
-	t.deepEqual(result, ['id-1', 'id-1']);
-
 	const [telemetry] = database.collection('telemetry').documents;
 	const [heatmap] = database.collection('keyboard_heatmap').documents;
+
+	// The result names exactly the documents the collections now hold: each id
+	// is the Flush's stamp plus the collection's name (ADR-0009).
+	t.deepEqual(result, [telemetry?.['_id'], heatmap?.['_id']]);
 
 	t.is(telemetry?.['leftClicks'], 1);
 	t.is(telemetry?.['rightClicks'], 2);
@@ -198,7 +240,7 @@ test('flush reports failure so the caller can keep the state', async t => {
 	const database = new FakeDatabase();
 	const logger = new FakeLogger();
 	const store = await buildStore(database, logger);
-	database.collection('keyboard_heatmap').failInsertsWith = new Error('boom');
+	database.collection('keyboard_heatmap').failWritesWith = new Error('boom');
 
 	const result = await store.flush(stateWithActivity().snapshot());
 
@@ -206,6 +248,108 @@ test('flush reports failure so the caller can keep the state', async t => {
 	// Telemetry State and retries the same data next interval.
 	t.is(result, undefined);
 	t.is(logger.warnings.length, 1);
+});
+
+test('a Flush that failed after writing is overwritten by the retry, not duplicated', async t => {
+	const database = new FakeDatabase();
+	const store = await buildStore(database);
+	database.collection('keyboard_heatmap').failWritesWith = new Error('boom');
+
+	await store.flush(stateWithActivity().snapshot());
+
+	// The partial Flush left its Telemetry Document behind.
+	const [partial] = database.collection('telemetry').documents;
+	t.is(partial?.['keysPressed'], 3);
+
+	// The retry is the same Telemetry State plus the next interval's Activity —
+	// one accumulator that kept counting, not a second one.
+	const state = stateWithActivity();
+	state.addKeyPress('Escape');
+	database.collection('keyboard_heatmap').failWritesWith = undefined;
+
+	const result = await store.flush(state.snapshot());
+
+	t.is(result?.length, 2);
+	t.is(database.collection('telemetry').documents.length, 1);
+	t.is(database.collection('keyboard_heatmap').documents.length, 1);
+
+	// The surviving Telemetry Document holds the union, and it carries the
+	// failed attempt's createdAt: the reader buckets on that field, so the era
+	// lands where its first attempt put it.
+	const [telemetry] = database.collection('telemetry').documents;
+	t.is(telemetry?.['keysPressed'], 4);
+	t.is(telemetry?.['createdAt'], partial?.['createdAt']);
+
+	const [heatmap] = database.collection('keyboard_heatmap').documents;
+	t.is(heatmap?.['A'], 2);
+	t.is(heatmap?.['Return'], 1);
+	t.is(heatmap?.['Escape'], 1);
+});
+
+test('a retry that fails again keeps overwriting the same documents', async t => {
+	const database = new FakeDatabase();
+	const store = await buildStore(database);
+	const heatmap = database.collection('keyboard_heatmap');
+	heatmap.failWritesWith = new Error('boom');
+
+	await store.flush(stateWithActivity().snapshot());
+
+	const state = stateWithActivity();
+	state.addKeyPress('Escape');
+	await store.flush(state.snapshot());
+	t.is(database.collection('telemetry').documents.length, 1);
+
+	state.addKeyPress('Escape');
+	heatmap.failWritesWith = undefined;
+	await store.flush(state.snapshot());
+
+	// Two failed attempts and one success still leave one document per
+	// collection, holding everything the era observed.
+	t.is(database.collection('telemetry').documents.length, 1);
+	t.is(heatmap.documents.length, 1);
+	t.is(database.collection('telemetry').documents[0]?.['keysPressed'], 5);
+	t.is(heatmap.documents[0]?.['Escape'], 2);
+});
+
+test('a write the driver reported as failed but that landed is overwritten too', async t => {
+	const database = new FakeDatabase();
+	const store = await buildStore(database);
+	database.collection('telemetry').failAfterWriteWith = new Error('timed out');
+
+	await store.flush(stateWithActivity().snapshot());
+
+	// The Telemetry Document is there even though the Flush reported failure —
+	// the acknowledgement was lost, not the write.
+	t.is(database.collection('telemetry').documents.length, 1);
+
+	database.collection('telemetry').failAfterWriteWith = undefined;
+	await store.flush(stateWithActivity().snapshot());
+
+	// The retry must land on the same document rather than beside it.
+	t.is(database.collection('telemetry').documents.length, 1);
+});
+
+test('a successful Flush closes the retry, so the next Flush writes fresh documents', async t => {
+	const database = new FakeDatabase();
+	const store = await buildStore(database);
+
+	await store.flush(stateWithActivity().snapshot());
+
+	const state = new TelemetryState({mouseDpi: 72});
+	state.addKeyPress('Escape');
+	await store.flush(state.snapshot());
+
+	// Two eras, two Telemetry Documents. The second Flush must not overwrite
+	// the first, or a successful interval would lose its data to the next one.
+	const telemetry = database.collection('telemetry').documents;
+	t.is(telemetry.length, 2);
+	t.is(telemetry[0]?.['keysPressed'], 3);
+	t.is(telemetry[1]?.['keysPressed'], 1);
+
+	const heatmaps = database.collection('keyboard_heatmap').documents;
+	t.is(heatmaps.length, 2);
+	t.is(heatmaps[0]?.['A'], 2);
+	t.is(heatmaps[1]?.['Escape'], 1);
 });
 
 test('creating the TTL indexes is idempotent', async t => {
@@ -237,10 +381,8 @@ test('without an injected database the store builds one from MongoClient', async
 	// `collection()` straight off the client — as this store used to — is a
 	// TypeError against a real driver, and no fake-backed test would see it.
 	t.deepEqual(client.databasesRequested, ['test']);
-	t.deepEqual(await store.flush(stateWithActivity().snapshot()), [
-		'id-1',
-		'id-1',
-	]);
+	const result = await store.flush(stateWithActivity().snapshot());
+	t.is(result?.length, 2);
 });
 
 test('close() closes a client the store owns', async t => {
@@ -277,8 +419,6 @@ test('a failed TTL index is a warning, not a crash', async t => {
 	t.regex(logger.warnings[0]!.message, /TTL index/v);
 
 	// And the store is still usable.
-	t.deepEqual(await store.flush(stateWithActivity().snapshot()), [
-		'id-1',
-		'id-1',
-	]);
+	const result = await store.flush(stateWithActivity().snapshot());
+	t.is(result?.length, 2);
 });
