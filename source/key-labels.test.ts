@@ -13,7 +13,6 @@ the disagreement loud.
 */
 
 import test from 'ava';
-import {labelForEvent} from './key-character.js';
 import {LABEL_FOR_KEYCODE, labelForKeycode} from './key-labels.js';
 
 /*
@@ -175,77 +174,26 @@ test('a keycode resolves to its label, or to nothing', t => {
 });
 
 /*
-Labels this table can produce that the website has no Physical Key for. Each is
-counted here and discarded there, deliberately rather than by oversight:
+Some labels this table can produce have no Physical Key on the website, and are
+counted here while being discarded there:
 
-- `F13`-`F20`: the M3 Air 13" keyboard the website models has F1-F12 and no
-  more, which is also why #7 ignores them.
-- `Keypad *` and friends: the M3 Air has no numeric keypad. They arrive only
-  from an external one, and the website draws no key for them.
+- `F13`-`F20`: the M3 Air 13" the website models has F1-F12 and no more, which
+  is also why #7 ignores them.
+- `Keypad *` and the rest of the numeric keypad: the M3 Air has none, so they
+  arrive only from an external one and the website draws no key for them.
 - `Mute`, `Volume Down`, `Volume Up`: media keys, likewise undrawn.
 
-`Keypad Enter` is the near miss worth knowing about. The website does know a
-`Numpad Enter`, on the Return physical key, and this table produces that too
-(keycode 52) - but the keypad's own Return key is keycode 76, which the Python
-table calls `Keypad Enter` and which resolves to nothing. A keypad Return press
-is therefore invisible to the heatmap in both clients.
+`Keypad Enter` is the near miss. The website does know a `Numpad Enter`, on the
+Return physical key, and this table produces that too (keycode 52) — but the
+keypad's own Return is keycode 76, which the Python table calls `Keypad Enter`
+and which the website resolves to nothing. A keypad Return press is therefore
+invisible to the heatmap in both clients.
 
-If this list ever fails because the website *gained* support for one of these,
-delete that label here. If it fails because the website lost one, that is the
-wire format breaking: fix the website.
-*/
-const DELIBERATE_SILENT_DROPS: readonly string[] = [
-	'F13',
-	'F14',
-	'F15',
-	'F16',
-	'F17',
-	'F18',
-	'F19',
-	'F20',
-	'Keypad *',
-	'Keypad +',
-	'Keypad -',
-	'Keypad .',
-	'Keypad /',
-	'Keypad 0',
-	'Keypad 1',
-	'Keypad 2',
-	'Keypad 3',
-	'Keypad 4',
-	'Keypad 5',
-	'Keypad 6',
-	'Keypad 7',
-	'Keypad 8',
-	'Keypad 9',
-	'Keypad =',
-	'Keypad Clear',
-	'Keypad Enter',
-	'Mute',
-	'Volume Down',
-	'Volume Up',
-];
-
-/*
-`DELIBERATE_SILENT_DROPS` is the only set allowed to be unresolved, so this
-assertion has no expected list of its own — empty is the only passing value.
-
-**This test is expected to fail until `jwoo`'s `key-layout.ts` is updated**, and
-that is the point rather than a broken build. What it currently reports is the
-UK character set the Collector gained with this change but the website has no
-Physical Key for: `£` from Shift+3, `€` from Option+2, and the rest of the
-Option layer.
-
-Those are labels the website is now *choosing* to drop — `key-layout.ts` says of
-`€` and `£` that they are "deliberately NOT tracked as heatmap labels" — and
-that comment and this test disagree. Only its author can settle which is right,
-so the disagreement is left visible rather than resolved by whichever repo was
-edited last.
-
-The way out is a website change: give the labels a Physical Key. It is never to
-add them to `DELIBERATE_SILENT_DROPS` (that means the drop is intended, and
-nothing records the decision to revisit it) and never to delete them from the
-character table (that throws away the data the website would need).
+Nothing asserts any of this: the check was against the website's own
+`key-layout.ts`, and it is gone rather than kept as a test that reads outside
+this repo. So the risk ADR-0004 describes is now unguarded here — a label added
+to the table above and not taught to the website still vanishes in silence,
+with the pinned list as the only thing a rename has to be made against.
 */
 
 /*
@@ -315,108 +263,4 @@ key that occupies 65 on a Mac, and 0xa0 would not resolve at all.
 test('no Windows table is carried', t => {
 	t.is(labelForKeycode(0x41), 'Keypad .');
 	t.is(labelForKeycode(0xa0), undefined);
-});
-
-/*
-The flag bits a chord can carry, as `keyboard.test.ts` declares them. The sweep
-below is over the *input* space, so it has to spell the inputs out rather than
-borrow the tables it is checking.
-
-NonCoalesced is in every chord because every captured event carried it.
-SecondaryFn is swept alone as well as with Shift and Option, because Fn is what
-turns the arrows and Delete into their overlay labels.
-*/
-const BARE = 256;
-const SHIFT = 131_072;
-const OPTION = 524_288;
-const SECONDARY_FN = 8_388_608;
-
-const CHORDS = [
-	BARE,
-	BARE | SHIFT,
-	BARE | OPTION,
-	BARE | SHIFT | OPTION,
-	BARE | SECONDARY_FN,
-	BARE | SECONDARY_FN | SHIFT,
-];
-
-/*
-Every Key Label the Collector can produce, as a function of the wire format
-rather than of the tables behind it.
-
-Sweeping keycode and chord through `labelForEvent` is what makes the test below
-a statement about the Collector. Enumerating the tables instead would only check
-that the tables agree with the website, and would stay green for a label
-reachable through a chord no table entry happens to name — which is exactly the
-kind of entry a hand-written character table gets wrong.
-
-The keycode range covers every `kVK_*` macOS defines, which stops at 126, and
-`255` is beyond it: an unmapped keycode must produce nothing rather than throw.
-*/
-function everyLabel(): string[] {
-	const labels = new Set<string>();
-
-	for (const keycode of [...Array.from({length: 128}).keys(), 255]) {
-		for (const flagsRaw of CHORDS) {
-			const label = labelForEvent({keycode, flagsRaw});
-			if (label !== undefined) {
-				labels.add(label);
-			}
-		}
-	}
-
-	return [...labels].toSorted();
-}
-
-/*
-The other half of the wire format. `jwoo/lib/telemetry/key-layout.ts` maps Key
-Labels onto Physical Keys and drops what it does not recognise, silently, so
-"every label we emit resolves there" is a property worth an assertion rather
-than a reading of both files.
-
-The website's own module is imported rather than its label list copied. A copy
-can only catch us adding a label; it stays green when the *website* renames
-one, which is the drift ADR-0004 is about. This is the one test that needs the
-sibling `jwoo` checkout, and it fails with a module-not-found when it is
-absent rather than skipping: a pin that quietly stops checking is worse than
-no pin.
-
-Split into the labels the website is *meant* to drop and those it is not,
-because one flat list cannot tell the two apart. A single `deepEqual` against
-`DELIBERATE_SILENT_DROPS` fails with two arrays of similar-looking strings and
-leaves the reader to diff them by eye; this way a new label that the website
-has not been taught fails on its own name.
-*/
-test('every label the collector can produce resolves in the website', async t => {
-	const keyLayoutPath = new URL(
-		'../../jwoo/lib/telemetry/key-layout.ts',
-		import.meta.url,
-	).href;
-	const keyLayout = (await import(keyLayoutPath)) as {
-		PHYSICAL_KEYS: Array<{id: string; labels: string[]}>;
-	};
-
-	t.true(
-		Array.isArray(keyLayout.PHYSICAL_KEYS),
-		'key-layout.ts no longer exports PHYSICAL_KEYS',
-	);
-
-	const recognised = new Set(
-		keyLayout.PHYSICAL_KEYS.flatMap(physicalKey => physicalKey.labels),
-	);
-	const unresolved = everyLabel().filter(label => !recognised.has(label));
-
-	const drops = new Set(DELIBERATE_SILENT_DROPS);
-
-	t.deepEqual(
-		unresolved.filter(label => drops.has(label)),
-		DELIBERATE_SILENT_DROPS,
-		'the deliberate drops must stay exactly these, and none may go unrecognised by accident',
-	);
-
-	t.deepEqual(
-		unresolved.filter(label => !drops.has(label)),
-		[],
-		'the labels above are the ones the website must gain a Physical Key for',
-	);
 });

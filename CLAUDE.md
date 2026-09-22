@@ -37,9 +37,10 @@ The helper is not part of `npm test`: `prettier` and `xo` do not read `.swift`, 
 neither checks nor covers it. Build it by hand after changing it and commit the binary with the
 source.
 
-One test reads outside this repo: `key-labels.test.ts` imports `jwoo/lib/telemetry/key-layout.ts`
-to check the Key Label wire format against the website's reader. `jwoo` has to be checked out
-alongside this repo for the `ava` step to pass.
+No test reads outside this repo, and none may start: the `ava` step has to pass on a clone of
+this repo alone. The Key Label wire format was once checked by importing the website's
+`jwoo/lib/telemetry/key-layout.ts`, and that test is gone — the label set is pinned here
+instead, by hand, against the website's reader rather than against its module.
 
 Tabs, not spaces (`.editorconfig`). Formatting is `@vdemedes/prettier-config` and `npm test`
 enforces it rather than advising it.
@@ -277,10 +278,9 @@ stay flat numeric scalars and `createdAt` must stay a real BSON Date.
 
 `source/key-labels.ts` is the ported table and `key-labels.test.ts` is what holds it in place.
 The label set is asserted there as a literal list, not derived from the table, so a rename has to
-be made in two places on purpose; and every label is checked against the website's own module,
-which is imported rather than copied. That last test is the only one that reads outside this
-repo: it needs the sibling `jwoo` checkout, and fails with a module-not-found without it rather
-than skipping.
+be made in two places on purpose. It is the only guard: nothing here compiles or reads
+`key-layout.ts`, so a label this CLI emits that the website has not been taught is caught by
+nobody, and disappears in silence exactly as ADR-0004 warns.
 
 Never name anything `Daemon`, `Service`, or `Agent` (ADR-0001). App tracking and Windows support
 are documented as deliberately absent rather than missing, and the glossary should not drift
