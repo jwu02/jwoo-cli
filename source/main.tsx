@@ -23,6 +23,7 @@ import {
 	defaultProblemReporter,
 	EventStream as HelperStream,
 	requestInputMonitoring as askForInputMonitoring,
+	type StreamProblem,
 } from './event-stream.js';
 import {MongoHistorySource, type HistorySource} from './history.js';
 import {KeyboardCollector} from './keyboard.js';
@@ -87,13 +88,14 @@ export type CollectorFactory = (
 ) => CollectorSetup;
 
 /*
-The two things the default factory reaches outside itself for, and the whole
-reason it is reachable from a test: the stream the Collectors read, and the
-grant they need. A granted run can then be driven end to end with a stream of
-the caller's own, and a denied one watched asking for the grant, without a
-capture process and without a TCC prompt (ADR-0002).
+What the default factory reaches outside itself for, and the whole reason it is
+reachable from a test: the stream the Collectors read, the grant they need, and
+where the helper's own failure lines go. A granted run can then be driven end to
+end with a stream of the caller's own, and a denied one watched asking for the
+grant, without a capture process and without a TCC prompt (ADR-0002).
 
-Both are what a real run wants when nothing is supplied, so neither is required.
+All three are what a real run wants when nothing is supplied, so none is
+required.
 */
 export type CollectorFactoryOptions = {
 	/*
@@ -107,6 +109,19 @@ export type CollectorFactoryOptions = {
 	that asks is the one where the user has just been told it is absent.
 	*/
 	readonly requestInputMonitoring?: () => void;
+	/*
+	Where the helper's failure line goes. It arrives as an event like any other
+	and is owned by no Collector, so the wiring that consumes the stream is what
+	reports it (ADR-0008) — and a caller that wants to see that it happened, or
+	to keep it out of a test's output, supplies this.
+
+	That line, and not the stream's other problems: a line that would not parse,
+	an exit, a helper that could not run are reported through the `EventStream`
+	the caller builds, which is theirs. Both default to the same reporter,
+	because a failure that reached nothing would leave a run looking exactly
+	like an idle machine.
+	*/
+	readonly onProblem?: (problem: StreamProblem) => void;
 };
 
 /*
@@ -120,6 +135,7 @@ shape as any other degraded run.
 export function defaultCollectorFactory({
 	createStream = () => new HelperStream({}),
 	requestInputMonitoring = askForInputMonitoring,
+	onProblem = defaultProblemReporter,
 }: CollectorFactoryOptions): CollectorFactory {
 	return (report, state) => {
 		if (report.status !== 'granted') {
@@ -140,9 +156,21 @@ export function defaultCollectorFactory({
 		*/
 		const stream = createStream();
 
-		return {collectors: collectorsOver(stream, state), stream};
+		return {collectors: collectorsOver(stream, state, onProblem), stream};
 	};
 }
+
+/*
+A Collector as the wiring needs it: the `start()`/`stop()` the Session asks for,
+and the `handle()` the events arrive on.
+
+Declared here rather than widened into `session.ts`, because the Session starts
+and stops a Collector and nothing else (ADR-0001) — delivery is the composition
+root's business (ADR-0008).
+*/
+type EventCollector = Collector & {
+	handle(event: RawEvent): void;
+};
 
 /*
 Both Collectors read the one tap, so both are built over one stream. Spawning
@@ -153,17 +181,20 @@ Both also count into the one Telemetry State the Session flushes, which arrives
 as an argument rather than being built here. Building one here would compile,
 run, and write nothing at all.
 
-The switch below is where event ownership is stated, and it is stated here
-rather than in the entry point so that a test executes it (ADR-0008). It is not
-where that decision leaves it — the end state is delivery to every Collector,
-each ignoring what it does not own — and the change that gets there is #14.
+Delivery is a loop over the Collectors rather than a switch that decides between
+them, which is the whole of ADR-0008: nothing here states which Collector owns
+which event, each is shown all of them and ignores by name what it does not own,
+and a new Collector is a new entry in the list below and no edit anywhere else.
 */
 function collectorsOver(
 	stream: EventSource,
 	state: TelemetryState,
-): Collector[] {
-	const keyboard = new KeyboardCollector({state});
-	const mouse = new MouseCollector({state});
+	onProblem: (problem: StreamProblem) => void,
+): EventCollector[] {
+	const collectors: EventCollector[] = [
+		new KeyboardCollector({state}),
+		new MouseCollector({state}),
+	];
 
 	/*
 	Wired before the stream can start. The Session starts the stream and then
@@ -172,45 +203,23 @@ function collectorsOver(
 	do quietly.
 	*/
 	stream.onEvent(event => {
-		switch (event.type) {
-			case 'keyDown':
-			case 'keyUp':
-			case 'flagsChanged': {
-				keyboard.handle(event);
-				return;
-			}
+		for (const collector of collectors) {
+			collector.handle(event);
+		}
 
-			case 'mouseMoved':
-			case 'mouseDown':
-			case 'mouseUp': {
-				mouse.handle(event);
-				return;
-			}
-
-			case 'error': {
-				/*
-				The helper's own failure line. It is on stdout rather than
-				stderr precisely so it cannot be missed, and it belongs with the
-				stream's own problems: both are statements about why there is no
-				input rather than about a key or a click.
-				*/
-				defaultProblemReporter({kind: 'error-line', error: event});
-				break;
-			}
-
-			case 'preflight': {
-				/*
-				Unreachable from a streaming run: `--preflight` exits before a
-				tap exists, so the helper never prints one while emitting
-				events. Named rather than folded into a `default` so that adding
-				an event type to the wire format has to be considered here.
-				*/
-				break;
-			}
+		/*
+		The helper's own failure line, which is an event like any other: the
+		Collectors have just been shown it and none of them owns it. It is on
+		stdout rather than stderr precisely so it cannot be missed, and it belongs
+		with the stream's own problems — both are statements about why there is no
+		input rather than about a key or a click.
+		*/
+		if (event.type === 'error') {
+			onProblem({kind: 'error-line', error: event});
 		}
 	});
 
-	return [keyboard, mouse];
+	return collectors;
 }
 
 export type Logger = Pick<Console, 'log' | 'warn'>;

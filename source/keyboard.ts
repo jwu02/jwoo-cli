@@ -6,7 +6,8 @@ later move to a separate process is a different entry point rather than a rewrit
 (ADR-0001). It owns no listener: events arrive through `handle()`, which is the
 seam the Python suite had when it called `_on_press` and `_on_release` directly —
 the rules below are exercised against synthetic events on any machine, with no
-OS involved (ADR-0003).
+OS involved (ADR-0003). `handle()` is handed every event the helper emits and
+ignores by name the ones it does not own, as the Mouse Collector does (ADR-0008).
 
 The Python original's `_FnGlobeWatcher` is gone, and its absence is the point.
 It existed because pynput never reported Fn, so a second Quartz thread had to
@@ -16,7 +17,7 @@ along with every other modifier.
 */
 
 import {labelForEvent, modifierBitFor} from './key-character.js';
-import {type KeyEvent} from './raw-event.js';
+import {type KeyEvent, type RawEvent} from './raw-event.js';
 import {type TelemetryState} from './state.js';
 
 export type KeyboardCollectorOptions = {
@@ -165,7 +166,17 @@ export class KeyboardCollector {
 		*/
 	}
 
-	handle(event: KeyEvent): void {
+	/*
+	Total over the helper's events, like the Mouse Collector's: every event is
+	shown to this one and it decides for itself which it owns, so nothing
+	upstream has to know which Collector a key event belongs to (ADR-0008).
+
+	The events it does not own are listed rather than folded into a `default`,
+	which is the statement that a pointer move is not a key press and that the
+	helper's own lines are not keys either — and that adding an event type to
+	the wire format has to be considered here.
+	*/
+	handle(event: RawEvent): void {
 		switch (event.type) {
 			case 'keyDown': {
 				this.#press(event);
@@ -179,6 +190,15 @@ export class KeyboardCollector {
 
 			case 'flagsChanged': {
 				this.#flagsChanged(event);
+				break;
+			}
+
+			case 'mouseMoved':
+			case 'mouseDown':
+			case 'mouseUp':
+			case 'error':
+			case 'preflight': {
+				break;
 			}
 		}
 	}

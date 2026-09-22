@@ -14,9 +14,10 @@ import {
 	type RunOptions,
 	run,
 } from './main.js';
+import {type StreamProblem} from './event-stream.js';
 import {KeyboardCollector} from './keyboard.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
-import {keyEventAt, type RawEvent} from './raw-event.js';
+import {type HelperError, keyEventAt, type RawEvent} from './raw-event.js';
 import {
 	type Collector,
 	type EventStream,
@@ -42,9 +43,13 @@ const CONFIG: Config = {
 /*
 NonCoalesced, which every captured event carried, as `keyboard.test.ts` does.
 Spelled here rather than imported from a test file, which ava would then run
-twice.
+twice. SecondaryFn is here for Fn, which is counted off a `flagsChanged` event
+rather than a `keyDown` (ADR-0006).
 */
 const BARE = 256;
+const SECONDARY_FN = 8_388_608;
+const FN = 63;
+const A_KEY = 0;
 
 class FakeStore implements TelemetryStore {
 	readonly snapshots: Array<Record<string, unknown>> = [];
@@ -468,6 +473,134 @@ test('an event through the factory’s own stream reaches the final Flush', asyn
 	t.is(stream.stops, 1, 'and the Session closes what the factory built');
 	t.is(test_.store.snapshots.length, 1);
 	t.deepEqual(test_.store.snapshots[0]?.['keyCounts'], {A: 1});
+});
+
+/*
+Delivery, over the Collectors the composition root builds when no factory was
+supplied (ADR-0008).
+
+Everything the wire format carries is shown to every Collector and each decides
+for itself which events it owns, so what is asserted is the Snapshot as a whole
+rather than one number: an event that landed somewhere it does not belong shows
+up as a counter that should have stayed at zero, and a Collector the loop forgot
+shows up as its own counters never moving.
+*/
+type Delivery = {
+	readonly snapshot: Record<string, unknown> | undefined;
+	readonly problems: StreamProblem[];
+};
+
+async function deliver(events: readonly RawEvent[]): Promise<Delivery> {
+	const test_ = harness(granted());
+	const stream = new FakeStream();
+	const problems: StreamProblem[] = [];
+
+	const running = run(
+		{kind: 'collect'},
+		{
+			...withoutFactory(test_.options),
+			createStream: () => stream,
+			onProblem(problem) {
+				problems.push(problem);
+			},
+			/*
+			Unreachable, because the report is granted — but stubbed rather than
+			left to the default, which spawns the real helper and asks macOS for
+			a grant. A prompt nobody is there to answer would hang the suite
+			rather than fail it.
+			*/
+			requestInputMonitoring() {
+				throw new Error('a granted run must not ask for the grant');
+			},
+		},
+	);
+
+	/*
+	Delivered after `start()`, so they reach a run that is genuinely under way,
+	and before the signal, so the final Flush takes its Snapshot over all of
+	them. The Flush Interval here is an hour, so that is the only Flush there
+	can be.
+	*/
+	await stream.started;
+	for (const event of events) {
+		stream.emit(event);
+	}
+
+	test_.shutdown.fire('SIGINT');
+	await running;
+
+	return {snapshot: test_.store.snapshots[0], problems};
+}
+
+test('a key event is counted by the Keyboard Collector and by nothing else', async t => {
+	/*
+	Fn is the third kind of key event on the wire, and the one that is not a
+	`keyDown`: it is counted off the flag bit on a `flagsChanged` (ADR-0006), so
+	its flags word is composed here the way `keyboard.test.ts` composes its own.
+	*/
+	// eslint-disable-next-line no-bitwise -- a fixture spelling the flags word, not production code.
+	const fnHeld = BARE | SECONDARY_FN;
+
+	const {snapshot, problems} = await deliver([
+		keyEventAt('keyDown', A_KEY, BARE),
+		keyEventAt('keyUp', A_KEY, BARE),
+		keyEventAt('flagsChanged', FN, fnHeld),
+	]);
+
+	t.deepEqual(snapshot?.['keyCounts'], {A: 1, Fn: 1});
+	t.is(snapshot?.['leftClicks'], 0);
+	t.is(snapshot?.['rightClicks'], 0);
+	t.is(snapshot?.['movementMeters'], 0, 'no key press moves the pointer');
+	t.deepEqual(problems, [], 'and none of it is a problem to report');
+});
+
+test('a mouse event is counted by the Mouse Collector and by nothing else', async t => {
+	const {snapshot} = await deliver([
+		// Two moves, because a distance needs two points: the first move is the
+		// baseline. One inch at the configured DPI, so the metres are its own.
+		{type: 'mouseMoved', timestampNs: 0, x: 0, y: 0},
+		{type: 'mouseMoved', timestampNs: 0, x: CONFIG.mouseDpi, y: 0},
+		{type: 'mouseDown', timestampNs: 0, x: 0, y: 0, button: 'left'},
+		{type: 'mouseDown', timestampNs: 0, x: 0, y: 0, button: 'right'},
+		{type: 'mouseUp', timestampNs: 0, x: 0, y: 0, button: 'left'},
+	]);
+
+	t.is(snapshot?.['movementMeters'], 0.0254);
+	t.is(snapshot?.['leftClicks'], 1);
+	t.is(snapshot?.['rightClicks'], 1, 'a button release is not a second click');
+	t.deepEqual(snapshot?.['keyCounts'], {}, 'no click is a key press');
+});
+
+/*
+A preflight line is on the wire but not in a streaming run: `--preflight` exits
+before a tap exists, so the helper never prints one while emitting events. What
+is pinned here is that it is harmless if one ever arrives — no Collector owns
+it, no counter moves, and so there is no Activity and not even a Flush.
+*/
+test('a preflight line is delivered and lands nowhere', async t => {
+	const {snapshot, problems} = await deliver([
+		{
+			type: 'preflight',
+			inputMonitoring: 'granted',
+			message: 'Input Monitoring is granted.',
+		},
+	]);
+
+	t.is(snapshot, undefined, 'no Activity, so no Flush was attempted');
+	t.deepEqual(problems, []);
+});
+
+test('the helper’s failure line reaches the reporter and no Collector', async t => {
+	const failure: HelperError = {
+		type: 'error',
+		code: 'tapDisabled',
+		message: 'the event tap was disabled',
+	};
+
+	const {snapshot, problems} = await deliver([failure]);
+
+	t.deepEqual(problems, [{kind: 'error-line', error: failure}]);
+	t.is(snapshot, undefined, 'and there is nothing in it to count');
 });
 
 /*

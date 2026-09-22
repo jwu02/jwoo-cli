@@ -70,10 +70,19 @@ alive after the work has finished. `cli.tsx` is only the entry point above it: i
 and reports a failure's message rather than its stack.
 
 `main.tsx` supplies the Collectors too, and the default factory is its own rather than the
-entry point's, along with the two things that factory reaches for — the helper stream it builds
-and the grant it asks for (ADR-0008). A test can therefore drive the real factory through
-`collect` with a stream of its own: the first test to execute any statement of which Collector
-owns which event.
+entry point's, along with the things that factory reaches for — the helper stream it builds, the
+grant it asks for, and where the helper's failure line is reported (ADR-0008). A test can
+therefore drive the real factory through `collect` with a stream of its own, which is how
+delivery is executed rather than described.
+
+**Delivery is a loop, and every Collector is total** (ADR-0008). Each event is handed to every
+Collector, and each ignores by name what it does not own — the shape `mouse.ts` always had, and
+the one `keyboard.ts` now shares. Nothing outside a Collector states which events are its, so a
+new Collector is a new module and one entry in the list. A new wire event type is forced into
+view by the `--self-check` pin in `event-stream.test.ts`, which fails until it is considered,
+and the delivery tests in `main.test.tsx` are what execute the ownership for every type the
+format carries. The helper's failure line is delivered like any other event, owned by nobody,
+and reported by that wiring.
 
 ### Three subcommands, and no others
 

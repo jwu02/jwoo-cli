@@ -11,7 +11,7 @@ came from.
 
 import test from 'ava';
 import {KeyboardCollector} from './keyboard.js';
-import {keyEventAt, type KeyEvent} from './raw-event.js';
+import {keyEventAt, type KeyEvent, type RawEvent} from './raw-event.js';
 import {TelemetryState} from './state.js';
 
 /*
@@ -367,6 +367,35 @@ test('a dropped key does not block a later press of a counted one', t => {
 	test_.press(999);
 
 	t.deepEqual(test_.counts(), {});
+});
+
+/*
+Everything else the wire format carries, shown to the Collector because that is
+what the wiring does now: every event goes to every Collector and each decides
+for itself what it owns (ADR-0008). The Mouse Collector has ignored the key
+events by name all along; this is the other half of the same statement, and
+without it a pointer move would be a key press.
+*/
+test('an event of another kind is ignored rather than counted', t => {
+	const state = new TelemetryState();
+	const collector = new KeyboardCollector({state});
+	const others: readonly RawEvent[] = [
+		{type: 'mouseMoved', timestampNs: 0, x: 3, y: 4},
+		{type: 'mouseDown', timestampNs: 0, x: 3, y: 4, button: 'left'},
+		{type: 'mouseUp', timestampNs: 0, x: 3, y: 4, button: 'left'},
+		{type: 'error', code: 'tapDisabled', message: 'the tap was disabled'},
+		{
+			type: 'preflight',
+			inputMonitoring: 'granted',
+			message: 'Input Monitoring is granted.',
+		},
+	];
+
+	for (const event of others) {
+		collector.handle(event);
+	}
+
+	t.deepEqual(state.snapshot().keyCounts, {});
 });
 
 // ---------------------------------------------------------------------------
