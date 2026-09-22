@@ -9,13 +9,26 @@ The pieces arrive as options rather than being reached for directly: this module
 is where permission, store, state and Collector meet, and a test that had to
 build a real one of each could not check the meeting. `cli.tsx` is the caller
 that supplies the real ones.
+
+The Collectors are one of those pieces, and their default is here rather than in
+the entry point (ADR-0008). Which Collector owns which event is a decision about
+collection, and the entry point is a module that runs the CLI on import — so a
+switch kept there was reached by no test at all.
 */
 
 import process from 'node:process';
 import {type Command} from './args.js';
 import {type Config, loadConfig} from './config.js';
+import {
+	defaultProblemReporter,
+	EventStream as HelperStream,
+	requestInputMonitoring as askForInputMonitoring,
+} from './event-stream.js';
 import {MongoHistorySource, type HistorySource} from './history.js';
+import {KeyboardCollector} from './keyboard.js';
+import {MouseCollector} from './mouse.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
+import {type RawEvent} from './raw-event.js';
 import {
 	type Collector,
 	CollectionSession,
@@ -45,6 +58,18 @@ export type CollectorSetup = {
 };
 
 /*
+The helper's stream as the wiring reaches for it: the Session's slice of it,
+plus the one thing the Collectors need, which is somewhere to attach the handler
+their events arrive on.
+
+Structural rather than the class in `event-stream.ts`, which has private fields
+and so cannot be stood in for — and a stand-in is the whole point of the seam.
+*/
+export type EventSource = EventStream & {
+	onEvent(handler: (event: RawEvent) => void): void;
+};
+
+/*
 Given the preflight report, hands back the Collectors that should run. The
 decision about what a missing grant disables stays in `permissions.ts` — the
 report names it — and the factory only decides what to build, or whether to
@@ -60,6 +85,133 @@ export type CollectorFactory = (
 	report: PermissionReport,
 	state: TelemetryState,
 ) => CollectorSetup;
+
+/*
+The two things the default factory reaches outside itself for, and the whole
+reason it is reachable from a test: the stream the Collectors read, and the
+grant they need. A granted run can then be driven end to end with a stream of
+the caller's own, and a denied one watched asking for the grant, without a
+capture process and without a TCC prompt (ADR-0002).
+
+Both are what a real run wants when nothing is supplied, so neither is required.
+*/
+export type CollectorFactoryOptions = {
+	/*
+	The stream the Collectors read. The default is the real one, which spawns
+	the helper lazily in its own `start()` and never before.
+	*/
+	readonly createStream?: () => EventSource;
+	/*
+	Called once, on a run whose report says the grant is missing. macOS will not
+	show the prompt to a process with nobody at the keyboard, so the one run
+	that asks is the one where the user has just been told it is absent.
+	*/
+	readonly requestInputMonitoring?: () => void;
+};
+
+/*
+The default factory: which Collectors the grant allows, and the stream they
+read.
+
+Nothing here exits on `disabled`: a machine whose grant is missing still runs,
+reports the grant, and waits to be stopped, which is what keeps this the same
+shape as any other degraded run.
+*/
+export function defaultCollectorFactory({
+	createStream = () => new HelperStream({}),
+	requestInputMonitoring = askForInputMonitoring,
+}: CollectorFactoryOptions): CollectorFactory {
+	return (report, state) => {
+		if (report.status !== 'granted') {
+			requestInputMonitoring();
+			/*
+			No stream either. A denied grant means no tap, so a helper started
+			anyway would have nothing to open, exit, and report itself as a
+			problem on a path that is meant to degrade quietly.
+			*/
+			return {collectors: []};
+		}
+
+		/*
+		Constructed, not started. The helper is spawned by the Session, through
+		the stream it owns — nothing about building the Collectors should open a
+		process: a run stopped before it starts would then leave one behind, and
+		owning that lifetime is the Session's whole job.
+		*/
+		const stream = createStream();
+
+		return {collectors: collectorsOver(stream, state), stream};
+	};
+}
+
+/*
+Both Collectors read the one tap, so both are built over one stream. Spawning
+per Collector would mean two taps racing on the same events and two grants to
+keep (ADR-0006).
+
+Both also count into the one Telemetry State the Session flushes, which arrives
+as an argument rather than being built here. Building one here would compile,
+run, and write nothing at all.
+
+The switch below is where event ownership is stated, and it is stated here
+rather than in the entry point so that a test executes it (ADR-0008). It is not
+where that decision leaves it — the end state is delivery to every Collector,
+each ignoring what it does not own — and the change that gets there is #14.
+*/
+function collectorsOver(
+	stream: EventSource,
+	state: TelemetryState,
+): Collector[] {
+	const keyboard = new KeyboardCollector({state});
+	const mouse = new MouseCollector({state});
+
+	/*
+	Wired before the stream can start. The Session starts the stream and then
+	the Collectors, so a listener attached afterwards would miss whatever
+	arrived in between — and losing input is the one thing a Collector must not
+	do quietly.
+	*/
+	stream.onEvent(event => {
+		switch (event.type) {
+			case 'keyDown':
+			case 'keyUp':
+			case 'flagsChanged': {
+				keyboard.handle(event);
+				return;
+			}
+
+			case 'mouseMoved':
+			case 'mouseDown':
+			case 'mouseUp': {
+				mouse.handle(event);
+				return;
+			}
+
+			case 'error': {
+				/*
+				The helper's own failure line. It is on stdout rather than
+				stderr precisely so it cannot be missed, and it belongs with the
+				stream's own problems: both are statements about why there is no
+				input rather than about a key or a click.
+				*/
+				defaultProblemReporter({kind: 'error-line', error: event});
+				break;
+			}
+
+			case 'preflight': {
+				/*
+				Unreachable from a streaming run: `--preflight` exits before a
+				tap exists, so the helper never prints one while emitting
+				events. Named rather than folded into a `default` so that adding
+				an event type to the wire format has to be considered here.
+				*/
+				break;
+			}
+		}
+	});
+
+	return [keyboard, mouse];
+}
 
 export type Logger = Pick<Console, 'log' | 'warn'>;
 
@@ -79,21 +231,21 @@ export type DashboardView = {
 	readonly ended: Promise<void>;
 };
 
-export type RunOptions = {
+export type RunOptions = CollectorFactoryOptions & {
 	readonly permissions: PermissionSource;
-	readonly collectors: CollectorFactory;
+	/*
+	Which Collectors run, and the stream they read if they read one. Absent from
+	a CLI run, which wants the default — and `cli.tsx`, which still supplies the
+	permission source, no longer supplies this (ADR-0008).
+
+	The stream is not an option of its own beside this one. Whether there is one
+	at all is the same question as whether there are Collectors, and a stream
+	supplied here but not known to the factory would be one that nothing is
+	reading: a run that starts every Collector and feeds it no events.
+	*/
+	readonly collectors?: CollectorFactory;
 	readonly shutdown?: ShutdownSignal;
 	readonly logger?: Logger;
-	/*
-	The helper's event stream, if the Collectors were built over one. Owned by
-	the Session rather than by a Collector, because the Collectors and the
-	helper have to start and stop together and a stream hidden inside one
-	Collector's `start()` is a lifetime nobody can see.
-
-	An option for the same reason the store is: a test of the dispatch should
-	not spawn a capture process, and there is no fake tap to point it at.
-	*/
-	readonly stream?: EventStream;
 	/*
 	The store and the history source are options for the same reason the rest
 	are, and each one builds a `MongoClient`: a test of the dispatch should not
@@ -170,9 +322,9 @@ A missing grant degrades collection rather than stopping the CLI: the factory is
 given the report and builds only what it allows, and whatever it does build
 still runs. Nothing here exits on `disabled`.
 
-The stream comes from the factory for the same reason there is no default one
-here — see `CollectorSetup`. The option overrides it, because a test of the
-dispatch supplies its own rather than spawning a capture process.
+The factory is the one supplied or the default, which is what makes the default
+reachable by a test rather than only by running the CLI. The stream comes back
+from it rather than from an option of its own — see `CollectorSetup`.
 */
 function sessionFor(
 	options: RunOptions,
@@ -190,13 +342,16 @@ function sessionFor(
 		readonly onFlush?: (attempt: FlushAttempt) => void;
 	},
 ): CollectionSession {
-	const setup = options.collectors(report, state);
+	const setup = (options.collectors ?? defaultCollectorFactory(options))(
+		report,
+		state,
+	);
 
 	return new CollectionSession({
 		store: options.store ?? new MongoTelemetryStore(config),
 		state,
 		collectors: setup.collectors,
-		stream: options.stream ?? setup.stream,
+		stream: setup.stream,
 		flushIntervalSeconds: config.flushIntervalSeconds,
 		shutdown: options.shutdown ?? processSignal,
 		logger,

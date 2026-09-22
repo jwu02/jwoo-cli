@@ -16,7 +16,7 @@ import {
 } from './main.js';
 import {KeyboardCollector} from './keyboard.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
-import {keyEventAt} from './raw-event.js';
+import {keyEventAt, type RawEvent} from './raw-event.js';
 import {
 	type Collector,
 	type EventStream,
@@ -326,9 +326,9 @@ look healthy while collecting nothing: a factory that builds a stream the
 Session never hears about compiles, starts every Collector, and feeds them no
 events at all.
 
-Deliberately not reached through `options.stream`. That option exists so a test
-can avoid a capture process, and going through it would test the arrangement the
-tests use rather than the one the CLI does.
+Through a factory the caller supplied rather than the default one, so that the
+stream can be traced without spawning a helper at all. The default factory's own
+stream is covered below, over a stream of the same kind.
 */
 test('a stream the factory supplies is started and stopped by the Session', async t => {
 	const test_ = harness(granted());
@@ -345,6 +345,129 @@ test('a stream the factory supplies is started and stopped by the Session', asyn
 	);
 
 	t.deepEqual(trace, ['start', 'stop']);
+});
+
+/*
+A stand-in for the helper's stream: the one the real factory builds, wires and
+hands to the Session. There is no fake tap to point a real one at, and no
+permission to collect under, so this is what makes the default factory reachable
+from a test at all.
+*/
+class FakeStream implements EventStream {
+	#resolveStarted: () => void = noop;
+	#handler: ((event: RawEvent) => void) | undefined;
+	/*
+	Resolved by `start()`, so a test can deliver an event into a run that is
+	genuinely under way. The handler is attached before then, but an event
+	emitted before `start()` would reach a run that has not begun, and one
+	emitted after the signal would arrive after the final Flush had taken its
+	Snapshot.
+	*/
+	readonly started = new Promise<void>(resolve => {
+		this.#resolveStarted = resolve;
+	});
+
+	starts = 0;
+	stops = 0;
+
+	onEvent(handler: (event: RawEvent) => void): void {
+		this.#handler = handler;
+	}
+
+	start(): void {
+		this.starts += 1;
+		this.#resolveStarted();
+	}
+
+	stop(): void {
+		this.stops += 1;
+	}
+
+	emit(event: RawEvent): void {
+		this.#handler?.(event);
+	}
+}
+
+/*
+The harness's options with its factory taken back out, for the tests that are
+about the factory the composition root supplies when none was given. Every other
+test in this file injects one, so that it does not spawn a capture process.
+*/
+function withoutFactory(options: RunOptions): RunOptions {
+	const {collectors: _injected, ...rest} = options;
+	return rest;
+}
+
+/*
+On a denied report the default factory builds nothing at all — no Collector, and
+no stream either, because a helper with no tap to open would exit and report
+itself as a problem on a path meant to degrade quietly. The grant is asked for
+exactly once, on the run where the user has just been told it is missing.
+*/
+test('a denied grant builds no Collectors and asks for it once', async t => {
+	const test_ = harness(denied());
+	const requests: number[] = [];
+	const streams: number[] = [];
+
+	test_.shutdown.fire('SIGTERM');
+
+	await run(
+		{kind: 'collect'},
+		{
+			...withoutFactory(test_.options),
+			createStream() {
+				streams.push(1);
+				return new FakeStream();
+			},
+			requestInputMonitoring() {
+				requests.push(1);
+			},
+		},
+	);
+
+	t.is(requests.length, 1);
+	t.is(streams.length, 0);
+	t.is(test_.store.closed, 1, 'and the run still reaches its shutdown');
+});
+
+/*
+The statement of event ownership, executed for the first time: the factory the
+composition root supplies when none was given, driving real Collectors over a
+stream this test can see into.
+
+Nothing here goes through an option that replaces the factory, which is the
+point of the test. The event is delivered through the stream the factory itself
+built and wired, and the count has to come out of the store — so a factory that
+built a second stream, or wired no handler at all, fails here rather than
+collecting nothing quietly.
+*/
+test('an event through the factory’s own stream reaches the final Flush', async t => {
+	const test_ = harness(granted());
+	const stream = new FakeStream();
+	const requests: number[] = [];
+
+	const running = run(
+		{kind: 'collect'},
+		{
+			...withoutFactory(test_.options),
+			createStream: () => stream,
+			requestInputMonitoring() {
+				requests.push(1);
+			},
+		},
+	);
+
+	await stream.started;
+	stream.emit(keyEventAt('keyDown', 0, BARE));
+
+	test_.shutdown.fire('SIGINT');
+	await running;
+
+	t.is(requests.length, 0, 'a granted run asks for nothing');
+	t.is(stream.starts, 1);
+	t.is(stream.stops, 1, 'and the Session closes what the factory built');
+	t.is(test_.store.snapshots.length, 1);
+	t.deepEqual(test_.store.snapshots[0]?.['keyCounts'], {A: 1});
 });
 
 /*

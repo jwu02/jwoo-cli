@@ -69,6 +69,12 @@ client's lifetime and closes it on every path, because a client left open keeps 
 alive after the work has finished. `cli.tsx` is only the entry point above it: it parses argv
 and reports a failure's message rather than its stack.
 
+`main.tsx` supplies the Collectors too, and the default factory is its own rather than the
+entry point's, along with the two things that factory reaches for — the helper stream it builds
+and the grant it asks for (ADR-0008). A test can therefore drive the real factory through
+`collect` with a stream of its own: the first test to execute any statement of which Collector
+owns which event.
+
 ### Three subcommands, and no others
 
 `args.ts` parses argv into exactly three commands: no argument opens the dashboard, `collect`
