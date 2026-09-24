@@ -199,9 +199,12 @@ reporter and the entry, and the entry constructors (`flushEntry`, `helperEntry`,
 `collectionEntry`) live beside the buffer because the two texts are one decision: the line the
 block draws and the full text the diagnostics view draws.
 
-The block is drawn under both views rather than inside one, because the dashboard lands on the
-history view and that view knows nothing about this run — a session whose every Flush failed
-would otherwise open on a frame with nothing to say about it.
+The block is drawn under the history and live views rather than inside one, because the dashboard
+lands on the history view and that view knows nothing about this run — a session whose every Flush
+failed would otherwise open on a frame with nothing to say about it. **The third view is the
+exception** (#22): `d` draws those same entries whole, one per entry with its summary and its full
+text, from the same source through the same hook, so the line the block had to cut is readable
+without the block drawing a truncated copy of it underneath.
 
 ### The native helper emits raw events and nothing else
 
@@ -256,13 +259,13 @@ is the output a test asserts against.
 
 The TUI is Ink 7 on React 19, and the `.tsx` extension marks the whole of it: `tui.tsx`,
 `app.tsx`, `history-view.tsx`, `live-view.tsx`, `totals-view.tsx`, `run-log-view.tsx`,
-`use-history.ts`, `use-telemetry.ts` and `use-run-log.ts` are the only modules that import `ink`
-or `react`. Everything else is plain TypeScript, which is what ADR-0001 requires of the Collector
-so that the move to a separate process is a different entry point rather than a rewrite. Tests
-render through `ink-testing-library`.
+`diagnostics-view.tsx`, `use-history.ts`, `use-telemetry.ts` and `use-run-log.ts` are the only
+modules that import `ink` or `react`. Everything else is plain TypeScript, which is what ADR-0001
+requires of the Collector so that the move to a separate process is a different entry point rather
+than a rewrite. Tests render through `ink-testing-library`.
 
-The two views draw the same three lines — Clicks, Mouse Distance, Press Total — and share
-`totals-view.tsx` rather than each spelling them, with the number formats alongside in
+The history and live views draw the same three lines — Clicks, Mouse Distance, Press Total — and
+share `totals-view.tsx` rather than each spelling them, with the number formats alongside in
 `format.ts`. Only the heading above the block says which view it is, so a difference between
 them would be a bug rather than a difference of meaning.
 
@@ -274,17 +277,25 @@ them would be a bug rather than a difference of meaning.
 because "nothing yet", "nothing there" and "could not ask" draw completely differently — while
 `history-view.tsx` is presentational and synchronous, tested by rendering a fixed `LoadState`.
 `use-telemetry.ts` and `live-view.tsx` split the same way: the hook polls and holds nothing but
-the timer, and the view takes a reading and a zone. `use-run-log.ts` and `run-log-view.tsx` split
-that way too — the block takes entries and a zone. Each poll is owned by the component that draws
-it rather than held in `app.tsx`, so a tick re-renders that component's own subtree and not the
-view above it: the Run Log block is on screen under both views, and the history view is not
-re-rendered once a second on its account.
+the timer, and the view takes a reading and a zone. `use-run-log.ts` splits that way against both
+of the modules that draw its entries — `run-log-view.tsx` and `diagnostics-view.tsx` take entries
+and a zone. Each poll is owned by the component that draws it rather than held in `app.tsx`, so a
+tick re-renders that component's own subtree and not the view above it: the Run Log block is on
+screen under the history and live views, and the history view is not re-rendered once a second on
+its account.
+
+**Which view is up is one value, and the keys are absolute** (#22). `app.tsx` holds a
+`history | live | diagnostics` union rather than a flag per view, and every view key names the
+view it wants: `d` opens diagnostics from anywhere, `t` and `w` are the history view at their
+range, `l` is the live view, `q` quits. Nothing toggles and there is no way back to "whatever was
+showing". That one value is also what decides the block, which draws under history and live and
+not under diagnostics.
 
 **Unmount the Ink root in any test that leaves a polling hook mounted.** A pending `setInterval`
 holds ava's worker open, and the run ends in `✘ Timed out while running tests` rather than in a
 failed assertion. `t.teardown(() => { unmount(); })` is the whole fix — and since the Run Log
-block is under both views, that is every test that mounts the dashboard, not only the ones that
-switch to the live view.
+block is under the history and live views and the diagnostics view polls the same entries, that
+is every test that mounts the dashboard, not only the ones that switch views.
 
 `HistorySource` must be referentially stable: `app.tsx` takes it as a prop and the load effect
 is keyed on it, so constructing one inside a component body reloads forever. That is why
