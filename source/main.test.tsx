@@ -5,6 +5,8 @@ import {
 	type HistoryData,
 	type HistorySource,
 	type LoadResult,
+	type ReadWarning,
+	type ReadWarningReporter,
 	type Totals,
 } from './history.js';
 import {
@@ -731,7 +733,7 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 		{kind: 'dashboard'},
 		{
 			...test_.options,
-			historySource: source,
+			createHistorySource: () => source,
 			async renderApp(view) {
 				rendered.push(view);
 			},
@@ -771,7 +773,7 @@ test('a missing grant reaches the live view as a disabled reading', async t => {
 		{kind: 'dashboard'},
 		{
 			...test_.options,
-			historySource: stubHistory(),
+			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				readings.push(view.telemetry.read());
 			},
@@ -804,7 +806,7 @@ test('a Flush is counted into the live totals', async t => {
 		{kind: 'dashboard'},
 		{
 			...test_.options,
-			historySource: stubHistory(),
+			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				telemetry = view.telemetry;
 			},
@@ -867,7 +869,7 @@ async function logged(
 			state,
 			createStream: () => stream,
 			requestInputMonitoring: noGrantRequest,
-			historySource: stubHistory(),
+			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				runLog = view.runLog;
 				/*
@@ -1005,7 +1007,7 @@ test('an unreadable line and a helper exit are entries too', async t => {
 				return stream;
 			},
 			requestInputMonitoring: noGrantRequest,
-			historySource: stubHistory(),
+			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				await view.ended;
 			},
@@ -1027,6 +1029,109 @@ test('an unreadable line and a helper exit are entries too', async t => {
 				'the capture helper exited (code 1); input is no longer being collected.',
 			],
 		],
+	);
+});
+
+/*
+The read seam's entries, and the other half of the change to the history view:
+a read that failed is one line in the log rather than a driver sentence drawn
+across the frame, and a bucket the boundaries never named is one too.
+
+The source is the caller's own, reporting through the reporter it was handed
+the way the real one does — the arrangement the delivery tests above use for
+the helper's stream, and for the same reason: the real source opens a
+connection, and what has to be exercised is the routing rather than the read.
+*/
+function reportingHistory(
+	result: LoadResult,
+	...warnings: readonly ReadWarning[]
+): (onWarning: ReadWarningReporter) => HistorySource {
+	return onWarning => ({
+		async load(): Promise<LoadResult> {
+			for (const warning of warnings) {
+				onWarning(warning);
+			}
+
+			return result;
+		},
+		async close(): Promise<void> {
+			// Nothing to release: the stand-in holds no connection.
+		},
+	});
+}
+
+/*
+What the seam's warnings come to once a dashboard run has had them: the entries
+the view was handed, read back after the run so the final Flush has landed.
+
+`load` is driven from the renderer because that is what the view does on mount,
+and the source is the composition root's — so this is the only way a test can
+reach the reporter it gave that source.
+*/
+async function entriesFromRead(
+	createHistorySource: (onWarning: ReadWarningReporter) => HistorySource,
+): Promise<readonly RunLogEntry[]> {
+	const test_ = harness(granted());
+	const runLog = new InProcessRunLogSource();
+
+	await run(
+		{kind: 'dashboard'},
+		{
+			...test_.options,
+			runLog,
+			createHistorySource,
+			async renderApp(view) {
+				await view.history.load('today', new Date());
+			},
+		},
+	);
+
+	return runLog.read();
+}
+
+test('a failed history read is an entry carrying the driver’s message', async t => {
+	const entries = await entriesFromRead(
+		reportingHistory(
+			{ok: false, message: 'connect ECONNREFUSED'},
+			{
+				kind: 'failed-read',
+				error: new Error('connect ECONNREFUSED'),
+			},
+		),
+	);
+
+	t.is(entries.length, 1);
+	t.is(entries[0]?.class, 'History');
+	t.true(entries[0]?.failed === true, 'which is what draws it red');
+	t.is(
+		entries[0]?.summary,
+		'connect ECONNREFUSED',
+		'which the view used to draw in the middle of the frame',
+	);
+});
+
+/*
+A read that answered, with one bucket the boundaries never named. Nothing
+failed and the dashboard drew, so it is an entry rather than a failure — the
+point of it is that the reader drops the bucket loudly rather than in silence.
+*/
+test('a read that ignored a bucket is an entry, and not a failure', async t => {
+	const entries = await entriesFromRead(
+		reportingHistory(
+			{ok: true, data: data()},
+			{
+				kind: 'ignored-buckets',
+				buckets: ['default'],
+			},
+		),
+	);
+
+	t.is(entries.length, 1);
+	t.is(entries[0]?.class, 'History');
+	t.is(entries[0]?.failed, undefined);
+	t.is(
+		entries[0]?.summary,
+		'Ignored 1 time series bucket(s) outside the range boundaries',
 	);
 });
 
@@ -1094,7 +1199,7 @@ test('a missing grant is one entry on a run that never starts', async t => {
 			requestInputMonitoring() {
 				// Stubbed: the real one asks macOS, and nobody is at this keyboard.
 			},
-			historySource: stubHistory(),
+			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				reading = view.telemetry.read();
 			},
@@ -1159,7 +1264,7 @@ test('the history source is closed even when rendering throws', async t => {
 			{kind: 'dashboard'},
 			{
 				...test_.options,
-				historySource: stubHistory(closed),
+				createHistorySource: () => stubHistory(closed),
 				async renderApp() {
 					throw new Error('no tty');
 				},
@@ -1186,7 +1291,7 @@ test('a Collector that throws on start stops the dashboard and propagates', asyn
 			{kind: 'dashboard'},
 			{
 				...test_.options,
-				historySource: stubHistory(closed),
+				createHistorySource: () => stubHistory(closed),
 				collectors: () => ({
 					collectors: [
 						{

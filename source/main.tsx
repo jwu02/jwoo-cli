@@ -25,7 +25,12 @@ import {
 	requestInputMonitoring as askForInputMonitoring,
 	type StreamProblem,
 } from './helper.js';
-import {MongoHistorySource, type HistorySource} from './history.js';
+import {
+	MongoHistorySource,
+	type HistorySource,
+	type ReadWarning,
+	type ReadWarningReporter,
+} from './history.js';
 import {KeyboardCollector} from './keyboard.js';
 import {MouseCollector} from './mouse.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
@@ -34,6 +39,7 @@ import {
 	collectionEntry,
 	flushEntry,
 	helperEntry,
+	historyEntry,
 	InProcessRunLogSource,
 	type RunLogSource,
 } from './run-log.js';
@@ -285,12 +291,21 @@ export type RunOptions = CollectorFactoryOptions & {
 	readonly shutdown?: ShutdownSignal;
 	readonly logger?: Logger;
 	/*
-	The store and the history source are options for the same reason the rest
-	are, and each one builds a `MongoClient`: a test of the dispatch should not
-	need a database, and there is no test database in this repo.
+	The store is an option for the same reason the rest are, and it builds a
+	`MongoClient`: a test of the dispatch should not need a database, and there
+	is no test database in this repo.
 	*/
 	readonly store?: TelemetryStore;
-	readonly historySource?: HistorySource;
+	/*
+	The read seam as the dashboard reaches for it, built with the reporter its
+	warnings go to — the shape `createStream` has, and for the same reason. What
+	the seam reports is settled when it is built, so a caller building one of
+	its own reports where it was told to; that is what lets a test drive the
+	routing without a database, and what the source the dashboard supplies is.
+	*/
+	readonly createHistorySource?: (
+		onWarning: ReadWarningReporter,
+	) => HistorySource;
 	readonly state?: TelemetryState;
 	/*
 	The Run Log the run appends to. An option for the reason `state` is one: a
@@ -555,7 +570,21 @@ async function runDashboard(options: RunOptions): Promise<void> {
 		},
 	});
 
-	const source = options.historySource ?? new MongoHistorySource(config);
+	/*
+	The read seam's warnings become entries, as the helper's do and for the same
+	reason: the dashboard lands on the history view, and the sentence a failed
+	read carries is a fact about this run rather than about the range on screen.
+	The view draws a pointer and the log holds the whole of it — drawn in both
+	places it would be one failure said twice, one of them across the frame.
+	*/
+	const reportReadWarning = (warning: ReadWarning): void => {
+		runLog.append(historyEntry(warning, new Date()));
+	};
+
+	const source =
+		options.createHistorySource?.(reportReadWarning) ??
+		new MongoHistorySource(config, undefined, {onWarning: reportReadWarning});
+
 	/*
 	A statement rather than `options.renderApp ?? (await import(...)).renderApp`,
 	which would import ink on every path — including the one where the caller

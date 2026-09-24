@@ -195,9 +195,20 @@ mode is what decides the default rather than the rule. Both commands append one 
 starts with no grant, naming the Collectors it took out, which is what puts a missing grant on
 the landing view without the live-view key being pressed — the live view's own report is
 untouched. `problemMessage` in `helper.ts` is the one spelling of a problem, shared by the stderr
-reporter and the entry, and the entry constructors (`flushEntry`, `helperEntry`,
+reporter and the entry, and the entry constructors (`flushEntry`, `helperEntry`, `historyEntry`,
 `collectionEntry`) live beside the buffer because the two texts are one decision: the line the
 block draws and the full text the diagnostics view draws.
+
+**The read seam reports the same way** (#23), and for the same reason. A failed read is a fact
+about this run rather than about the range on screen, so `history.ts` raises a `ReadWarning` —
+a union of `failed-read` and `ignored-buckets`, so that _what a warning means_ is decided where
+it is raised rather than guessed back out of prose — and the composition root answers it with an
+entry; `readWarningMessage` is the one spelling of it, as `problemMessage` is. The seam's default
+reporter is the stderr warning it has always written, which is what a run with no view to draw an
+entry in keeps. So the history view draws one compact red pointer line where the driver's
+sentence used to replace the dashboard: the sentence is in the log, whole, one `d` away.
+`LoadState` still carries the message, because the three-state machine is untouched — no view
+draws it.
 
 The block is drawn under the history and live views rather than inside one, because the dashboard
 lands on the history view and that view knows nothing about this run — a session whose every Flush

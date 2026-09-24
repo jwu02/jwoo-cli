@@ -1,3 +1,4 @@
+import process from 'node:process';
 import test from 'ava';
 import {type MongoClient} from 'mongodb';
 import {type Config} from './config.js';
@@ -5,9 +6,12 @@ import {
 	type AggregationCursor,
 	type Collection,
 	type Database,
+	defaultReadWarningReporter,
 	type HistoryData,
-	type TimeSeriesPoint,
 	MongoHistorySource,
+	type ReadWarning,
+	type ReadWarningReporter,
+	type TimeSeriesPoint,
 } from './history.js';
 import {type Range} from './ranges.js';
 
@@ -85,12 +89,41 @@ class FakeMongoClient {
 	}
 }
 
-class FakeLogger implements Pick<Console, 'warn'> {
-	readonly warnings: Array<{message: string; error: unknown}> = [];
+/*
+The reader's warnings, collected. Stands in for the reporter the composition
+root supplies in dashboard mode, which is what makes the two ends assertions
+below readable — and for the stderr one by being left out.
+*/
+class FakeWarnings {
+	readonly warnings: ReadWarning[] = [];
 
-	warn(message: string, error: unknown): void {
-		this.warnings.push({message, error});
+	readonly report: ReadWarningReporter = warning => {
+		this.warnings.push(warning);
+	};
+}
+
+/*
+The terminal, held for the length of one call, as `main.test.tsx` holds it.
+
+What the default reporter's contract is: the sentence and the driver's own
+error, reaching stderr as they always have. The window is the call rather than
+the test, because ava runs the tests in this file concurrently.
+*/
+function captureStderr(call: () => void): string[] {
+	const written: string[] = [];
+	const original = process.stderr.write;
+	process.stderr.write = (chunk: string) => {
+		written.push(chunk);
+		return true;
+	};
+
+	try {
+		call();
+	} finally {
+		process.stderr.write = original;
 	}
+
+	return written;
 }
 
 const config: Config = {
@@ -174,9 +207,12 @@ async function load(
 
 const buildSource = (
 	database: Database,
-	logger = new FakeLogger(),
+	warnings = new FakeWarnings(),
 	overrides: Partial<Config> = {},
-) => new MongoHistorySource({...config, ...overrides}, database, {logger});
+) =>
+	new MongoHistorySource({...config, ...overrides}, database, {
+		onWarning: warnings.report,
+	});
 
 /*
 A load that is expected to fail. Throwing here rather than asserting keeps the
@@ -266,7 +302,7 @@ test('the range is read in the configured timezone', async t => {
 
 	// Shanghai is eight hours ahead, so local midnight is 16:00Z the day before.
 	await load(
-		buildSource(database, new FakeLogger(), {timeZone: 'Asia/Shanghai'}),
+		buildSource(database, new FakeWarnings(), {timeZone: 'Asia/Shanghai'}),
 		'today',
 		MONDAY_NOON,
 	);
@@ -391,8 +427,8 @@ test('key counts are ranked by count, then by label', async t => {
 	]);
 });
 
-test('a bucket outside the boundaries is dropped and warned about', async t => {
-	const logger = new FakeLogger();
+test('a bucket outside the boundaries is dropped, and reported as one', async t => {
+	const warnings = new FakeWarnings();
 	const database = databaseWith({
 		series: [
 			// `$bucket`'s `default` label, and a date the boundaries never named.
@@ -401,17 +437,28 @@ test('a bucket outside the boundaries is dropped and warned about', async t => {
 		],
 	});
 
-	const data = await load(buildSource(database, logger), 'today', MONDAY_NOON);
+	const data = await load(
+		buildSource(database, warnings),
+		'today',
+		MONDAY_NOON,
+	);
 
 	// Silently zero-filling these would hide a boundary bug; counting them
 	// would invent a bucket that does not exist.
 	t.is(sumOf(data.timeSeries).leftClicks, 0);
-	t.is(logger.warnings.length, 1);
-	t.regex(logger.warnings[0]!.message, /boundar/v);
+	/*
+	The ids travel with the warning rather than a count, because which ones
+	could not be placed at all is the whole of what the reader knows and what a
+	boundary bug has to say. The date is not among them: it *is* a bucket, and
+	a bucket no boundary named simply never comes back out of the lookup.
+	*/
+	t.deepEqual(warnings.warnings, [
+		{kind: 'ignored-buckets', buckets: ['out-of-range']},
+	]);
 });
 
-test('a failed read is a value, and the raw error reaches the log', async t => {
-	const logger = new FakeLogger();
+test('a failed read is a value, and the raw error is reported', async t => {
+	const warnings = new FakeWarnings();
 	const database = databaseWith();
 	const failure = new Error('connection reset');
 	database.collection(config.collectionName).failWith = failure;
@@ -419,18 +466,18 @@ test('a failed read is a value, and the raw error reaches the log', async t => {
 	/*
 	Resolved rather than rejected, deliberately. A rejected promise inside an
 	effect is an unhandled rejection, which ends the process by default — the
-	TUI would exit instead of drawing an error. The message is what the view
-	renders; the raw error goes to the log.
+	TUI would exit instead of drawing an error. The view draws a pointer at the
+	Run Log; what the seam reports is the error itself, so that whoever is
+	listening can spell it.
 	*/
 	const {message} = await failureOf(
-		buildSource(database, logger),
+		buildSource(database, warnings),
 		'today',
 		MONDAY_NOON,
 	);
 
 	t.is(message, 'connection reset');
-	t.is(logger.warnings.length, 1);
-	t.is(logger.warnings[0]!.error, failure);
+	t.deepEqual(warnings.warnings, [{kind: 'failed-read', error: failure}]);
 });
 
 /*
@@ -439,13 +486,39 @@ Intl cannot resolve is enough. That has to be a value too: it is the same
 promise, and a rejection escaping it ends the process just as surely.
 */
 test('a failure before the query is still a value', async t => {
-	const logger = new FakeLogger();
-	const source = buildSource(databaseWith(), logger, {timeZone: 'Bogus/Zone'});
+	const warnings = new FakeWarnings();
+	const source = buildSource(databaseWith(), warnings, {
+		timeZone: 'Bogus/Zone',
+	});
 
 	const {message} = await failureOf(source, 'today', MONDAY_NOON);
 
 	t.true(message.length > 0);
-	t.is(logger.warnings.length, 1);
+	t.is(warnings.warnings.length, 1);
+	t.is(warnings.warnings[0]?.kind, 'failed-read');
+});
+
+/*
+The other end of the seam, and the contract `collect` keeps: a run with no view
+to draw an entry in reports through the terminal, in the words it always has.
+The error is a second argument rather than part of the sentence, so the
+driver's own stack prints as the driver wrote it.
+*/
+test('a warning nothing has routed still reaches stderr, as it always has', t => {
+	const written = captureStderr(() => {
+		defaultReadWarningReporter({
+			kind: 'failed-read',
+			error: new Error('connection reset'),
+		});
+		defaultReadWarningReporter({kind: 'ignored-buckets', buckets: ['default']});
+	});
+
+	t.regex(written[0] ?? '', /Failed to read telemetry history/v);
+	t.regex(written[0] ?? '', /connection reset/v);
+	t.regex(
+		written[1] ?? '',
+		/Ignored 1 time series bucket\(s\) outside the range boundaries \[ 'default' \]/v,
+	);
 });
 
 test('without an injected database the reader builds one from MongoClient', async t => {
@@ -455,7 +528,7 @@ test('without an injected database the reader builds one from MongoClient', asyn
 	const source = new MongoHistorySource(
 		config,
 		undefined,
-		{logger: new FakeLogger()},
+		{onWarning: new FakeWarnings().report},
 		client as unknown as MongoClient,
 	);
 
@@ -472,7 +545,7 @@ test('close() closes a client the reader owns', async t => {
 	const source = new MongoHistorySource(
 		config,
 		undefined,
-		{logger: new FakeLogger()},
+		{onWarning: new FakeWarnings().report},
 		client as unknown as MongoClient,
 	);
 

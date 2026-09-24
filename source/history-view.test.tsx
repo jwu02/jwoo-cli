@@ -144,10 +144,32 @@ test('a range with nothing in it says so', t => {
 	t.regex(frame, /Nothing recorded/v);
 });
 
-test('a failure is drawn as its message', t => {
+/*
+A failure is one line pointing at the Run Log, rather than the driver's
+sentence drawn where the dashboard should be. The sentence is a fact about this
+run and the Run Log is where this run's facts are — the seam routes it there,
+and the block under this view draws it, whole in diagnostics behind `d`. Drawn
+here as well it would be the same failure said twice, and the only thing on
+screen that has no room for the rest of the run's context.
+*/
+test('a failure points at the Run Log rather than drawing the raw message', t => {
 	const frame = frameOf({status: 'error', message: 'connection reset'});
 
-	t.regex(frame, /connection reset/v);
+	t.regex(frame, /Could not read history — see the Run Log \(d\)\./v);
+	t.false(
+		frame.includes('connection reset'),
+		'the driver’s sentence is the log’s to draw',
+	);
+});
+
+/*
+The pointer belongs to the error body and to nothing else: the other two states
+have their own thing to say, and a range that is still being read is not a
+range that failed to be read.
+*/
+test('the pointer is drawn only when the read failed', t => {
+	t.false(frameOf({status: 'loading'}).includes('Run Log'));
+	t.false(frameOf({status: 'ready', data: history()}).includes('Run Log'));
 });
 
 test('loading says so rather than drawing an empty dashboard', t => {

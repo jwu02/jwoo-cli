@@ -45,7 +45,18 @@ export function HistoryView({state, range}: {state: LoadState; range: Range}) {
 			</Text>
 
 			{state.status === 'loading' && <Text dimColor>Reading…</Text>}
-			{state.status === 'error' && <Text color="red">{state.message}</Text>}
+			{/*
+			A pointer rather than the driver's sentence, which the read seam routes
+			into the Run Log instead. A failed read is one fact about this run, and
+			the log is where this run's facts are: drawn here as well it would be
+			the same failure said twice, in the one place with no room for the rest
+			of the context. The state still carries the message — that is the
+			seam's return value and `use-history.ts` is untouched — and the frame
+			draws the pointer.
+			*/}
+			{state.status === 'error' && (
+				<Text color="red">Could not read history — see the Run Log (d).</Text>
+			)}
 			{state.status === 'ready' && <Dashboard data={state.data} />}
 		</Box>
 	);

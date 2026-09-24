@@ -33,14 +33,16 @@ when the CLI exits (CONTEXT.md, Deliberately absent).
 
 import {COUNT_FORMAT, METRES_FORMAT} from './format.js';
 import {problemMessage, type StreamProblem} from './helper.js';
+import {readWarningMessage, type ReadWarning} from './history.js';
 import {type DisabledCollector, type DisabledReport} from './permissions.js';
 import {type FlushAttempt} from './session.js';
 
 /*
-The four kinds of thing a run can report. A Flush and a problem are the two a
-run produces today; `History` is the read seam's, and arrives with the logger
-that routes its warnings here. The block draws the class of an entry beside its
-text, which is what tells a `Helper` line from a `Collection` one at a glance.
+The four kinds of thing a run can report: a Flush attempt, a problem the helper
+or the stream reading it reported, a warning from the history read, and
+collection that started disabled. The block draws the class of an entry beside
+its text, which is what tells a `Helper` line from a `Collection` one at a
+glance.
 */
 export type RunLogClass = 'Flush' | 'Helper' | 'History' | 'Collection';
 
@@ -149,6 +151,29 @@ export function helperEntry(problem: StreamProblem, at: Date): RunLogEntry {
 		summary: oneLine(message),
 		detail: message,
 	};
+}
+
+/*
+A read the history seam reported on.
+
+Both texts are the seam's own sentence for the warning, for the reason
+`helperEntry` borrows `problemMessage`: there is one spelling of "the read
+dropped a bucket" and one of what the driver said, and a view, a terminal and a
+log that each composed their own would be three descriptions of one event.
+
+A failed read draws red and carries the driver's message, which is the text the
+history view used to draw in place of the dashboard and now points here for. An
+ignored bucket does not: the read answered and the view drew, so the entry
+exists because a bucket the boundaries never named is worth seeing rather than
+because anything failed.
+*/
+export function historyEntry(warning: ReadWarning, at: Date): RunLogEntry {
+	const detail = readWarningMessage(warning);
+	const summary = oneLine(detail);
+
+	return warning.kind === 'failed-read'
+		? {at, class: 'History', failed: true, summary, detail}
+		: {at, class: 'History', summary, detail};
 }
 
 /*
