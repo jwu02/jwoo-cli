@@ -450,6 +450,113 @@ test.serial('the footer names the diagnostics key', async t => {
 });
 
 /*
+The frame is drawn into the whole window rather than into a box as tall as its
+content, and the window's height comes from the stream — which the fake stream
+does not have until a case gives it one. `reportRows` is that: `rows` is what
+the frame is sized from, and the `resize` event is what says it has changed,
+which is the pair a real terminal hands a run.
+*/
+const WINDOW_ROWS = 40;
+
+function reportRows(
+	stdout: ReturnType<typeof render>['stdout'],
+	rows: number,
+): void {
+	Object.defineProperty(stdout, 'rows', {configurable: true, value: rows});
+	stdout.emit('resize');
+}
+
+// A window is counted in lines, and Ink's frames end in a newline that is not
+// one of them. Ink also trims each line's own end, so nothing else is lost.
+function linesOf(frame: string): string[] {
+	return frame.trimEnd().split('\n');
+}
+
+test.serial('the frame is as tall as the window', async t => {
+	const source = new StubHistorySource();
+	const instance = mount(t, source);
+	await settle();
+
+	reportRows(instance.stdout, WINDOW_ROWS);
+	await settle();
+
+	const lines = linesOf(instance.lastFrame() ?? '');
+	t.is(lines.length, WINDOW_ROWS);
+	// The view is at the top and the keys are on the last line: the frame is one
+	// windowful, and the slack is inside it rather than under it.
+	t.regex(lines[0] ?? '', /Today/v);
+	t.regex(lines.at(-1) ?? '', /q quit/v);
+});
+
+test.serial('a resize re-fits the frame', async t => {
+	const source = new StubHistorySource();
+	const instance = mount(t, source);
+	await settle();
+
+	reportRows(instance.stdout, WINDOW_ROWS);
+	await settle();
+	reportRows(instance.stdout, WINDOW_ROWS + 10);
+	await settle();
+
+	const lines = linesOf(instance.lastFrame() ?? '');
+	t.is(lines.length, WINDOW_ROWS + 10);
+	t.regex(lines.at(-1) ?? '', /q quit/v);
+});
+
+/*
+A run whose output is a pipe has no window to fill — there is no `rows` — and
+one whose stream has no terminal behind it reports 0. Neither is a window of
+nothing, and a frame built to fill either would be a frame with no lines in it.
+*/
+test.serial('a stream with no window is given no filler', async t => {
+	const source = new StubHistorySource();
+	const instance = mount(t, source);
+	await settle();
+
+	const natural = linesOf(instance.lastFrame() ?? '');
+	t.regex(natural.at(-1) ?? '', /q quit/v);
+	t.true(
+		natural.length < WINDOW_ROWS,
+		'no blank lines under a frame of no window',
+	);
+
+	reportRows(instance.stdout, 0);
+	await settle();
+
+	t.is(linesOf(instance.lastFrame() ?? '').length, natural.length);
+});
+
+/*
+The window is a floor under the frame rather than its size: a frame with more
+in it than the terminal has room for grows past the window instead of being
+squeezed into it. Squeezing is what `height` does — Ink shrinks the children to
+fit and draws their lines over one another — and what it costs is the record
+itself: the block's lines and a diagnostic entry's full text are what the run
+did, and they are drawn whole on a short terminal or not at all.
+*/
+test.serial('content taller than the window is still drawn whole', async t => {
+	const source = new StubHistorySource();
+	const runLog = new StubRunLogSource();
+	runLog.entries = [written(), failed()];
+	const instance = mount(t, source, runLog);
+	await settle();
+
+	reportRows(instance.stdout, 5);
+	await settle();
+
+	const lines = linesOf(instance.lastFrame() ?? '');
+	const frame = lines.join('\n');
+	t.true(lines.length > 5);
+	t.regex(frame, /Today/v);
+	t.regex(frame, /Run Log/v);
+	t.regex(frame, /failed — will retry/v);
+	// The lines are drawn beside each other rather than over each other, which
+	// is what a frame squeezed into too little room would look like.
+	t.regex(frame, /Press Total\s+1,111/v);
+	t.regex(lines.at(-1) ?? '', /q quit/v);
+});
+
+/*
 `q` is not asserted here. It delegates straight to Ink's `exit()`, and
 `ink-testing-library` exposes no way to observe that a root has exited —
 `Instance` has `unmount`, `frames` and `lastFrame`, and none of them changes

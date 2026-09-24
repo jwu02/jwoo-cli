@@ -46,7 +46,9 @@ $ node --env-file=.env dist/cli.js permissions  # report the macOS grants
 
 The dashboard collects while it is open, and shows two views of what it collects: Today and This
 week, read back from Atlas, and a live view of the run in progress. `t` and `w` switch the range,
-`l` the live view, `q` quits.
+`l` the live view, `q` quits. It fills the terminal it was opened in — the frame is a screenful
+whenever it has less in it than that, with the keys on its last line — and gives the screen back
+when it exits, so the shell's own output is where it was.
 
 `collect` is a subcommand rather than a key inside the dashboard, because collection is not
 something that only exists inside a rendered Ink tree (ADR-0001). It runs in the foreground and

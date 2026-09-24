@@ -37,6 +37,7 @@ import {type TelemetrySource} from './telemetry.js';
 import {useHistory} from './use-history.js';
 import {useRunLog} from './use-run-log.js';
 import {useTelemetry} from './use-telemetry.js';
+import {useWindowHeight} from './use-window.js';
 
 /*
 Which view is drawn, as one value rather than a flag per view. The keys are
@@ -57,6 +58,7 @@ export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 	const [view, setView] = useState<View>('history');
 	const {exit} = useApp();
 	const state = useHistory(history, range);
+	const height = useWindowHeight();
 
 	useInput(input => {
 		switch (input) {
@@ -97,13 +99,25 @@ export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 	});
 
 	return (
-		<Box flexDirection="column">
+		/*
+		The frame is the window: as tall as the terminal reports, so the keys sit
+		on its last line rather than wherever the content happened to end. It is
+		a floor rather than a size, and that is what keeps a short terminal from
+		breaking the frame — `height` would compress the views to fit and draw
+		their lines over each other, where a floor is met by growing instead. The
+		spacer is what holds the keys down: it takes whatever the views and the
+		Run Log leave, and nothing at all when they need more room than the window
+		has. A stream that reports no height leaves no floor, so the frame is the
+		height of its content and the spacer has nothing to take.
+		*/
+		<Box flexDirection="column" minHeight={height}>
 			{view === 'history' && <HistoryView state={state} range={range} />}
 			{view === 'live' && <Live source={telemetry} />}
 			{view === 'diagnostics' && (
 				<Diagnostics source={runLog} timeZone={timeZone} />
 			)}
 			{view !== 'diagnostics' && <RunLog source={runLog} timeZone={timeZone} />}
+			<Box flexGrow={1} />
 			<Box marginTop={1}>
 				<Text dimColor>
 					t today · w this week · l live · d diagnostics · q quit

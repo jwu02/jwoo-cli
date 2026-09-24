@@ -26,6 +26,18 @@ export async function renderApp({
 			runLog={runLog}
 			timeZone={timeZone}
 		/>,
+		/*
+		The dashboard takes the whole terminal rather than drawing a frame into
+		the scrollback: what it drew is gone when it exits, and the shell's own
+		output is where it was. A frame as tall as the window is a screenful by
+		definition, and this is what makes it a screenful rather than the last
+		thing written over everything before it.
+
+		It is inert where there is no terminal to take — Ink enters the alternate
+		screen only when stdout is a TTY and the run is interactive — so a piped
+		or redirected run draws the frames it always did.
+		*/
+		{alternateScreen: true},
 	);
 
 	/*

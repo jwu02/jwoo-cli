@@ -90,6 +90,22 @@ side of a one-way mapping
 Note that the mapping is the _website's_ reader. The CLI has no `key-layout.ts` and no Physical
 Key: it ranks Key Labels as they arrive, so a label the website would discard still appears here.
 
+## The frame
+
+**Frame**:
+What the dashboard has on screen at one moment: the view that is up, the Run Log block under it,
+and the keys line at the bottom. Ink draws each frame over the one before it, which is what makes
+a stray write between frames cost every frame after it (ADR-0010).
+_Avoid_: screen, page, and "view" — the view is what the frame holds
+
+**Window**:
+The room the terminal gives the frame. The frame is exactly this tall wherever the content is
+shorter, with the slack sitting between the record and the keys line, and taller than it wherever
+the content needs more; a stream with no terminal behind it has no window to give, and the frame is
+then the height of its content (ADR-0011).
+_Avoid_: screen, viewport, and "window" for a Range — that is a calendar interval read from storage,
+and nothing here is related to it
+
 ## The live view
 
 The dashboard's second view: what the run that is happening now has observed. It is available

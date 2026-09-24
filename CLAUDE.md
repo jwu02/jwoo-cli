@@ -283,12 +283,21 @@ is the output a test asserts against.
 
 ### React layering
 
-The TUI is Ink 7 on React 19, and the `.tsx` extension marks the whole of it: `tui.tsx`,
-`app.tsx`, `history-view.tsx`, `live-view.tsx`, `totals-view.tsx`, `run-log-view.tsx`,
-`diagnostics-view.tsx`, `use-history.ts`, `use-telemetry.ts` and `use-run-log.ts` are the only
-modules that import `ink` or `react`. Everything else is plain TypeScript, which is what ADR-0001
-requires of the Collector so that the move to a separate process is a different entry point rather
-than a rewrite. Tests render through `ink-testing-library`.
+The TUI is Ink 7 on React 19, and it reaches no further than these modules: `tui.tsx`, `app.tsx`,
+`history-view.tsx`, `live-view.tsx`, `totals-view.tsx`, `run-log-view.tsx`,
+`diagnostics-view.tsx`, `use-history.ts`, `use-telemetry.ts`, `use-run-log.ts` and
+`use-window.ts` are the only ones that import `ink` or `react` — most of them `.tsx`, the hooks
+`.ts` because they hold no markup. Everything else is plain TypeScript, which is what ADR-0001
+requires of the Collector so that the move to a separate process is a different entry point
+rather than a rewrite. Tests render through `ink-testing-library`.
+
+**The frame is the window, and the window is the terminal's** (ADR-0011). `use-window.ts` is the
+only reader of `stdout.rows`, subscribed to the stream's `resize`; `app.tsx` gives the root box
+that value as a `minHeight` — a floor rather than a size, so a terminal shorter than the content
+grows the frame instead of compressing it — with a `flexGrow` spacer above the keys line, and
+`tui.tsx` renders into the alternate screen so what the dashboard drew goes when it exits. A
+stream that reports no height (a pipe, or a stream with no terminal behind it) reports `rows` of
+absent or 0, and the frame is then the height of its content as it always was.
 
 The history and live views draw the same three lines — Clicks, Mouse Distance, Press Total — and
 share `totals-view.tsx` rather than each spelling them, with the number formats alongside in
