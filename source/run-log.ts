@@ -38,13 +38,19 @@ import {type DisabledCollector, type DisabledReport} from './permissions.js';
 import {type FlushAttempt} from './session.js';
 
 /*
-The four kinds of thing a run can report: a Flush attempt, a problem the helper
-or the stream reading it reported, a warning from the history read, and
-collection that started disabled. The block draws the class of an entry beside
-its text, which is what tells a `Helper` line from a `Collection` one at a
-glance.
+The kinds of thing a run can report: a Flush attempt, a problem the helper or
+the stream reading it reported, a warning from the history read, a warning the
+write seam raised while setting itself up, and collection that started
+disabled. The block draws the class of an entry beside its text, which is what
+tells a `Helper` line from a `Collection` one at a glance.
+
+`Storage` is the write seam's own, and it is here rather than folded into
+`Flush` because it is not one: the store raises it as it is built, before any
+Flush has happened, and a line about a TTL index filed under a Flush would read
+as something the write below it did.
 */
-export type RunLogClass = 'Flush' | 'Helper' | 'History' | 'Collection';
+export type RunLogClass =
+	'Flush' | 'Helper' | 'History' | 'Storage' | 'Collection';
 
 /*
 Two texts rather than one, because a block that stays a fixed size has to cut
@@ -174,6 +180,34 @@ export function historyEntry(warning: ReadWarning, at: Date): RunLogEntry {
 	return warning.kind === 'failed-read'
 		? {at, class: 'History', failed: true, summary, detail}
 		: {at, class: 'History', summary, detail};
+}
+
+/*
+A warning the write seam raised, as the log records it.
+
+The store reports through a logger rather than as a return value — the one
+thing on that side that is not a Flush is a TTL index it could not create — so
+this is the entry the dashboard answers that logger with. A failed Flush never
+arrives this way: `flush` returns `undefined` for one, and the attempt the
+Session reports is what the log draws it from.
+
+The extra arguments a logger call carried are kept in `detail`, where the
+diagnostics view shows them: a driver's error is worth more than the one line
+the message makes of it, and dropping it here would leave the driver's own
+sentence nowhere at all.
+*/
+export function storageEntry(
+	message: string,
+	extra: readonly unknown[],
+	at: Date,
+): RunLogEntry {
+	return {
+		at,
+		class: 'Storage',
+		failed: true,
+		summary: oneLine(message),
+		detail: [message, ...extra.map(String)].join(' '),
+	};
 }
 
 /*

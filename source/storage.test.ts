@@ -247,7 +247,14 @@ test('flush reports failure so the caller can keep the state', async t => {
 	// `undefined` rather than throwing is the whole contract: the caller keeps
 	// Telemetry State and retries the same data next interval.
 	t.is(result, undefined);
-	t.is(logger.warnings.length, 1);
+
+	/*
+	And it is the *whole* of the report. A warning here as well would be one
+	failure said twice, in a place that cannot know whether there is a frame on
+	screen to draw it in — the caller that received the `undefined` is the one
+	that decides where the news belongs (ADR-0010).
+	*/
+	t.deepEqual(logger.warnings, []);
 });
 
 test('a Flush that failed after writing is overwritten by the retry, not duplicated', async t => {

@@ -123,6 +123,16 @@ export type TelemetryStore = {
 	close(): Promise<void>;
 };
 
+/*
+Where this store's warnings go. One thing reaches it: a TTL index the server
+would not create, raised once as the store is built and never fatal. A failed
+Flush does not — `flush` reports that as its own return value, and the caller
+that receives it is the one that knows where the news belongs (ADR-0010).
+
+The dashboard hands over a logger that appends Run Log entries, which is what
+keeps a startup warning out of the middle of the frame; a headless run keeps the
+terminal.
+*/
 export type MongoTelemetryStoreOptions = {
 	readonly logger?: Pick<Console, 'warn'>;
 };
@@ -252,8 +262,14 @@ export class MongoTelemetryStore implements TelemetryStore {
 				await collection.replaceOne({_id: id}, document, {upsert: true});
 				writtenIds.push(id);
 			}
-		} catch (error) {
-			this.#logger.warn('Failed to flush telemetry documents', error);
+		} catch {
+			/*
+			Swallowed, and deliberately: `undefined` is this method's whole report
+			of a failure, and the caller that receives it is the one that knows
+			where the news belongs — a Run Log entry under a frame, a line on
+			stderr without one (ADR-0010). A warning from here as well would be
+			the same failure said twice.
+			*/
 			this.#outstandingStamp ??= createdAt;
 			return undefined;
 		}

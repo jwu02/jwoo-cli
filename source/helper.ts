@@ -98,6 +98,23 @@ export type StreamProblem =
 			readonly signal: NodeJS.Signals | undefined;
 	  };
 
+/*
+Where the two things a stream produces besides events go: the problems it
+found — a line of stdout that would not parse, a helper that exited — and the
+helper's own diagnostics, which arrive on its stderr.
+
+Handed to whoever builds the stream, as one thing, because each is settled when
+the stream is built and neither can be changed afterwards: a stream constructed
+with a sink and told about the other later would have sent its first problem to
+the wrong place. The two are not the same decision — the dashboard keeps the
+problems as entries and drops the chatter — but they are decided at the same
+moment, and one object is how a builder is told about both (ADR-0010).
+*/
+export type StreamSinks = {
+	readonly onProblem: (problem: StreamProblem) => void;
+	readonly onHelperStderr: (chunk: string) => void;
+};
+
 export type EventStreamOptions = {
 	readonly helperPath?: string;
 	/*
@@ -119,6 +136,13 @@ export type EventStreamOptions = {
 	could ask for a logger would be a wider interface than the one thing it does.
 	*/
 	readonly onProblem?: (problem: StreamProblem) => void;
+	/*
+	Where the helper's own diagnostics go. Passed through to this process's
+	stderr by default, which is where a terminal run wants them; the dashboard
+	hands over a sink that drops them, because a line landing in the middle of a
+	drawn frame corrupts it (ADR-0010).
+	*/
+	readonly onHelperStderr?: (chunk: string) => void;
 };
 
 /*
@@ -131,6 +155,7 @@ export class EventStream implements StartStop {
 	readonly #helperArgs: readonly string[];
 	#onEvent: ((event: RawEvent) => void) | undefined;
 	readonly #onProblem: (problem: StreamProblem) => void;
+	readonly #onHelperStderr: (chunk: string) => void;
 
 	/*
 	Stdin closed rather than piped: the helper takes no input, and a writable
@@ -161,11 +186,13 @@ export class EventStream implements StartStop {
 		helperArgs = [],
 		onEvent,
 		onProblem = defaultProblemReporter,
+		onHelperStderr = defaultHelperStderr,
 	}: EventStreamOptions) {
 		this.#helperPath = helperPath;
 		this.#helperArgs = helperArgs;
 		this.#onEvent = onEvent;
 		this.#onProblem = onProblem;
+		this.#onHelperStderr = onHelperStderr;
 	}
 
 	/*
@@ -227,13 +254,13 @@ export class EventStream implements StartStop {
 
 		/*
 		The helper writes its diagnostics to stderr and never to stdout, which
-		is what lets stdout be read as nothing but events. Passed through rather
-		than swallowed, because the tap's own notes — a re-enable, a missing
-		grant — have nowhere else to appear.
+		is what lets stdout be read as nothing but events. Sent to the sink the
+		caller supplied — this process's stderr when it supplied none, because
+		the tap's own notes have nowhere else to appear on a terminal.
 		*/
 		child.stderr.setEncoding('utf8');
 		child.stderr.on('data', (chunk: string) => {
-			process.stderr.write(chunk);
+			this.#onHelperStderr(chunk);
 		});
 
 		child.on('error', error => {
@@ -485,4 +512,18 @@ the dashboard appends Run Log entries instead.
 */
 export function defaultProblemReporter(problem: StreamProblem): void {
 	process.stderr.write(`[eventtap] ${problemMessage(problem)}\n`);
+}
+
+/*
+Where the helper's own diagnostics go when nothing else was supplied: this
+process's stderr, unchanged.
+
+They are notes rather than events — a tap that was re-enabled, the listener
+starting up — and the helper writes them to stderr precisely so that a reader
+can take stdout as nothing but events. A terminal run reads them there; a run
+with a frame to keep whole hands over a sink that drops them, because a line
+arriving mid-draw corrupts the frame it was meant to explain (ADR-0010).
+*/
+export function defaultHelperStderr(chunk: string): void {
+	process.stderr.write(chunk);
 }

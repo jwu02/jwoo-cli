@@ -21,7 +21,7 @@ import {Box, Text} from 'ink';
 import {CLOCK_WIDTH, clockTime} from './format.js';
 import {type RunLogEntry} from './run-log.js';
 
-// "Collection", the longest of the four classes, and a gap after it.
+// "Collection", the longest of the classes, and a gap after it.
 const CLASS_WIDTH = 11;
 
 export function RunLogView({

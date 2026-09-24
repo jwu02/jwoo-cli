@@ -7,9 +7,10 @@ that affordable: it prints one sample of every event type and exits before
 creating a tap, so these tests need no permission, no input, and no live
 capture. It is the same reason the helper has that mode at all.
 
-The other fixtures are not the helper. They are `/bin/cat` and a path that does
-not exist, chosen because each produces something the helper cannot be asked to
-produce on demand — a line split across two reads, and a failure to start.
+The other fixtures are not the helper. They are `/bin/cat`, `/bin/sh` and a path
+that does not exist, chosen because each produces something the helper cannot be
+asked to produce on demand — a line split across two reads, something said on
+stderr, and a failure to start.
 
 The preflight reader's tests at the bottom are the exception to all of this: a
 pure function over whole-stdout strings, it needs no process at all.
@@ -270,6 +271,38 @@ test('a helper that cannot start is reported rather than thrown', async t => {
 	t.is(problem.error.code, 'helperUnavailable');
 	t.regex(problem.error.message, /helper\/build\.sh/v);
 	t.deepEqual(seen.events, []);
+});
+
+/*
+What the helper says on stderr, and where it goes.
+
+Its notes are diagnostics rather than events, and it writes them to stderr so
+that stdout can be read as nothing but events. Where they end up from there is
+the caller's: this process's stderr by default, which is what a terminal run
+wants, and whatever sink was handed over otherwise — which is how a run with a
+frame to keep whole stops them corrupting it (ADR-0010).
+
+`sh` rather than `cat`, because the point is a child that says something on
+stderr at all. `cat` reads a file to stdout and has no way to be asked.
+*/
+test('the helper’s stderr goes to the sink the stream was built with', async t => {
+	const seen: string[] = [];
+	const stream = new EventStream({
+		helperPath: '/bin/sh',
+		helperArgs: ['-c', 'echo banner 1>&2'],
+		onHelperStderr(chunk) {
+			seen.push(chunk);
+		},
+		onProblem: quiet(),
+	});
+
+	stream.start();
+	await until(() => seen.length > 0, 'the helper’s stderr');
+	stream.stop();
+
+	// Joined, because a pipe delivers chunks rather than lines and this one is
+	// free to arrive in more than one.
+	t.is(seen.join(''), 'banner\n');
 });
 
 test('stopping kills the helper rather than leaving it running', async t => {

@@ -20,10 +20,12 @@ import process from 'node:process';
 import {type Command} from './args.js';
 import {type Config, loadConfig} from './config.js';
 import {
+	defaultHelperStderr,
 	defaultProblemReporter,
 	EventStream as HelperStream,
 	requestInputMonitoring as askForInputMonitoring,
 	type StreamProblem,
+	type StreamSinks,
 } from './helper.js';
 import {
 	MongoHistorySource,
@@ -42,6 +44,7 @@ import {
 	historyEntry,
 	InProcessRunLogSource,
 	type RunLogSource,
+	storageEntry,
 } from './run-log.js';
 import {
 	type Collector,
@@ -107,24 +110,23 @@ where the helper's own failure lines go. A granted run can then be driven end to
 end with a stream of the caller's own, and a denied one watched asking for the
 grant, without a capture process and without a TCC prompt (ADR-0002).
 
-All three are what a real run wants when nothing is supplied, so none is
+All of them are what a real run wants when nothing is supplied, so none is
 required.
 */
 export type CollectorFactoryOptions = {
 	/*
-	The stream the Collectors read, built with the reporter its problems go to.
+	The stream the Collectors read, built with the sinks its byproducts go to.
 	The default is the real one, which spawns the helper lazily in its own
 	`start()` and never before.
 
-	The reporter is handed over rather than reached for afterwards because a
-	stream's problems are settled when it is built: a helper that could not run,
-	a line of stdout that would not parse and an exit are reported by the stream
-	itself, and a caller building one of its own reports them where it was told
-	to — which is the only way the dashboard can keep them off the terminal.
+	The sinks are handed over rather than reached for afterwards because both are
+	settled when a stream is built: a helper that could not run, a line of stdout
+	that would not parse and an exit are reported by the stream itself, and so is
+	the helper's own stderr as it arrives. A caller building one of its own
+	reports them where it was told to — which is the only way the dashboard can
+	keep them off the terminal (ADR-0010).
 	*/
-	readonly createStream?: (
-		onProblem: (problem: StreamProblem) => void,
-	) => EventSource;
+	readonly createStream?: (sinks: StreamSinks) => EventSource;
 	/*
 	Called once, on a run whose report says the grant is missing. macOS will not
 	show the prompt to a process with nobody at the keyboard, so the one run
@@ -143,6 +145,13 @@ export type CollectorFactoryOptions = {
 	dashboard, which has a frame to keep whole, appends Run Log entries instead.
 	*/
 	readonly onProblem?: (problem: StreamProblem) => void;
+	/*
+	Where the helper's own diagnostics go: the tap's notes, written to its
+	stderr. Passed through to this process's stderr by default, which is what a
+	terminal run wants, and dropped by the dashboard, where anything arriving
+	mid-draw corrupts the frame (ADR-0010).
+	*/
+	readonly onHelperStderr?: (chunk: string) => void;
 };
 
 /*
@@ -157,18 +166,18 @@ export function defaultCollectorFactory({
 	createStream,
 	requestInputMonitoring = askForInputMonitoring,
 	onProblem = defaultProblemReporter,
+	onHelperStderr = defaultHelperStderr,
 }: CollectorFactoryOptions): CollectorFactory {
 	/*
 	The default stream is built here rather than as a default above, because it
-	has to be told where to report its problems and only this has read that yet.
-	It is handed the same reporter the caller's would be, so there is one rule
-	rather than one for each: whatever builds the stream says where its problems
-	go, and the helper is where that reporter lands.
+	has to be told where its byproducts go and only this has read that yet. It
+	is handed the same sinks the caller's would be, so there is one rule rather
+	than one for each: whatever builds the stream says where they go, and the
+	helper is where they land.
 	*/
+	const sinks: StreamSinks = {onProblem, onHelperStderr};
 	const buildStream =
-		createStream ??
-		((report: (problem: StreamProblem) => void) =>
-			new HelperStream({onProblem: report}));
+		createStream ?? ((where: StreamSinks) => new HelperStream(where));
 
 	return (report, state) => {
 		if (report.status !== 'granted') {
@@ -187,7 +196,7 @@ export function defaultCollectorFactory({
 		process: a run stopped before it starts would then leave one behind, and
 		owning that lifetime is the Session's whole job.
 		*/
-		const stream = buildStream(onProblem);
+		const stream = buildStream(sinks);
 
 		return {collectors: collectorsOver(stream, state, onProblem), stream};
 	};
@@ -291,11 +300,15 @@ export type RunOptions = CollectorFactoryOptions & {
 	readonly shutdown?: ShutdownSignal;
 	readonly logger?: Logger;
 	/*
-	The store is an option for the same reason the rest are, and it builds a
-	`MongoClient`: a test of the dispatch should not need a database, and there
-	is no test database in this repo.
+	The write seam as the composition root reaches for it, built with the logger
+	its warnings go to — the shape `createHistorySource` has, and for the same
+	reason. What the seam reports is settled when it is built, so a caller
+	building one of its own reports where it was told to; that is what lets a
+	test drive a TTL index the server would not create to an entry, or to the
+	terminal, without a database. There is no test database in this repo, and
+	the store builds a `MongoClient`.
 	*/
-	readonly store?: TelemetryStore;
+	readonly createStore?: (logger: Pick<Console, 'warn'>) => TelemetryStore;
 	/*
 	The read seam as the dashboard reaches for it, built with the reporter its
 	warnings go to — the shape `createStream` has, and for the same reason. What
@@ -392,15 +405,15 @@ function sessionFor(
 		config,
 		state,
 		report,
-		logger,
 		runLog,
 		problemReporter,
+		helperStderr,
+		storeLogger,
 		onFlush,
 	}: {
 		readonly config: Config;
 		readonly state: TelemetryState;
 		readonly report: PermissionReport;
-		readonly logger: Logger;
 		readonly runLog: InProcessRunLogSource;
 		/*
 		Where the helper's problems go on a run whose caller supplied no reporter
@@ -410,6 +423,20 @@ function sessionFor(
 		*/
 		readonly problemReporter?: (problem: StreamProblem) => void;
 		/*
+		Where the helper's own diagnostics go, on the same terms: left out by
+		`collect`, which passes them through to the terminal it always has, and a
+		sink that drops them in dashboard mode, where a line arriving mid-draw
+		corrupts the frame (ADR-0010).
+		*/
+		readonly helperStderr?: (chunk: string) => void;
+		/*
+		Where the write seam's warnings go. Left out by `collect`, which keeps
+		the store's own default — a line on stderr; the dashboard appends
+		entries, which is what puts a TTL index the server would not create in
+		the Run Log rather than in the middle of the frame.
+		*/
+		readonly storeLogger?: Pick<Console, 'warn'>;
+		/*
 		Whatever else wants to hear about a Flush, which is the live view — the
 		one observer whose counters depend on whether the write landed.
 		*/
@@ -417,28 +444,40 @@ function sessionFor(
 	},
 ): CollectionSession {
 	/*
-	A reporter the caller supplied is the one that runs — a caller that asked to
-	see the problems itself has said where it wants them — so the mode's is the
+	A sink the caller supplied is the one that runs — a caller that asked to
+	receive these itself has said where it wants them — so the mode's is the
 	default and not the rule. The `undefined` of a mode that left one out is
-	what `defaultCollectorFactory` reads as "the stderr reporter".
+	what `defaultCollectorFactory` reads as "the stderr one".
 	*/
 	const factoryOptions: CollectorFactoryOptions = {
 		...options,
 		onProblem: options.onProblem ?? problemReporter,
+		onHelperStderr: options.onHelperStderr ?? helperStderr,
 	};
 	const setup = (options.collectors ?? defaultCollectorFactory(factoryOptions))(
 		report,
 		state,
 	);
 
+	/*
+	Built with the logger its warnings go to, whichever builder is used: a
+	caller's own receives it, and so does the real store — which is the whole of
+	what keeps a TTL index it could not create off the frame (ADR-0010).
+	`console` when nothing said otherwise, which is the store's own default and
+	what a headless run keeps.
+	*/
+	const buildStore =
+		options.createStore ??
+		((logger: Pick<Console, 'warn'>) =>
+			new MongoTelemetryStore(config, undefined, {logger}));
+
 	return new CollectionSession({
-		store: options.store ?? new MongoTelemetryStore(config),
+		store: buildStore(storeLogger ?? console),
 		state,
 		collectors: setup.collectors,
 		stream: setup.stream,
 		flushIntervalSeconds: config.flushIntervalSeconds,
 		shutdown: options.shutdown ?? processSignal,
-		logger,
 		/*
 		The Run Log is written here rather than by an observer, because both
 		commands record Flushes and only one of them has a view to hear about
@@ -450,6 +489,26 @@ function sessionFor(
 			onFlush?.(attempt);
 		},
 	});
+}
+
+/*
+The write seam's warnings, as Run Log entries.
+
+A logger rather than a reporter, because a logger is the shape the store offers
+and it is not the store's business whether there is a frame to keep quiet. What
+it raises through one is a TTL index it could not create — raised as it is
+built, before any Flush has happened — and in dashboard mode that is an entry
+rather than a line of stderr in the middle of the drawing (ADR-0010).
+
+The extra arguments a warning was given are kept, because they are where a
+driver's error travels.
+*/
+function storeLoggerFor(runLog: InProcessRunLogSource): Pick<Console, 'warn'> {
+	return {
+		warn(message: string, ...extra: unknown[]) {
+			runLog.append(storageEntry(message, extra, new Date()));
+		},
+	};
 }
 
 /*
@@ -484,8 +543,23 @@ async function runCollect(options: RunOptions): Promise<void> {
 		config,
 		state: stateFor(options, config),
 		report,
-		logger,
 		runLog,
+		/*
+		A headless run has no frame to keep whole, so a Flush that failed is a
+		line on stderr. It is said from the attempt the Session reports rather
+		than by the Session or the store, because this is the one place that
+		knows which command it is answering (ADR-0010).
+
+		A failed *final* Flush is then warned about twice — here, and once more
+		by `reportShutdown` below — which is the shape this has always had, and
+		the two lines say different things: one that the write failed, the other
+		that the counters were lost with it.
+		*/
+		onFlush(attempt) {
+			if (!attempt.ok) {
+				logger.warn('Flush failed; counters will retry on the next Flush');
+			}
+		},
 	});
 
 	reportShutdown(await session.run(), logger);
@@ -555,7 +629,6 @@ async function runDashboard(options: RunOptions): Promise<void> {
 		config,
 		state,
 		report,
-		logger,
 		runLog,
 		/*
 		The helper's problems become entries rather than lines of stderr, which
@@ -565,6 +638,21 @@ async function runDashboard(options: RunOptions): Promise<void> {
 		problemReporter(problem) {
 			runLog.append(helperEntry(problem, new Date()));
 		},
+		/*
+		The helper's other output goes nowhere at all. Its notes — a tap
+		re-enabled, the listener announcing itself — are written to stderr for a
+		terminal to read, and a frame has no room for them: Ink draws by
+		overwriting the lines it last drew, so a line landing mid-draw leaves the
+		rest of the frame off by one from where Ink thinks it is. Nothing that
+		matters goes with it — a statement about collection arrives as an event
+		on stdout, and those become entries.
+		*/
+		helperStderr: discardHelperStderr,
+		/*
+		The write seam's warnings, likewise: entries rather than lines of
+		stderr.
+		*/
+		storeLogger: storeLoggerFor(runLog),
 		onFlush(attempt) {
 			telemetry.recordFlush(attempt);
 		},
@@ -637,6 +725,15 @@ says so once.
 */
 function noop(): void {
 	// See the call site: the failure is reported by `await running`, not here.
+}
+
+/*
+A sink that drops what it is handed, for the one caller that wants one: the
+helper's stderr under a frame. Named rather than an arrow for the same reason
+`noop` is — an empty body is the intent here, and a name is what says so.
+*/
+function discardHelperStderr(): void {
+	// See the call site: the helper's notes have nowhere to go under a frame.
 }
 
 export async function run(

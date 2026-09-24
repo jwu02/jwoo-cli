@@ -133,7 +133,6 @@ export type SessionOptions = {
 	readonly stream?: EventStream;
 	readonly flushIntervalSeconds: number;
 	readonly shutdown: ShutdownSignal;
-	readonly logger?: Pick<Console, 'warn'>;
 	/*
 	Called after every Flush attempt, successful or not.
 
@@ -156,7 +155,6 @@ export class CollectionSession {
 	readonly #stream: EventStream | undefined;
 	readonly #intervalMs: number;
 	readonly #shutdown: ShutdownSignal;
-	readonly #logger: Pick<Console, 'warn'>;
 	readonly #onFlush: ((attempt: FlushAttempt) => void) | undefined;
 
 	#timer: NodeJS.Timeout | undefined;
@@ -195,7 +193,6 @@ export class CollectionSession {
 		this.#stream = options.stream;
 		this.#intervalMs = options.flushIntervalSeconds * 1000;
 		this.#shutdown = options.shutdown;
-		this.#logger = options.logger ?? console;
 		this.#onFlush = options.onFlush;
 	}
 
@@ -250,9 +247,15 @@ export class CollectionSession {
 	}
 
 	/*
-	Activity decides whether a Flush is attempted at all. A failed Flush is a
-	warning and Telemetry State is left whole, so the same Snapshot is retried on
-	the next interval — the rule from `storage.ts`, applied here.
+	Activity decides whether a Flush is attempted at all. A failed Flush leaves
+	Telemetry State whole, so the same Snapshot is retried on the next interval —
+	the rule from `storage.ts`, applied here.
+
+	A failure is warned about by nobody here: the attempt below is the one thing
+	that says it happened, and whoever wants it said reaches for that. A warning
+	written here as well would be a second report of one failure, in a place
+	that cannot know whether there is a frame on screen to draw it in
+	(ADR-0010).
 	*/
 	async #flush(): Promise<boolean> {
 		if (!this.#state.hasActivity()) {
@@ -267,8 +270,6 @@ export class CollectionSession {
 
 		if (isWritten) {
 			this.#state.clear();
-		} else {
-			this.#logger.warn('Flush failed; counters will retry on the next Flush');
 		}
 
 		/*

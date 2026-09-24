@@ -7,6 +7,7 @@ import {
 	historyEntry,
 	InProcessRunLogSource,
 	type RunLogEntry,
+	storageEntry,
 } from './run-log.js';
 import {type FlushAttempt} from './session.js';
 import {type Snapshot} from './state.js';
@@ -227,6 +228,44 @@ test('an ignored bucket is an entry, and not a failure', t => {
 		ignored.summary,
 		'Ignored 1 time series bucket(s) outside the range boundaries',
 	);
+});
+
+/*
+The write seam's warning, which is the store's own side of a run and the one
+thing it reports that is not a Flush.
+
+The message is the store's, because the store composes it; what this module
+decides is that it is the entry's line, that a warning is drawn as a fault, and
+that the arguments a logger call carried are kept rather than dropped — a
+driver's error is worth more than the one line the message makes of it, and the
+diagnostics view is the only place left to read it.
+*/
+test('a write seam warning is an entry keeping the driver’s own words', t => {
+	const warning = storageEntry(
+		'Failed to create TTL index on telemetry',
+		[new Error('not authorized')],
+		AT,
+	);
+
+	t.deepEqual(warning.at, AT);
+	t.is(warning.class, 'Storage');
+	t.true(warning.failed === true, 'which is what draws it red');
+	t.is(warning.summary, 'Failed to create TTL index on telemetry');
+	t.is(
+		warning.detail,
+		'Failed to create TTL index on telemetry Error: not authorized',
+	);
+});
+
+/*
+A warning called with the message alone, which is what a logger is free to do:
+the full text is then the same sentence the line shows, and nothing is invented
+to pad it.
+*/
+test('a warning with nothing after the message is its own full text', t => {
+	const warning = storageEntry('Failed to create TTL index', [], AT);
+
+	t.is(warning.detail, warning.summary);
 });
 
 function denied(

@@ -129,10 +129,11 @@ Key Counts and are still different things
 
 **Run Log**:
 The dashboard's record of what the current run did and hit: each Flush attempt with the counts
-it wrote, or that it failed; the problems the helper and the reads reported; and collection
-that started disabled by a missing permission. It holds only this run — it exists while the CLI
-runs and is gone when it exits. A Flush is attempted only when there is Activity, so the log
-lists attempts, not intervals. The full text of an entry is one keypress away.
+it wrote, or that it failed; the problems the helper and the reads reported; what the write seam
+reported about itself; and collection that started disabled by a missing permission. It holds
+only this run — it exists while the CLI runs and is gone when it exits. A Flush is attempted
+only when there is Activity, so the log lists attempts, not intervals. The full text of an entry
+is one keypress away.
 _Avoid_: activity log (Activity is countable input), event log (events are the helper's wire
 format), flush history (history is the storage read — the other view), session log, log file
 (nothing here is written to disk)

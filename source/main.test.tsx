@@ -16,7 +16,7 @@ import {
 	type RunOptions,
 	run,
 } from './main.js';
-import {type StreamProblem} from './helper.js';
+import {type StreamProblem, type StreamSinks} from './helper.js';
 import {KeyboardCollector} from './keyboard.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
 import {type HelperError, keyEventAt, type RawEvent} from './raw-event.js';
@@ -58,11 +58,29 @@ const SECONDARY_FN = 8_388_608;
 const FN = 63;
 const A_KEY = 0;
 
+/*
+A store that writes, or one that fails a set number of Flushes and then writes.
+
+The budget is what makes a *mid-run* failure testable: the Flush that fails has
+to be an interval's rather than the last one's, so that the retry lands and the
+run ends cleanly — which is the only shape in which "one failure, one report"
+can be counted.
+*/
 class FakeStore implements TelemetryStore {
+	#failures: number;
 	readonly snapshots: Array<Record<string, unknown>> = [];
 	closed = 0;
 
+	constructor(failures = 0) {
+		this.#failures = failures;
+	}
+
 	async flush(snapshot: never): Promise<FlushResult> {
+		if (this.#failures > 0) {
+			this.#failures -= 1;
+			return undefined;
+		}
+
 		this.snapshots.push(snapshot);
 		return ['id'];
 	}
@@ -70,6 +88,25 @@ class FakeStore implements TelemetryStore {
 	async close(): Promise<void> {
 		this.closed += 1;
 	}
+}
+
+/*
+Waits for something the run reaches on its own — a Flush Interval firing —
+rather than for a fixed time, so a test is not racing the timer's resolution.
+*/
+async function until(isSatisfied: () => boolean, what: string): Promise<void> {
+	for (let attempts = 0; attempts < 200; attempts += 1) {
+		if (isSatisfied()) {
+			return;
+		}
+
+		// eslint-disable-next-line no-await-in-loop -- polling, one check at a time.
+		await new Promise(resolve => {
+			setTimeout(resolve, 5);
+		});
+	}
+
+	throw new Error(`timed out waiting for ${what}`);
 }
 
 class FakeShutdownSignal implements ShutdownSignal {
@@ -150,6 +187,31 @@ function captureStderr(call: () => void): string[] {
 	}
 
 	return written;
+}
+
+/*
+The same question asked of a whole run rather than of one call, because a frame
+is up for a whole run: what a Flush Interval writes, and what a retry writes,
+are not inside any single call a test can wrap.
+
+It records *and forwards*. A window this long may overlap another test's, and a
+window that swallowed would take that test's output down with it — the only
+thing this one takes is a copy.
+*/
+function watchStderr(): {written: string[]; restore: () => void} {
+	const written: string[] = [];
+	const original = process.stderr.write;
+	process.stderr.write = function (chunk: string) {
+		written.push(chunk);
+		return original.call(process.stderr, chunk);
+	};
+
+	return {
+		written,
+		restore() {
+			process.stderr.write = original;
+		},
+	};
 }
 
 /*
@@ -249,6 +311,12 @@ type Harness = {
 	readonly logger: ReturnType<typeof logger>;
 	readonly reports: PermissionReport[];
 	readonly collectors: Array<ReturnType<typeof collector>>;
+	/*
+	The logger the composition root built the store with, one per run. What the
+	write seam's warnings are worth is decided by where that logger puts them,
+	and there is no other way to reach it from outside a run.
+	*/
+	readonly storeLoggers: Array<Pick<Console, 'warn'>>;
 };
 
 function harness(report: PermissionReport): Harness {
@@ -258,6 +326,7 @@ function harness(report: PermissionReport): Harness {
 	const lines = logger();
 	const reports: PermissionReport[] = [];
 	const collectors: Array<ReturnType<typeof collector>> = [];
+	const storeLoggers: Array<Pick<Console, 'warn'>> = [];
 
 	const buildCollectors: CollectorFactory = seen => {
 		reports.push(seen);
@@ -273,10 +342,18 @@ function harness(report: PermissionReport): Harness {
 		logger: lines,
 		reports,
 		collectors,
+		storeLoggers,
 		options: {
 			permissions,
 			shutdown,
-			store,
+			/*
+			The harness's store, handed the logger the composition root decided
+			the mode's warnings go through and built the way the real one is.
+			*/
+			createStore(storeLogger) {
+				storeLoggers.push(storeLogger);
+				return store;
+			},
 			state: new TelemetryState(),
 			logger: lines,
 			config: CONFIG,
@@ -668,7 +745,7 @@ test('a failed final Flush exits non-zero, because the counters are lost', async
 			{kind: 'collect'},
 			{
 				...test_.options,
-				store: FAILING_STORE,
+				createStore: () => FAILING_STORE,
 			},
 		);
 		test_.shutdown.fire('SIGTERM');
@@ -863,7 +940,7 @@ async function logged(
 		{kind: 'dashboard'},
 		{
 			...withoutFactory(test_.options),
-			...(store && {store}),
+			...(store && {createStore: () => store}),
 			state,
 			createStream: () => stream,
 			requestInputMonitoring: noGrantRequest,
@@ -1000,7 +1077,7 @@ test('an unreadable line and a helper exit are entries too', async t => {
 		{
 			...withoutFactory(test_.options),
 			runLog,
-			createStream(onProblem) {
+			createStream({onProblem}) {
 				report = onProblem;
 				return stream;
 			},
@@ -1167,6 +1244,246 @@ test('collect still prints helper problems to stderr', async t => {
 		runLog.read(),
 		[],
 		'a headless run reports through the terminal and its exit code',
+	);
+});
+
+/*
+One failure, one report — the half of the contract a headless run has.
+
+The Session and the write seam both used to warn about the same failed Flush, so
+a mid-run failure was said twice before anything else got to it, and the
+deletion of both had to leave `collect` a warning it can still read (ADR-0010).
+What is asserted is the whole of the warnings, so a report from the store, from
+the Session or from anywhere else fails here as the second one it would be.
+
+The Flush Interval is milliseconds and the store fails exactly once, so the
+failure under test is an interval's and the final Flush lands: the run ends
+cleanly, and nothing about a lost counter is mixed into what is counted here.
+*/
+test('collect warns once for a failed Flush, from the attempt itself', async t => {
+	const test_ = harness(granted());
+	const store = new FakeStore(1);
+	test_.options.state?.addLeftClick();
+
+	const running = run(
+		{kind: 'collect'},
+		{
+			...test_.options,
+			createStore: () => store,
+			config: {...CONFIG, flushIntervalSeconds: 0.005},
+		},
+	);
+
+	await until(
+		() => test_.logger.warnings.length > 0,
+		'the failed interval Flush',
+	);
+	test_.shutdown.fire('SIGTERM');
+	await running;
+
+	t.deepEqual(test_.logger.warnings, [
+		'Flush failed; counters will retry on the next Flush',
+	]);
+	t.deepEqual(
+		store.snapshots.map(snapshot => snapshot['leftClicks']),
+		[1],
+		'and the same counters were written by the retry',
+	);
+});
+
+/*
+A failed Flush mid-run, with a frame up — the claim the whole change rests on,
+and the one place it can be checked end to end.
+
+The store fails an interval's Flush on a run that is drawing, and the retry
+after it lands, so both entries are the run's own doing. Nothing writes to
+stderr for any of it: the Session has no logger to write with any more and the
+store reports a failure as its return value, which leaves the entry as the one
+report — and a `console.warn` left anywhere on the path would show up here as
+the second one it would be (ADR-0010).
+
+The window is the run rather than a call, because that is when a frame is up.
+*/
+test('a dashboard reports a failed Flush once, and writes nothing to stderr', async t => {
+	const test_ = harness(granted());
+	const runLog = new InProcessRunLogSource();
+	const state = new TelemetryState();
+	state.addLeftClick();
+
+	const watch = watchStderr();
+	try {
+		await run(
+			{kind: 'dashboard'},
+			{
+				...withoutFactory(test_.options),
+				createStore: () => new FakeStore(1),
+				runLog,
+				state,
+				config: {...CONFIG, flushIntervalSeconds: 0.005},
+				createStream: () => new FakeStream(),
+				requestInputMonitoring: noGrantRequest,
+				createHistorySource: () => stubHistory(),
+				async renderApp(view) {
+					await until(
+						() => runLog.read().some(entry => entry.failed === true),
+						'the failed interval Flush',
+					);
+					test_.shutdown.fire('SIGINT');
+					await view.ended;
+				},
+			},
+		);
+	} finally {
+		watch.restore();
+	}
+
+	t.deepEqual(watch.written, [], 'the frame is the only output');
+	const entries = runLog.read();
+	t.deepEqual(
+		entries.map(entry => [entry.class, entry.failed === true]),
+		[
+			['Flush', true],
+			['Flush', false],
+		],
+		'the failure, and the retry that wrote the same counters',
+	);
+});
+
+/*
+The helper's own diagnostics, which are the one thing on a run that reaches the
+terminal without anyone asking for it.
+
+Both modes are asserted together because the change is a redirection rather than
+a silencing: a dashboard that stopped the chatter by stopping it everywhere
+would pass the first assertion and fail the second, and a `collect` run would
+have lost the tap's notes without anyone deciding it should (ADR-0010).
+*/
+async function sinksFor(kind: 'collect' | 'dashboard'): Promise<StreamSinks> {
+	const test_ = harness(granted());
+	const stream = new FakeStream();
+	let sinks: StreamSinks | undefined;
+
+	test_.shutdown.fire('SIGINT');
+
+	await run(
+		{kind},
+		{
+			...withoutFactory(test_.options),
+			createStream(where) {
+				sinks = where;
+				return stream;
+			},
+			requestInputMonitoring: noGrantRequest,
+			createHistorySource: () => stubHistory(),
+			async renderApp(view) {
+				await view.ended;
+			},
+		},
+	);
+
+	if (sinks === undefined) {
+		throw new Error('the factory built no stream');
+	}
+
+	return sinks;
+}
+
+test('a dashboard sends the helper’s stderr nowhere, and collect sends it to the terminal', async t => {
+	const dashboard = await sinksFor('dashboard');
+	const collect = await sinksFor('collect');
+
+	t.deepEqual(
+		captureStderr(() => {
+			dashboard.onHelperStderr('banner\n');
+		}),
+		[],
+		'nothing may write to stderr while the frame is up',
+	);
+	t.deepEqual(
+		captureStderr(() => {
+			collect.onHelperStderr('banner\n');
+		}),
+		['banner\n'],
+		'and a headless run still reads what the helper said',
+	);
+});
+
+/*
+The write seam's warning, which is the one report a run can make that is not a
+Flush: the TTL index the store asks the server for as it is built, and cannot
+always have.
+
+It is raised through the logger the store was built with, so what becomes of it
+is the composition root's decision and not the store's — an entry under a frame,
+a line on the terminal without one. The store is the harness's own here and the
+warning is raised while the frame is up, because the routing is what is under
+test; the real store's half of it, that a TTL index it could not create is a
+warning at all, is `storage.test.ts`'s.
+*/
+test('the write seam’s warning is an entry in dashboard mode, and not a line on stderr', async t => {
+	const test_ = harness(granted());
+	const runLog = new InProcessRunLogSource();
+	let written: readonly string[] = [];
+
+	await run(
+		{kind: 'dashboard'},
+		{
+			...test_.options,
+			runLog,
+			createHistorySource: () => stubHistory(),
+			async renderApp(view) {
+				written = captureStderr(() => {
+					test_.storeLoggers[0]?.warn(
+						'Failed to create TTL index on telemetry',
+						new Error('not authorized'),
+					);
+				});
+
+				/*
+				The frame comes down when the run ends, so the signal is what
+				ends it — and it is raised after the warning, so the warning is
+				made while there is a frame to keep whole.
+				*/
+				test_.shutdown.fire('SIGINT');
+				await view.ended;
+			},
+		},
+	);
+
+	t.deepEqual(written, [], 'the frame is the only output');
+	t.deepEqual(
+		runLog.read().map(entry => [entry.class, entry.summary]),
+		[['Storage', 'Failed to create TTL index on telemetry']],
+	);
+	t.regex(
+		runLog.read()[0]?.detail ?? '',
+		/not authorized/v,
+		'and the driver’s own error is kept in the full text',
+	);
+});
+
+/*
+The other half of the same decision, and the reason it cannot be made by
+silencing the store: a headless run has no frame to draw an entry in, so its
+warnings keep going where they have always gone.
+*/
+test('collect keeps the write seam’s warning on stderr', async t => {
+	const test_ = harness(granted());
+	const runLog = new InProcessRunLogSource();
+
+	test_.shutdown.fire('SIGINT');
+	await run({kind: 'collect'}, {...test_.options, runLog});
+
+	t.deepEqual(
+		captureStderr(() => {
+			test_.storeLoggers[0]?.warn('Failed to create TTL index on telemetry');
+		}),
+		['Failed to create TTL index on telemetry\n'],
+	);
+	t.deepEqual(
+		runLog.read(),
+		[],
+		'and nothing appends an entry no view would ever draw',
 	);
 });
 
