@@ -54,10 +54,12 @@ stops when it exits — there is no background process. `SIGINT` and `SIGTERM` b
 final Flush, so quitting does not lose the counters accumulated since the last Flush Interval.
 
 The live view draws what the run has observed since it started — not since the last Flush, which
-would fall back to zero every five minutes — along with when the last Flush was attempted and
-whether it succeeded. A machine whose Input Monitoring grant is missing draws as disabled rather
-than as zeroes, because nothing has arrived yet and nothing is being collected are the same
-numbers and not the same thing.
+would fall back to zero every five minutes. What it has written is not drawn there: the Run Log
+underneath it is the flush record, one line per attempt with the counts it wrote or that it
+failed, and `d` draws those entries whole. A machine whose Input Monitoring grant is missing
+draws as disabled rather than as
+zeroes, because nothing has arrived yet and nothing is being collected are the same numbers and
+not the same thing.
 
 A missing macOS permission degrades collection rather than stopping the CLI: the Collectors it
 affects are disabled and named, and everything else carries on. `permissions` reports the same

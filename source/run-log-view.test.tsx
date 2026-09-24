@@ -96,10 +96,13 @@ test('entries are drawn in the order they happened, newest last', t => {
 });
 
 /*
-The line a failed Flush draws. That it is *red* is Ink's, and no test here
-asserts a colour: `ink-testing-library` renders without a terminal, so a frame
-carries no escape codes to look for. What is asserted is the entry that the
-colour is attached to.
+The line a failed Flush draws — which is the block's to draw, and the live
+view's no longer: it carries the fact, the retry wording and the second it
+happened at, in the viewer's zone rather than the machine's.
+
+That it is *red* is Ink's, and no test here asserts a colour:
+`ink-testing-library` renders without a terminal, so a frame carries no escape
+codes to look for. What is asserted is the entry that the colour is attached to.
 */
 test('a Flush that failed is drawn as one that will come back', t => {
 	const frame = frameOf([failed()]);

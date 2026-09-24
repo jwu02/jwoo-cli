@@ -72,9 +72,6 @@ test('a granted run reads as collecting, with nothing in it yet', t => {
 		movementMeters: 0,
 		pressTotal: 0,
 	});
-	// Distinct from a Flush that failed: nothing has been attempted yet, and a
-	// line saying "failed" before the first attempt would be a false alarm.
-	t.is(reading.lastFlush, undefined);
 });
 
 test('the counters in Telemetry State are what the view reads', t => {
@@ -123,26 +120,11 @@ test('a failed Flush is not added to the running total', t => {
 
 	source.recordFlush(flushed(state, false));
 
-	t.is(collecting(source.read()).totals.leftClicks, 1);
-	t.false(collecting(source.read()).lastFlush?.ok);
-});
-
-test('the last Flush reports when it happened and whether it worked', t => {
-	const {source, state} = granted();
-	state.addLeftClick();
-
-	source.recordFlush(flushed(state));
-
-	const {lastFlush} = collecting(source.read());
-	t.true(lastFlush?.ok);
-	t.deepEqual(lastFlush?.at, new Date('2026-09-22T10:00:00.000Z'));
-
-	state.addLeftClick();
-	source.recordFlush(flushed(state, false));
-
-	// The failure replaces it rather than joining it: "the last Flush" is one
-	// event, and the view has one line to draw it on.
-	t.false(collecting(source.read()).lastFlush?.ok);
+	t.is(
+		collecting(source.read()).totals.leftClicks,
+		1,
+		'the count stands once, not twice',
+	);
 });
 
 /*

@@ -494,8 +494,8 @@ test('a failed Flush is reported as one, counters and all', async t => {
 });
 
 /*
-An idle interval attempts no write at all, and a view that heard about one would
-move its last-Flush line without anything having been sent.
+An idle interval attempts no write at all, and a Run Log that heard about one
+would gain an entry for a write that never happened.
 */
 test('an interval with no Activity reports nothing', async t => {
 	const attempts: FlushAttempt[] = [];

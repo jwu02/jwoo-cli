@@ -32,16 +32,6 @@ import {type FlushAttempt} from './session.js';
 import {type Snapshot, type TelemetryState} from './state.js';
 
 /*
-The last Flush that was *attempted* — not the last interval that passed. An
-interval with no Activity writes nothing, so a line that moved anyway would
-report a write that never happened.
-*/
-export type LastFlush = {
-	readonly at: Date;
-	readonly ok: boolean;
-};
-
-/*
 Two states rather than totals plus an `enabled` flag, for the reason
 `use-history.ts` gives for its three: when there is no grant there are no
 counters worth drawing, and a view that drew zeroes beside a note would be
@@ -51,7 +41,6 @@ export type LiveTelemetry =
 	| {
 			readonly status: 'collecting';
 			readonly totals: Totals;
-			readonly lastFlush: LastFlush | undefined;
 	  }
 	| {readonly status: 'disabled'; readonly message: string};
 
@@ -104,7 +93,6 @@ export class InProcessTelemetrySource implements TelemetrySource {
 	the Flush Interval and call that live.
 	*/
 	#flushed: Totals = ZERO;
-	#lastFlush: LastFlush | undefined;
 
 	constructor({report, state}: InProcessTelemetrySourceOptions) {
 		this.#report = report;
@@ -116,10 +104,11 @@ export class InProcessTelemetrySource implements TelemetrySource {
 	storage, and the distinction decides whether these counters may be added to
 	the running total: a failed Flush leaves Telemetry State whole, so adding
 	them here as well would count the same presses twice.
-	*/
-	recordFlush({at, ok, snapshot}: FlushAttempt): void {
-		this.#lastFlush = {at, ok};
 
+	The attempt's `at` is not read: *when* a Flush happened is the Run Log's to
+	report, and this seam is only asked what the counters now stand at.
+	*/
+	recordFlush({ok, snapshot}: FlushAttempt): void {
 		if (ok) {
 			this.#flushed = plus(this.#flushed, totalsOf(snapshot));
 		}
@@ -144,7 +133,6 @@ export class InProcessTelemetrySource implements TelemetrySource {
 		return {
 			status: 'collecting',
 			totals: plus(this.#flushed, totalsOf(this.#state.snapshot())),
-			lastFlush: this.#lastFlush,
 		};
 	}
 }

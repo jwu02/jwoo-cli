@@ -33,27 +33,13 @@ export function TotalsView({totals}: {totals: Totals}) {
 	);
 }
 
-/*
-Exported for the lines a view sets apart from the block — the live view's Last
-Flush is not one of the Totals and must not read as though it were.
-*/
-export function Row({
-	label,
-	value,
-	color,
-}: {
-	label: string;
-	value: string;
-	color?: string;
-}) {
+function Row({label, value}: {label: string; value: string}) {
 	return (
 		<Box>
 			<Box width={LABEL_WIDTH}>
 				<Text>{label}</Text>
 			</Box>
-			<Text bold color={color}>
-				{value}
-			</Text>
+			<Text bold>{value}</Text>
 		</Box>
 	);
 }

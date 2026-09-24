@@ -288,7 +288,8 @@ them would be a bug rather than a difference of meaning.
 because "nothing yet", "nothing there" and "could not ask" draw completely differently — while
 `history-view.tsx` is presentational and synchronous, tested by rendering a fixed `LoadState`.
 `use-telemetry.ts` and `live-view.tsx` split the same way: the hook polls and holds nothing but
-the timer, and the view takes a reading and a zone. `use-run-log.ts` splits that way against both
+the timer, and the view takes a reading and nothing else — it draws no clock, so it is handed no
+zone. `use-run-log.ts` splits that way against both
 of the modules that draw its entries — `run-log-view.tsx` and `diagnostics-view.tsx` take entries
 and a zone. Each poll is owned by the component that draws it rather than held in `app.tsx`, so a
 tick re-renders that component's own subtree and not the view above it: the Run Log block is on

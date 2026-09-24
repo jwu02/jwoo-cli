@@ -794,8 +794,11 @@ The wiring between the run and the view, which neither module's own test can
 see: the Session reports each Flush attempt and the source is what hears about
 it. Without it the dashboard draws counters that never move.
 
-Read after the run rather than during it, so the final Flush has landed and
-there is nothing to wait for.
+Read after the run rather than during it, so the final Flush has landed — and
+landed means it cleared Telemetry State. The store is the harness's, which
+writes, so whether the Flush reached storage is not in question here; the click
+below is therefore in the reading at all only because the source folded that
+Flush in. That is what makes this one number the whole assertion.
 */
 test('a Flush is counted into the live totals', async t => {
 	const test_ = harness(granted());
@@ -813,17 +816,12 @@ test('a Flush is counted into the live totals', async t => {
 		},
 	);
 
-	const reading = telemetry?.read();
-	t.deepEqual(totalsOf(reading), {
+	t.deepEqual(totalsOf(telemetry?.read()), {
 		leftClicks: 1,
 		rightClicks: 0,
 		movementMeters: 0,
 		pressTotal: 0,
 	});
-	t.true(
-		reading?.status === 'collecting' && reading.lastFlush?.ok === true,
-		'the Flush that cleared Telemetry State was reported',
-	);
 });
 
 function totalsOf(reading: LiveTelemetry | undefined): Totals | undefined {

@@ -35,7 +35,6 @@ function reading(pressTotal: number): LiveTelemetry {
 	return {
 		status: 'collecting',
 		totals: {leftClicks: 0, rightClicks: 0, movementMeters: 0, pressTotal},
-		lastFlush: undefined,
 	};
 }
 

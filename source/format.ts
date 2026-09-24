@@ -30,11 +30,11 @@ export function twoDigits(value: number): string {
 /*
 An instant as a local clock reading, to the second.
 
-One spelling, because the live view's flush line and a Run Log entry are
-answering the same question about the same event — *when* — and a frame that said
-`11:00:00` in one place and `11:00` in the other would look like two different
-times. The zone is a parameter for the reason `local-time.ts` gives: the tests
-assert the same digits everywhere.
+One spelling, because the Run Log block and the diagnostics view draw the same
+entries: two spellings of one moment would be a disagreement between two views
+of one record, and the kind that only turns up in a screenshot. The zone is a
+parameter for the reason `local-time.ts` gives: the tests assert the same digits
+everywhere.
 */
 export function clockTime(at: Date, timeZone: string): string {
 	const {hour, minute, second} = localFields(at, timeZone);

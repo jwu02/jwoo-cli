@@ -1,10 +1,14 @@
 /*
 The live view, drawn.
 
-Presentational only, as `history-view.tsx` is: it takes a reading and a zone and
-returns a frame. No effects, nothing to await and no source — every test of this
-module is a synchronous render of a fixed reading, which is why the polling
-lives in `use-telemetry.ts`.
+Presentational only, as `history-view.tsx` is: it takes a reading and returns a
+frame. No effects, nothing to await and no source — every test of this module is
+a synchronous render of a fixed reading, which is why the polling lives in
+`use-telemetry.ts`.
+
+It draws the three totals and nothing else. What the run has *written* is not
+here: that is the Run Log's, which is on screen beneath this view — so the same
+Flush is reported in one place rather than two.
 
 The vocabulary is CONTEXT.md's. Press Total and Mouse Distance are terms rather
 than descriptions, and "Collector Disabled" is the state this view exists to
@@ -14,18 +18,11 @@ the two must not read alike.
 */
 
 import {Box, Text} from 'ink';
-import {clockTime} from './format.js';
 import {type Totals} from './history.js';
-import {Row, TotalsView} from './totals-view.js';
-import {type LastFlush, type LiveTelemetry} from './telemetry.js';
+import {TotalsView} from './totals-view.js';
+import {type LiveTelemetry} from './telemetry.js';
 
-export function LiveView({
-	telemetry,
-	timeZone,
-}: {
-	telemetry: LiveTelemetry;
-	timeZone: string;
-}) {
+export function LiveView({telemetry}: {telemetry: LiveTelemetry}) {
 	return (
 		<Box flexDirection="column">
 			{/*
@@ -39,11 +36,14 @@ export function LiveView({
 			{telemetry.status === 'disabled' ? (
 				<Disabled message={telemetry.message} />
 			) : (
-				<Collecting
-					totals={telemetry.totals}
-					lastFlush={telemetry.lastFlush}
-					timeZone={timeZone}
-				/>
+				<>
+					<TotalsView totals={telemetry.totals} />
+					{isIdle(telemetry.totals) && (
+						<Box marginTop={1}>
+							<Text dimColor>No activity yet.</Text>
+						</Box>
+					)}
+				</>
 			)}
 		</Box>
 	);
@@ -67,63 +67,16 @@ function Disabled({message}: {message: string}) {
 	);
 }
 
-function Collecting({
-	totals,
-	lastFlush,
-	timeZone,
-}: {
-	totals: Totals;
-	lastFlush: LastFlush | undefined;
-	timeZone: string;
-}) {
-	/*
-	Nothing has been observed at all, as opposed to nothing having been observed
-	lately: the totals are the whole run's, so they only stand at zero if nothing
-	has ever arrived.
-	*/
-	const isIdle =
+/*
+Nothing has been observed at all, as opposed to nothing having been observed
+lately: the totals are the whole run's, so they only stand at zero if nothing
+has ever arrived.
+*/
+function isIdle(totals: Totals): boolean {
+	return (
 		totals.leftClicks === 0 &&
 		totals.rightClicks === 0 &&
 		totals.pressTotal === 0 &&
-		totals.movementMeters === 0;
-
-	return (
-		<>
-			<TotalsView totals={totals} />
-
-			{/* Set apart: the three above are what has been observed, and this is
-			    what has been written, which happens on its own schedule. */}
-			<Box flexDirection="column" marginTop={1}>
-				<Row
-					label="Last Flush"
-					value={flushLabel(lastFlush, timeZone)}
-					color={lastFlush?.ok === false ? 'red' : undefined}
-				/>
-			</Box>
-
-			{isIdle && (
-				<Box marginTop={1}>
-					<Text dimColor>No activity yet.</Text>
-				</Box>
-			)}
-		</>
+		totals.movementMeters === 0
 	);
-}
-
-/*
-Three outcomes rather than two, because they mean different things to whoever is
-reading: nothing has been written yet, the last write landed, or the last write
-did not and the counters are piling up until it does.
-*/
-function flushLabel(
-	lastFlush: LastFlush | undefined,
-	timeZone: string,
-): string {
-	if (lastFlush === undefined) {
-		return 'not yet';
-	}
-
-	const clock = clockTime(lastFlush.at, timeZone);
-
-	return lastFlush.ok ? clock : `${clock} · failed`;
 }

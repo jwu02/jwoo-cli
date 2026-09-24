@@ -75,7 +75,6 @@ class StubTelemetrySource implements TelemetrySource {
 			movementMeters: 12.5,
 			pressTotal: LIVE_PRESS_TOTAL,
 		},
-		lastFlush: undefined,
 	};
 
 	read(): LiveTelemetry {

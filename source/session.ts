@@ -138,7 +138,7 @@ export type SessionOptions = {
 	Called after every Flush attempt, successful or not.
 
 	Not called when there was no Activity: no write was attempted, so there is
-	nothing that happened and nothing for a view to draw. A last-Flush line that
+	nothing that happened and nothing for a view to draw. A Run Log line that
 	moved on every idle interval would claim a write that never took place.
 	*/
 	readonly onFlush?: (attempt: FlushAttempt) => void;

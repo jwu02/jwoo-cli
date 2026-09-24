@@ -99,7 +99,7 @@ export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 	return (
 		<Box flexDirection="column">
 			{view === 'history' && <HistoryView state={state} range={range} />}
-			{view === 'live' && <Live source={telemetry} timeZone={timeZone} />}
+			{view === 'live' && <Live source={telemetry} />}
 			{view === 'diagnostics' && (
 				<Diagnostics source={runLog} timeZone={timeZone} />
 			)}
@@ -127,9 +127,13 @@ is the only way the block ever moves.
 Diagnostics is the same lines over a third reading, and it is a separate
 component from the block rather than a prop on it: only one of the two is ever
 mounted, so the entry list is polled once under whichever view is up.
+
+The live view is the only one handed no zone. It draws no clock of its own —
+everything in it is counted — and the times in the frame belong to the Run Log
+under it.
 */
-function Live({source, timeZone}: {source: TelemetrySource; timeZone: string}) {
-	return <LiveView telemetry={useTelemetry(source)} timeZone={timeZone} />;
+function Live({source}: {source: TelemetrySource}) {
+	return <LiveView telemetry={useTelemetry(source)} />;
 }
 
 function RunLog({source, timeZone}: {source: RunLogSource; timeZone: string}) {

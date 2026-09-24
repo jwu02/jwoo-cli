@@ -2,31 +2,25 @@ import test from 'ava';
 import {render} from 'ink-testing-library';
 import {type Totals} from './history.js';
 import {LiveView} from './live-view.js';
-import {type LastFlush, type LiveTelemetry} from './telemetry.js';
+import {type LiveTelemetry} from './telemetry.js';
 
 /*
 The view is presentational: it takes a reading and draws it. There is no source
 to fake and nothing to await, so every test here is a synchronous render of a
 fixed reading — which is the point of keeping the polling out of this module.
 
-The zone is a parameter rather than the machine's, so a flush time asserts the
-same digits everywhere.
+What the run has written is not tested here, and not drawn here either: a Flush
+is the Run Log's to report, and `run-log-view.test.tsx` is where its line —
+including the red one a failure draws — is asserted.
 */
 
-const TIME_ZONE = 'Europe/London';
-
 function frameOf(telemetry: LiveTelemetry): string {
-	const {lastFrame} = render(
-		<LiveView telemetry={telemetry} timeZone={TIME_ZONE} />,
-	);
+	const {lastFrame} = render(<LiveView telemetry={telemetry} />);
 
 	return lastFrame() ?? '';
 }
 
-function collecting(
-	totals: Partial<Totals> = {},
-	lastFlush?: LastFlush,
-): LiveTelemetry {
+function collecting(totals: Partial<Totals> = {}): LiveTelemetry {
 	return {
 		status: 'collecting',
 		totals: {
@@ -36,7 +30,6 @@ function collecting(
 			pressTotal: 0,
 			...totals,
 		},
-		lastFlush,
 	};
 }
 
@@ -83,38 +76,21 @@ test('the note goes once something has been counted', t => {
 });
 
 /*
-Three answers to one question, and they must not look alike: nothing written
-yet, the last write landed, and the last write did not.
+The row this view used to draw is gone, and all three outcomes it had stay gone
+with it: the label, "not yet" before anything had been written, and the "failed"
+that said the counters were piling up. The Run Log beneath is the flush record,
+so a line here would report one Flush twice on one screen.
+
+An absence is the whole of what there is to assert — the three totals above are
+what the view draws, and the tests above are what hold them — so this is what
+fails if the row comes back.
 */
-test('a Flush that has not happened yet says so', t => {
-	t.regex(frameOf(collecting({leftClicks: 1})), /Last Flush\s+not yet/v);
-});
+test('the view draws no flush line of its own', t => {
+	const frame = frameOf(collecting({leftClicks: 1}));
 
-test('a Flush that landed is drawn as the time it happened', t => {
-	// 10:00 UTC is 11:00 in London in September, so the zone is applied rather
-	// than the machine's being taken.
-	const frame = frameOf(
-		collecting(
-			{leftClicks: 1},
-			{at: new Date('2026-09-22T10:00:00.000Z'), ok: true},
-		),
-	);
-
-	t.regex(frame, /Last Flush\s+11:00:00/v);
+	t.false(frame.includes('Flush'));
+	t.false(frame.includes('not yet'));
 	t.false(frame.includes('failed'));
-});
-
-test('a Flush that failed is drawn as one', t => {
-	const frame = frameOf(
-		collecting(
-			{leftClicks: 1},
-			{at: new Date('2026-09-22T10:00:00.000Z'), ok: false},
-		),
-	);
-
-	// The counters are piling up until it succeeds, so this is not a quiet
-	// detail to leave the user to infer from a stale time.
-	t.regex(frame, /Last Flush\s+11:00:00 · failed/v);
 });
 
 /*
@@ -135,5 +111,4 @@ test('a missing grant is drawn as disabled, not as an idle run', t => {
 	// Zeroes beside the note would be a second, contradictory answer.
 	t.false(frame.includes('No activity yet'));
 	t.false(frame.includes('Press Total'));
-	t.false(frame.includes('Last Flush'));
 });
