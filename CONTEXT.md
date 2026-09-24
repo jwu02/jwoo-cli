@@ -103,11 +103,6 @@ they do not fall back to zero at each Flush.
 _Avoid_: session totals, current counters, live counts, and any reading that could be mistaken
 for a Range — a Range is a calendar interval read from storage, which is the other view
 
-**Last Flush**:
-When the most recent Flush was attempted, and whether it wrote anything. Not the last Flush
-Interval: an interval with no Activity attempts no write, so a line that moved anyway would
-report a write that never happened.
-
 A run with no grant has no Live Totals at all, rather than totals of zero — see Collector
 Disabled. The two are the same numbers and are not the same thing, and telling them apart is
 what this view is for.
@@ -130,6 +125,18 @@ where Key Counts order by label.
 _Avoid_: leaderboard, top keys, keyboard heatmap, and Heatmap itself — the two render the same
 Key Counts and are still different things
 
+## The run log
+
+**Run Log**:
+The dashboard's record of what the current run did and hit: each Flush attempt with the counts
+it wrote, or that it failed; the problems the helper and the reads reported; and collection
+that started disabled by a missing permission. It holds only this run — it exists while the CLI
+runs and is gone when it exits. A Flush is attempted only when there is Activity, so the log
+lists attempts, not intervals. The full text of an entry is one keypress away.
+_Avoid_: activity log (Activity is countable input), event log (events are the helper's wire
+format), flush history (history is the storage read — the other view), session log, log file
+(nothing here is written to disk)
+
 ## Deliberately absent
 
 These are not gaps. They are out of scope, and the vocabulary should not drift back toward them.
@@ -139,3 +146,5 @@ These are not gaps. They are out of scope, and the vocabulary should not drift b
 - **Windows.** macOS only. Key Labels are UK Mac labels and would be wrong on a Windows keyboard.
 - **Daemon.** There is no background process and no service. Collection happens only while the
   CLI is running. Do not name anything `Daemon`, `Service`, or `Agent`.
+- **A log file.** The Run Log lives in memory for the current run only. Diagnosing a run that
+  is already over is what the exit code and the database are for.
