@@ -804,7 +804,11 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 	const closed: number[] = [];
 	const source = stubHistory(closed);
 	const rendered: DashboardView[] = [];
+	let atRender: Date | undefined;
 	test_.options.state?.addLeftClick();
+	// Before the run is asked for, so the start it reports can be shown to be
+	// this run's rather than an import-time value or the drawing's own.
+	const before = new Date();
 
 	await run(
 		{kind: 'dashboard'},
@@ -812,6 +816,7 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 			...test_.options,
 			createHistorySource: () => source,
 			async renderApp(view) {
+				atRender = new Date();
 				rendered.push(view);
 			},
 		},
@@ -823,6 +828,20 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 		'the caller supplies the source, not Mongo',
 	);
 	t.is(rendered[0]?.timeZone, 'Europe/London', 'the zone comes from Config');
+
+	/*
+	The start the live view reports: this run's own, read where the run begins
+	rather than stamped at module load — it falls inside the window this test was
+	running for, and before the frame that draws it.
+	*/
+	const startedAt = rendered[0]?.startedAt;
+	t.true(
+		startedAt !== undefined &&
+			atRender !== undefined &&
+			before <= startedAt &&
+			startedAt <= atRender,
+		'the start is this run’s, and it precedes the frame',
+	);
 	t.deepEqual(closed, [1], 'closed even though rendering returned');
 
 	/*

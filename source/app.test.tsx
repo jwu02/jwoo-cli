@@ -125,6 +125,13 @@ function failed(at = new Date('2026-09-22T10:05:00.000Z')): RunLogEntry {
 	};
 }
 
+/*
+The run's start, as the composition root hands it down: 09:03:22Z, which is
+10:03:22 in the zone below — so a heading drawn from the instant's own UTC
+reading, or without the zone at all, cannot pass.
+*/
+const STARTED_AT = new Date('2026-09-22T09:03:22.000Z');
+
 function dashboard(
 	history: HistorySource,
 	runLog: RunLogSource = new StubRunLogSource(),
@@ -135,6 +142,7 @@ function dashboard(
 			history={history}
 			telemetry={telemetry}
 			runLog={runLog}
+			startedAt={STARTED_AT}
 			timeZone="Europe/London"
 		/>
 	);
@@ -214,7 +222,13 @@ test.serial('l switches to the live view', async t => {
 	await settle();
 
 	const frame = lastFrame() ?? '';
-	t.regex(frame, /since the CLI started/v);
+	/*
+	The start the composition root passed down, drawn in the zone it passed down
+	with it. Both are `App`'s to hand to the view, and the live view is the only
+	one that draws either — so this is where a live view left without a zone
+	would show up.
+	*/
+	t.regex(frame, /since the CLI started at 10:03:22/v);
 	t.regex(
 		frame,
 		new RegExp(String.raw`Press Total\s+${LIVE_PRESS_TOTAL}`, 'v'),

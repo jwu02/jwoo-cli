@@ -5,17 +5,32 @@ import {LiveView} from './live-view.js';
 import {type LiveTelemetry} from './telemetry.js';
 
 /*
-The view is presentational: it takes a reading and draws it. There is no source
-to fake and nothing to await, so every test here is a synchronous render of a
-fixed reading — which is the point of keeping the polling out of this module.
+The view is presentational: it takes a reading, the run's start and a zone, and
+draws them. There is no source to fake and nothing to await, so every test here
+is a synchronous render of fixed values — which is the point of keeping the
+polling out of this module.
 
 What the run has written is not tested here, and not drawn here either: a Flush
 is the Run Log's to report, and `run-log-view.test.tsx` is where its line —
 including the red one a failure draws — is asserted.
 */
 
+const STARTED_AT = new Date('2026-09-22T09:03:22.000Z');
+
+/*
+East of UTC, so a heading drawn from the instant rather than from the zone's own
+reading of it cannot pass: 09:03:22Z is 10:03:22 in London in September.
+*/
+const TIME_ZONE = 'Europe/London';
+
 function frameOf(telemetry: LiveTelemetry): string {
-	const {lastFrame} = render(<LiveView telemetry={telemetry} />);
+	const {lastFrame} = render(
+		<LiveView
+			telemetry={telemetry}
+			startedAt={STARTED_AT}
+			timeZone={TIME_ZONE}
+		/>,
+	);
 
 	return lastFrame() ?? '';
 }
@@ -30,6 +45,13 @@ function collecting(totals: Partial<Totals> = {}): LiveTelemetry {
 			pressTotal: 0,
 			...totals,
 		},
+	};
+}
+
+function disabled(): LiveTelemetry {
+	return {
+		status: 'disabled',
+		message: 'Input Monitoring is denied for this helper.',
 	};
 }
 
@@ -53,10 +75,24 @@ test('the totals are drawn in the glossary’s words', t => {
 /*
 The totals are the whole run's, not the last interval's, and the heading is the
 only place that says so. Without it the numbers would read as the history view's
-with a shorter range.
+with a shorter range; without the instant beside it, how far back they reach is
+left to be worked out from the wall clock, and a total read at nine in the
+morning is drawn exactly as one read at three in the afternoon.
+
+The zone is the run's rather than the instant's own UTC reading, and 10:03:22 is
+that zone's reading of the instant above — so a heading drawn from the instant
+directly, or from the machine's own zone, fails here.
 */
-test('the heading says what the numbers are counted from', t => {
-	t.regex(frameOf(collecting()), /since the CLI started/v);
+test('the heading says what the numbers are counted from, and when', t => {
+	t.regex(frameOf(collecting()), /since the CLI started at 10:03:22/v);
+});
+
+/*
+A disabled run has no totals to date, and its heading is still the run's: the
+note replaces the numbers, not the sentence that says what the view is showing.
+*/
+test('a disabled run is headed with its start as well', t => {
+	t.regex(frameOf(disabled()), /since the CLI started at 10:03:22/v);
 });
 
 test('a run that has seen nothing says so', t => {
@@ -100,10 +136,7 @@ touched — and the user who has just granted the permission is exactly the pers
 who cannot tell them apart.
 */
 test('a missing grant is drawn as disabled, not as an idle run', t => {
-	const frame = frameOf({
-		status: 'disabled',
-		message: 'Input Monitoring is denied for this helper.',
-	});
+	const frame = frameOf(disabled());
 
 	t.regex(frame, /Collection is disabled/v);
 	t.regex(frame, /Input Monitoring is denied/v);

@@ -281,6 +281,12 @@ export type DashboardView = {
 	readonly telemetry: TelemetrySource;
 	readonly runLog: RunLogSource;
 	readonly timeZone: string;
+	/*
+	When the run began, read here rather than in the view. The live view's totals
+	are counted from this instant, so it belongs to the run and not to the frame
+	that draws it — the same reason a Run Log entry's `at` is stamped out here.
+	*/
+	readonly startedAt: Date;
 	readonly ended: Promise<void>;
 };
 
@@ -684,6 +690,15 @@ async function runDashboard(options: RunOptions): Promise<void> {
 	}
 
 	/*
+	When the run began: the instant before the Session starts the Collectors,
+	which is the moment the live view's totals count from. Taken here, next to
+	the call that begins the run, so it is that instant rather than whenever a
+	frame happened to be drawn — a dashboard that opens slowly still says when
+	the run it is drawing began.
+	*/
+	const startedAt = new Date();
+
+	/*
 	Started before the view is mounted, so the counters are already moving by the
 	time the first frame is drawn.
 	*/
@@ -703,6 +718,7 @@ async function runDashboard(options: RunOptions): Promise<void> {
 			telemetry,
 			runLog,
 			timeZone: config.timeZone,
+			startedAt,
 			ended,
 		});
 	} finally {

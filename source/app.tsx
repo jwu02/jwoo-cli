@@ -50,10 +50,22 @@ export type AppProps = {
 	readonly history: HistorySource;
 	readonly telemetry: TelemetrySource;
 	readonly runLog: RunLogSource;
+	/*
+	When the run began. The live view is what draws it, because its totals are
+	counted from that instant and nothing else in the frame says when the run it
+	is showing started.
+	*/
+	readonly startedAt: Date;
 	readonly timeZone: string;
 };
 
-export default function App({history, telemetry, runLog, timeZone}: AppProps) {
+export default function App({
+	history,
+	telemetry,
+	runLog,
+	startedAt,
+	timeZone,
+}: AppProps) {
 	const [range, setRange] = useState<Range>('today');
 	const [view, setView] = useState<View>('history');
 	const {exit} = useApp();
@@ -112,7 +124,9 @@ export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 		*/
 		<Box flexDirection="column" minHeight={height}>
 			{view === 'history' && <HistoryView state={state} range={range} />}
-			{view === 'live' && <Live source={telemetry} />}
+			{view === 'live' && (
+				<Live source={telemetry} startedAt={startedAt} timeZone={timeZone} />
+			)}
 			{view === 'diagnostics' && (
 				<Diagnostics source={runLog} timeZone={timeZone} />
 			)}
@@ -142,12 +156,27 @@ Diagnostics is the same lines over a third reading, and it is a separate
 component from the block rather than a prop on it: only one of the two is ever
 mounted, so the entry list is polled once under whichever view is up.
 
-The live view is the only one handed no zone. It draws no clock of its own —
-everything in it is counted — and the times in the frame belong to the Run Log
-under it.
+The live view is handed the zone for one clock and no more: the instant the run
+began, which is what its totals are counted from. Everything else in it is
+counted rather than timed, and the Run Log under it is where the run's other
+times are.
 */
-function Live({source}: {source: TelemetrySource}) {
-	return <LiveView telemetry={useTelemetry(source)} />;
+function Live({
+	source,
+	startedAt,
+	timeZone,
+}: {
+	source: TelemetrySource;
+	startedAt: Date;
+	timeZone: string;
+}) {
+	return (
+		<LiveView
+			telemetry={useTelemetry(source)}
+			startedAt={startedAt}
+			timeZone={timeZone}
+		/>
+	);
 }
 
 function RunLog({source, timeZone}: {source: RunLogSource; timeZone: string}) {

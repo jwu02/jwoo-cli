@@ -16,6 +16,7 @@ export async function renderApp({
 	history,
 	telemetry,
 	runLog,
+	startedAt,
 	timeZone,
 	ended,
 }: DashboardView): Promise<void> {
@@ -24,6 +25,7 @@ export async function renderApp({
 			history={history}
 			telemetry={telemetry}
 			runLog={runLog}
+			startedAt={startedAt}
 			timeZone={timeZone}
 		/>,
 		/*

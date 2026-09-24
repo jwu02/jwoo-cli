@@ -1,14 +1,14 @@
 /*
 The live view, drawn.
 
-Presentational only, as `history-view.tsx` is: it takes a reading and returns a
-frame. No effects, nothing to await and no source — every test of this module is
-a synchronous render of a fixed reading, which is why the polling lives in
-`use-telemetry.ts`.
+Presentational only, as `history-view.tsx` is: it takes a reading, the instant
+the run began and a zone, and returns a frame. No effects, nothing to await and
+no source — every test of this module is a synchronous render of a fixed
+reading, which is why the polling lives in `use-telemetry.ts`.
 
-It draws the three totals and nothing else. What the run has *written* is not
-here: that is the Run Log's, which is on screen beneath this view — so the same
-Flush is reported in one place rather than two.
+It draws the three totals, and the heading's clock, and nothing else. What the
+run has *written* is not here: that is the Run Log's, which is on screen beneath
+this view — so the same Flush is reported in one place rather than two.
 
 The vocabulary is CONTEXT.md's. Press Total and Mouse Distance are terms rather
 than descriptions, and "Collector Disabled" is the state this view exists to
@@ -18,11 +18,20 @@ the two must not read alike.
 */
 
 import {Box, Text} from 'ink';
+import {clockTime} from './format.js';
 import {type Totals} from './history.js';
 import {TotalsView} from './totals-view.js';
 import {type LiveTelemetry} from './telemetry.js';
 
-export function LiveView({telemetry}: {telemetry: LiveTelemetry}) {
+export function LiveView({
+	telemetry,
+	startedAt,
+	timeZone,
+}: {
+	telemetry: LiveTelemetry;
+	startedAt: Date;
+	timeZone: string;
+}) {
 	return (
 		<Box flexDirection="column">
 			{/*
@@ -30,8 +39,16 @@ export function LiveView({telemetry}: {telemetry: LiveTelemetry}) {
 			view's numbers for a smaller interval. They include everything this
 			run has already Flushed, which is why they do not fall back to zero
 			at the Flush Interval.
+
+			The instant drawn beside it is the run's own start rather than a clock
+			read as the frame is drawn, and it is read in the run's zone as every
+			other clock in the frame is. Without it, how far back the totals reach
+			is left to be worked out from the wall clock, and a total read at nine
+			in the morning is drawn exactly as one read at three in the afternoon.
 			*/}
-			<Text bold>Live · since the CLI started</Text>
+			<Text bold>
+				{`Live · since the CLI started at ${clockTime(startedAt, timeZone)}`}
+			</Text>
 
 			{telemetry.status === 'disabled' ? (
 				<Disabled message={telemetry.message} />

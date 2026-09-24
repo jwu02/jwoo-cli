@@ -119,6 +119,11 @@ they do not fall back to zero at each Flush.
 _Avoid_: session totals, current counters, live counts, and any reading that could be mistaken
 for a Range — a Range is a calendar interval read from storage, which is the other view
 
+The heading draws the start those totals are counted from: the local clock reading at which the
+CLI's run began, in the same zone as every other clock in the frame, so how far back the totals
+reach is stated rather than worked out from the wall clock. It is the run's own start rather than
+the moment a frame happens to be drawn.
+
 A run with no grant has no Live Totals at all, rather than totals of zero — see Collector
 Disabled. The two are the same numbers and are not the same thing, and telling them apart is
 what this view is for.
