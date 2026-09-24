@@ -108,6 +108,24 @@ function written(at = new Date('2026-09-22T10:00:00.000Z')): RunLogEntry {
 	};
 }
 
+/*
+A Flush that did not land, whose two texts differ — which is the case the
+diagnostics view exists for: the block draws the first and only this view has
+the room for the second.
+*/
+const RETRY_DETAIL =
+	'The counters are still in Telemetry State; the next Flush Interval writes them again.';
+
+function failed(at = new Date('2026-09-22T10:05:00.000Z')): RunLogEntry {
+	return {
+		at,
+		class: 'Flush',
+		failed: true,
+		summary: 'failed — will retry',
+		detail: RETRY_DETAIL,
+	};
+}
+
 function dashboard(
 	history: HistorySource,
 	runLog: RunLogSource = new StubRunLogSource(),
@@ -134,9 +152,10 @@ async function settle(): Promise<void> {
 
 /*
 Unmounted rather than left to the end of the run, in every case here: the Run
-Log block is under both views and polls on both, so any root left mounted when a
+Log block is under the history and live views and polls on both, and the
+diagnostics view polls over the same entries, so any root left mounted when a
 test finishes leaves a timer behind that ava waits on. It is not only the tests
-that switch to the live view.
+that switch views.
 */
 function mount(
 	t: ExecutionContext,
@@ -294,21 +313,142 @@ test.serial(
 	async t => {
 		const source = new StubHistorySource();
 		const runLog = new StubRunLogSource();
-		runLog.entries = [
-			{
-				at: new Date('2026-09-22T10:05:00.000Z'),
-				class: 'Flush',
-				failed: true,
-				summary: 'failed — will retry',
-				detail: 'The counters are still in Telemetry State.',
-			},
-		];
+		runLog.entries = [failed()];
 		const {lastFrame} = mount(t, source, runLog);
 		await settle();
 
 		t.regex(lastFrame() ?? '', /11:05:00\s+Flush\s+failed — will retry/v);
 	},
 );
+
+/*
+The diagnostics view is the same entries the block draws, with the full text —
+so the frame it replaces the block with is one record drawn once, not that
+record drawn twice. What is asserted below is what the block could not show.
+*/
+test.serial('d opens the diagnostics view from the landing view', async t => {
+	const source = new StubHistorySource();
+	const runLog = new StubRunLogSource();
+	runLog.entries = [written(), failed()];
+	const {stdin, lastFrame} = mount(t, source, runLog);
+	await settle();
+
+	// The block's own line, which is all it has room for.
+	t.regex(lastFrame() ?? '', /failed — will retry/v);
+
+	stdin.write('d');
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.regex(frame, /Diagnostics/v);
+	t.regex(frame, /11:05:00\s+Flush/v);
+	t.true(frame.includes(RETRY_DETAIL), 'the full text the block cuts');
+	t.regex(
+		frame,
+		new RegExp(String.raw`Press Total\s+${RUN_LOG_PRESS_TOTAL}`, 'v'),
+	);
+});
+
+/*
+`d` is absolute, like the range keys: it opens the same view from wherever the
+dashboard happens to be, and the numbers of the view it replaced are gone
+rather than left above it.
+*/
+test.serial('d opens the diagnostics view from the live view', async t => {
+	const source = new StubHistorySource();
+	const {stdin, lastFrame} = mount(t, source);
+	await settle();
+
+	stdin.write('l');
+	await settle();
+	stdin.write('d');
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.regex(frame, /Diagnostics/v);
+	t.regex(
+		frame,
+		new RegExp(String.raw`Press Total\s+${RUN_LOG_PRESS_TOTAL}`, 'v'),
+		'with the entries the block was drawing',
+	);
+	t.false(frame.includes('since the CLI started'));
+	// Nothing was re-read: the range did not change, only the view.
+	t.deepEqual(source.requests, ['today']);
+});
+
+/*
+One record, drawn once: the same entry is not left truncated under the pane
+that just showed it in full.
+*/
+test.serial('the block is not drawn under the diagnostics view', async t => {
+	const source = new StubHistorySource();
+	const runLog = new StubRunLogSource();
+	runLog.entries = [failed()];
+	const {stdin, lastFrame} = mount(t, source, runLog);
+	await settle();
+
+	stdin.write('d');
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.is(frame.split('failed — will retry').length - 1, 1);
+	t.is(frame.split(RETRY_DETAIL).length - 1, 1);
+});
+
+test.serial('a range key is the way out of the diagnostics view', async t => {
+	const source = new StubHistorySource();
+	const {stdin, lastFrame} = mount(t, source);
+	await settle();
+
+	stdin.write('d');
+	await settle();
+
+	// Asserted, so the exit below is a way out of somewhere rather than a key
+	// that happened to do nothing.
+	t.regex(lastFrame() ?? '', /Diagnostics/v);
+
+	stdin.write('w');
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.regex(frame, /Press Total\s+2,222/v);
+	t.false(frame.includes('Diagnostics'));
+	t.deepEqual(source.requests, ['today', 'week']);
+});
+
+test.serial(
+	'the live key is the way out of the diagnostics view too',
+	async t => {
+		const source = new StubHistorySource();
+		const {stdin, lastFrame} = mount(t, source);
+		await settle();
+
+		stdin.write('d');
+		await settle();
+
+		// Asserted, so the exit below is a way out of somewhere.
+		t.regex(lastFrame() ?? '', /Diagnostics/v);
+
+		stdin.write('l');
+		await settle();
+
+		const frame = lastFrame() ?? '';
+		t.regex(frame, /since the CLI started/v);
+		t.false(frame.includes('Diagnostics'));
+	},
+);
+
+/*
+The footer is the only place the keys are named, so a view nothing points at is
+a view nobody finds.
+*/
+test.serial('the footer names the diagnostics key', async t => {
+	const source = new StubHistorySource();
+	const {lastFrame} = mount(t, source);
+	await settle();
+
+	t.regex(lastFrame() ?? '', /d diagnostics/v);
+});
 
 /*
 `q` is not asserted here. It delegates straight to Ink's `exit()`, and
