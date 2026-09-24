@@ -73,9 +73,12 @@ and reports a failure's message rather than its stack.
 
 `main.tsx` supplies the Collectors too, and the default factory is its own rather than the
 entry point's, along with the things that factory reaches for — the helper stream it builds, the
-grant it asks for, and where the helper's failure line is reported (ADR-0008). A test can
+grant it asks for, and where the helper's problems are reported (ADR-0008). A test can
 therefore drive the real factory through `collect` with a stream of its own, which is how
-delivery is executed rather than described.
+delivery is executed rather than described. The stream is built _with_ that reporter rather than
+having one attached afterwards: a stream's own problems — a line of stdout that would not parse,
+an exit — are settled when it is constructed, so `createStream` takes the reporter and the
+caller that builds a stream owns where its problems go.
 
 **Delivery is a loop, and every Collector is total** (ADR-0008). Each event is handed to every
 Collector, and each ignores by name what it does not own — the shape `mouse.ts` always had, and
@@ -182,6 +185,19 @@ an entry before passing the attempt on, so the log lists Flush _attempts_ rather
 and `collect` records into a log nothing reads back, because the terminal and the exit code are
 what a headless run reports through. A Flush entry is spelled by the same formatters the totals
 are, so a number that appears twice in one frame reads the same way twice.
+
+**The mode decides where a problem goes.** The dashboard hands the factory a reporter that appends
+an entry per helper problem — its error line, a line of stdout that would not parse, its exit —
+with `helper.ts`'s own sentence as the entry's text, so a problem is not printed into the middle
+of the frame; `collect` leaves the reporter out and keeps the `[eventtap]` warnings on stderr it
+has always had. A caller that supplied a reporter of its own keeps it, in either mode, so the
+mode is what decides the default rather than the rule. Both commands append one entry when the run
+starts with no grant, naming the Collectors it took out, which is what puts a missing grant on
+the landing view without the live-view key being pressed — the live view's own report is
+untouched. `problemMessage` in `helper.ts` is the one spelling of a problem, shared by the stderr
+reporter and the entry, and the entry constructors (`flushEntry`, `helperEntry`,
+`collectionEntry`) live beside the buffer because the two texts are one decision: the line the
+block draws and the full text the diagnostics view draws.
 
 The block is drawn under both views rather than inside one, because the dashboard lands on the
 history view and that view knows nothing about this run — a session whose every Flush failed

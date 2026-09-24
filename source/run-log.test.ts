@@ -1,6 +1,9 @@
 import test from 'ava';
+import {type DisabledCollector, type DisabledReport} from './permissions.js';
 import {
+	collectionEntry,
 	flushEntry,
+	helperEntry,
 	InProcessRunLogSource,
 	type RunLogEntry,
 } from './run-log.js';
@@ -22,6 +25,12 @@ function entry(second: number): RunLogEntry {
 
 	return {at: new Date(at), class: 'Flush', summary: at, detail: at};
 }
+
+/*
+The instant the entries below are stamped with, so `at` is asserted rather than
+assumed.
+*/
+const AT = new Date('2026-09-22T10:00:00.000Z');
 
 function attempt(
 	counts: Partial<Snapshot> = {},
@@ -137,5 +146,117 @@ test('a Flush that failed is an entry that says it will retry', t => {
 	t.is(
 		failed.detail,
 		'The counters are still in Telemetry State; the next Flush Interval writes them again.',
+	);
+});
+
+/*
+A helper problem, as the block draws it. The message is `helper.ts`'s own
+sentence — the one the stderr reporter writes with a `[eventtap]` prefix on it —
+because a terminal and a Run Log line that said different things about the same
+event would be two descriptions of it.
+*/
+test('a helper problem is an entry carrying the helper’s own sentence', t => {
+	const failure = helperEntry({kind: 'exited', code: 1, signal: undefined}, AT);
+
+	t.deepEqual(failure.at, AT);
+	t.is(failure.class, 'Helper');
+	t.true(failure.failed === true, 'which is what draws it red');
+	t.is(
+		failure.summary,
+		'the capture helper exited (code 1); input is no longer being collected.',
+	);
+	t.is(failure.detail, failure.summary);
+});
+
+/*
+The block draws a summary on one row, under a fixed clock and class, so a
+message that arrived with a line break in it would reshape the frame. Nothing is
+lost by folding it: the whole message is what the diagnostics view draws.
+
+A helper's own message is the one part of a problem this side does not compose,
+so it is the one that can arrive with anything in it.
+*/
+test('a message with a line break in it still draws as one line', t => {
+	const failure = helperEntry(
+		{
+			kind: 'error-line',
+			error: {type: 'error', code: 'tapDisabled', message: 'no tap\nretrying'},
+		},
+		AT,
+	);
+
+	t.is(failure.summary, 'no tap retrying');
+	t.is(failure.detail, 'no tap\nretrying');
+});
+
+function denied(
+	disabled: DisabledReport['disabled'],
+	access: DisabledReport['access'] = 'denied',
+): DisabledReport {
+	return {
+		status: 'disabled',
+		access,
+		disabled,
+		message: `Input Monitoring is ${access} for this helper.`,
+	};
+}
+
+const MOUSE: DisabledCollector = {
+	collector: 'mouse',
+	note: 'Mouse collection is disabled: Input Monitoring is denied. Grant it in System Settings > Privacy & Security > Input Monitoring.',
+};
+
+const NOTES: DisabledReport['disabled'] = [
+	MOUSE,
+	{
+		collector: 'keyboard',
+		note: 'Keyboard collection is disabled: Input Monitoring is denied. Grant it in System Settings > Privacy & Security > Input Monitoring.',
+	},
+];
+
+/*
+A run that started with no grant, as the landing view draws it: the block is the
+only thing on screen that knows, the history view above it being about the
+database rather than about this run.
+*/
+test('a missing grant is one entry naming the Collectors it took out', t => {
+	const disabled = collectionEntry(denied(NOTES), AT);
+
+	t.deepEqual(disabled.at, AT);
+	t.is(disabled.class, 'Collection');
+	t.is(
+		disabled.summary,
+		'Mouse and Keyboard collection is disabled: Input Monitoring is denied.',
+	);
+	t.is(
+		disabled.detail,
+		NOTES.map(({note}) => note).join('\n'),
+		'which is where the grant is named and where to change it',
+	);
+});
+
+/*
+Not a failure, and so not drawn red: CONTEXT.md's avoid-list for Collector
+Disabled names "failed" and "errored" as the words this state is not. The CLI is
+running with fewer Collectors, which is what "degrades rather than stops" means.
+*/
+test('collection that started disabled is not drawn as a failure', t => {
+	t.is(collectionEntry(denied(NOTES), AT).failed, undefined);
+});
+
+/*
+One grant, so a report naming one Collector is a report this shape can carry —
+the factory is typed against it even though the helper cannot currently produce
+it. The sentence has to read as one either way.
+*/
+test('the entry names only the Collectors the report disabled', t => {
+	t.is(
+		collectionEntry(denied([MOUSE]), AT).summary,
+		'Mouse collection is disabled: Input Monitoring is denied.',
+	);
+	t.is(
+		collectionEntry(denied(NOTES, 'unknown'), AT).summary,
+		'Mouse and Keyboard collection is disabled: Input Monitoring is unknown.',
+		'and an unknown grant reads as the helper reported it',
 	);
 });

@@ -4,9 +4,10 @@ The dashboard's record of the run that is happening now.
 A fourth seam, and shaped like the third. `history.ts` reads what has already
 been written, `telemetry.ts` reads what has been counted, and this reads what
 the run has *done*: each Flush attempt with the counts it wrote, or that it
-failed. All three are separate sources rather than modes of one, because they
-are answers to different questions — and none of them is a database read the
-caller has to wait on.
+failed; the problems the helper and the stream reading it reported; and
+collection that started with no grant. All three are separate sources rather
+than modes of one, because they are answers to different questions — and none
+of them is a database read the caller has to wait on.
 
 The read is synchronous here for the same reason it is in `telemetry.ts`: the
 buffer is a field access away and there is nothing to await. That is a fact about
@@ -16,21 +17,30 @@ something to wait on changes here and in `use-run-log.ts`, and the view that ask
 for entries never finds out.
 
 Entries are appended by the composition root, which is also the only place that
-knows a Flush happened at all — a Flush attempt is the one entry kind there is so
-far. What a *view* gets is the `RunLogSource` face of this, which can read and
+knows a Flush happened, or that the helper died, or that the grant was missing.
+What a *view* gets is the `RunLogSource` face of this, which can read and
 nothing else.
+
+The constructors below are the other half of that: what each kind of thing is
+spelled as once it is an entry. They live beside the buffer rather than at the
+call site because the two texts are one decision — the line the block draws and
+the text the diagnostics view draws — and a caller left to compose them would
+eventually compose a second version.
 
 There is no file behind any of it. The Run Log holds the current run and is gone
 when the CLI exits (CONTEXT.md, Deliberately absent).
 */
 
 import {COUNT_FORMAT, METRES_FORMAT} from './format.js';
+import {problemMessage, type StreamProblem} from './helper.js';
+import {type DisabledCollector, type DisabledReport} from './permissions.js';
 import {type FlushAttempt} from './session.js';
 
 /*
-The four kinds of thing a run can report. Only Flush entries exist so far; the
-rest are the classes the shape was decided with, and the block draws the class
-of an entry beside its text.
+The four kinds of thing a run can report. A Flush and a problem are the two a
+run produces today; `History` is the read seam's, and arrives with the logger
+that routes its warnings here. The block draws the class of an entry beside its
+text, which is what tells a `Helper` line from a `Collection` one at a glance.
 */
 export type RunLogClass = 'Flush' | 'Helper' | 'History' | 'Collection';
 
@@ -116,4 +126,76 @@ export function flushEntry({at, ok, snapshot}: FlushAttempt): RunLogEntry {
 				detail:
 					'The counters are still in Telemetry State; the next Flush Interval writes them again.',
 			};
+}
+
+/*
+A problem the helper, or the stream reading it, reported.
+
+The message is `helper.ts`'s own sentence for the problem — the one the stderr
+reporter writes — because there is one spelling of "the capture helper exited"
+and the terminal and the block both use it. It is the entry's full text, and its
+summary is the same sentence drawn as a single line.
+
+Failed, and so drawn red: an unreadable line, a helper that has gone, and the
+helper's own error line are all statements that collection is not working.
+*/
+export function helperEntry(problem: StreamProblem, at: Date): RunLogEntry {
+	const message = problemMessage(problem);
+
+	return {
+		at,
+		class: 'Helper',
+		failed: true,
+		summary: oneLine(message),
+		detail: message,
+	};
+}
+
+/*
+The Collectors as they are named in a sentence. The preflight reports them
+lowercase — `mouse`, `keyboard` are the names its notes are built from — and
+these are those names as the start of a line.
+*/
+const COLLECTOR_NAMES: Record<DisabledCollector['collector'], string> = {
+	mouse: 'Mouse',
+	keyboard: 'Keyboard',
+};
+
+/*
+A run that started with no grant, as the log records it.
+
+One entry rather than one per Collector: the grant is one grant, and a missing
+one is one thing that happened. It names the Collectors it took out — which is
+what the live view's full report has no room to say — and the detail is the
+preflight's own notes, which say where to change the setting.
+
+Not failed, deliberately: CONTEXT.md's avoid-list for Collector Disabled names
+"failed" and "errored" as the words for this state. The CLI is running, with
+fewer Collectors, and the live view draws it as a note rather than as a fault.
+*/
+export function collectionEntry(report: DisabledReport, at: Date): RunLogEntry {
+	const names = report.disabled
+		.map(({collector}) => COLLECTOR_NAMES[collector])
+		.join(' and ');
+
+	return {
+		at,
+		class: 'Collection',
+		summary: oneLine(
+			`${names} collection is disabled: Input Monitoring is ${report.access}.`,
+		),
+		detail: report.disabled.map(({note}) => note).join('\n'),
+	};
+}
+
+/*
+A message as one line.
+
+The block draws a summary on a single row under a fixed clock and class, so a
+newline that came through the wire would break the frame's shape. Nothing is
+dropped: the message is whole in `detail`, which is what the diagnostics view
+draws, and the summary is the same words with the breaks taken out.
+*/
+function oneLine(message: string): string {
+	return message.replaceAll(/\s+/gv, ' ').trim();
 }

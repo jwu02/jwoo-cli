@@ -33,14 +33,20 @@ export type DisabledCollector = {
 	readonly note: string;
 };
 
-export type PermissionReport =
-	| {readonly status: 'granted'}
-	| {
-			readonly status: 'disabled';
-			readonly access: 'denied' | 'unknown';
-			readonly disabled: readonly DisabledCollector[];
-			readonly message: string;
-	  };
+/*
+The answer with a missing grant in it, named so that what draws this state asks
+for it: the Run Log's collection entry takes a `DisabledReport` and so cannot be
+handed a report that says the grant was fine. `telemetry.ts` keeps narrowing the
+union for the live view, which draws the message and not the list.
+*/
+export type DisabledReport = {
+	readonly status: 'disabled';
+	readonly access: 'denied' | 'unknown';
+	readonly disabled: readonly DisabledCollector[];
+	readonly message: string;
+};
+
+export type PermissionReport = DisabledReport | {readonly status: 'granted'};
 
 export type PermissionSource = {
 	preflight(): Promise<PermissionReport>;

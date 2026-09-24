@@ -116,6 +116,51 @@ function noop(): void {
 }
 
 /*
+The grant request, stubbed rather than left to the default. A granted run never
+makes it, and the default spawns the real helper and asks macOS for a prompt
+nobody is there to answer — which would hang the suite rather than fail it.
+*/
+function noGrantRequest(): void {
+	throw new Error('a granted run must not ask for the grant');
+}
+
+/*
+The terminal's stderr, held for the length of one synchronous call.
+
+What these tests pin is what does or does not reach the terminal, and the
+reporter that decides it writes to `process.stderr` and nowhere else — there is
+nothing in the run to stand in for. The window is the call rather than the test,
+because ava runs the tests in this file concurrently and a whole-run window
+would swallow another test's output along with it.
+*/
+function captureStderr(call: () => void): string[] {
+	const written: string[] = [];
+	const original = process.stderr.write;
+	process.stderr.write = (chunk: string) => {
+		written.push(chunk);
+		return true;
+	};
+
+	try {
+		call();
+	} finally {
+		process.stderr.write = original;
+	}
+
+	return written;
+}
+
+/*
+The helper's own failure line, as `--self-check` prints one and as the stream
+delivers it: an event like any other, owned by no Collector.
+*/
+const FAILURE: HelperError = {
+	type: 'error',
+	code: 'tapDisabled',
+	message: 'the event tap was disabled',
+};
+
+/*
 A grant, as `permissions.ts` would report it. Built here rather than through
 `permissionReport` so a test can grant one Collector and not the other — which
 the helper cannot currently produce, but the factory is typed against.
@@ -508,15 +553,7 @@ async function deliver(events: readonly RawEvent[]): Promise<Delivery> {
 			onProblem(problem) {
 				problems.push(problem);
 			},
-			/*
-			Unreachable, because the report is granted — but stubbed rather than
-			left to the default, which spawns the real helper and asks macOS for
-			a grant. A prompt nobody is there to answer would hang the suite
-			rather than fail it.
-			*/
-			requestInputMonitoring() {
-				throw new Error('a granted run must not ask for the grant');
-			},
+			requestInputMonitoring: noGrantRequest,
 		},
 	);
 
@@ -596,15 +633,9 @@ test('a preflight line is delivered and lands nowhere', async t => {
 });
 
 test('the helper’s failure line reaches the reporter and no Collector', async t => {
-	const failure: HelperError = {
-		type: 'error',
-		code: 'tapDisabled',
-		message: 'the event tap was disabled',
-	};
+	const {snapshot, problems} = await deliver([FAILURE]);
 
-	const {snapshot, problems} = await deliver([failure]);
-
-	t.deepEqual(problems, [{kind: 'error-line', error: failure}]);
+	t.deepEqual(problems, [{kind: 'error-line', error: FAILURE}]);
 	t.is(snapshot, undefined, 'and there is nothing in it to count');
 });
 
@@ -811,6 +842,12 @@ fails here instead of drawing an empty block forever.
 type Logged = {
 	readonly entries: readonly RunLogEntry[];
 	readonly state: TelemetryState;
+	/*
+	What delivering the events wrote to the terminal. A dashboard run writes
+	nothing, which is the half of the contract a Run Log entry cannot show: a
+	`[eventtap]` line printed once the frame is up corrupts the drawing.
+	*/
+	readonly stderr: readonly string[];
 };
 
 async function logged(
@@ -829,14 +866,7 @@ async function logged(
 			...(store && {store}),
 			state,
 			createStream: () => stream,
-			/*
-			Unreachable, because the report is granted — but stubbed rather than
-			left to the default, which spawns the real helper and asks macOS for a
-			grant.
-			*/
-			requestInputMonitoring() {
-				throw new Error('a granted run must not ask for the grant');
-			},
+			requestInputMonitoring: noGrantRequest,
 			historySource: stubHistory(),
 			async renderApp(view) {
 				runLog = view.runLog;
@@ -850,14 +880,19 @@ async function logged(
 	);
 
 	await stream.started;
-	for (const event of events) {
-		stream.emit(event);
-	}
+	// Held across the delivery rather than the run: `handle` and the reporter it
+	// ends in are synchronous, so this window is the whole of what a run writes
+	// as the events arrive, and nothing else's.
+	const stderr = captureStderr(() => {
+		for (const event of events) {
+			stream.emit(event);
+		}
+	});
 
 	test_.shutdown.fire('SIGINT');
 	await running;
 
-	return {entries: runLog?.read() ?? [], state};
+	return {entries: runLog?.read() ?? [], state, stderr};
 }
 
 /*
@@ -922,6 +957,175 @@ test('an interval with no Activity is not an entry', async t => {
 	const {entries} = await logged([]);
 
 	t.deepEqual(entries, []);
+});
+
+/*
+The other half of what the block is for, and the half a terminal cannot show
+once the frame is up: the helper's failure line is an entry rather than a
+`[eventtap]` warning printed into the middle of the drawing.
+
+Both halves are asserted together on purpose. An entry *and* the warning would
+be the same failure reported twice, and only the pair of assertions can tell
+that from the one report this is meant to be.
+*/
+test('the helper’s failure line is an entry, and nothing goes to stderr', async t => {
+	const {entries, stderr} = await logged([FAILURE]);
+
+	t.deepEqual(
+		stderr,
+		[],
+		'the entry is the report, and there is not a second one',
+	);
+	t.is(entries.length, 1);
+	t.is(entries[0]?.class, 'Helper');
+	t.true(entries[0]?.failed === true, 'which is what draws it red');
+	t.is(entries[0]?.summary, FAILURE.message);
+});
+
+/*
+The two problems no event carries: a line of stdout that would not parse, and a
+helper that has exited. They are the stream's own, so the factory hands the
+stream it builds the reporter they go to — and this is that wiring, driven
+through a stand-in that reports them the way the real stream does, without a
+capture process behind it.
+*/
+test('an unreadable line and a helper exit are entries too', async t => {
+	const test_ = harness(granted());
+	const stream = new FakeStream();
+	const runLog = new InProcessRunLogSource();
+	let report: ((problem: StreamProblem) => void) | undefined;
+
+	const running = run(
+		{kind: 'dashboard'},
+		{
+			...withoutFactory(test_.options),
+			runLog,
+			createStream(onProblem) {
+				report = onProblem;
+				return stream;
+			},
+			requestInputMonitoring: noGrantRequest,
+			historySource: stubHistory(),
+			async renderApp(view) {
+				await view.ended;
+			},
+		},
+	);
+
+	await stream.started;
+	report?.({kind: 'unreadable-line', line: 'not an event'});
+	report?.({kind: 'exited', code: 1, signal: undefined});
+	test_.shutdown.fire('SIGINT');
+	await running;
+
+	t.deepEqual(
+		runLog.read().map(entry => [entry.class, entry.summary]),
+		[
+			['Helper', 'unreadable line on stdout: not an event'],
+			[
+				'Helper',
+				'the capture helper exited (code 1); input is no longer being collected.',
+			],
+		],
+	);
+});
+
+/*
+One command over, the same problem is still a line on the terminal. This is the
+contract the change must not break, and the composition root is where it could
+be broken: the reporter is chosen per mode, and a default applied in the wrong
+place would take `collect`'s diagnostics away from a headless run.
+*/
+test('collect still prints helper problems to stderr', async t => {
+	const test_ = harness(granted());
+	const stream = new FakeStream();
+	const runLog = new InProcessRunLogSource();
+
+	const running = run(
+		{kind: 'collect'},
+		{
+			...withoutFactory(test_.options),
+			runLog,
+			createStream: () => stream,
+			requestInputMonitoring: noGrantRequest,
+		},
+	);
+
+	await stream.started;
+	const written = captureStderr(() => {
+		stream.emit(FAILURE);
+	});
+
+	test_.shutdown.fire('SIGINT');
+	await running;
+
+	t.deepEqual(written, [`[eventtap] ${FAILURE.message}\n`]);
+	t.deepEqual(
+		runLog.read(),
+		[],
+		'a headless run reports through the terminal and its exit code',
+	);
+});
+
+/*
+A run that starts with no grant says so in the log, which is the whole point of
+the entry: the dashboard lands on the history view, and the live view's own
+report is behind a key press.
+
+The view's report is asserted here rather than left to the test above it,
+because "an entry as well" and "an entry instead" are the two ways this could
+have gone and only one of them leaves the disabled state explained in full.
+*/
+test('a missing grant is one entry on a run that never starts', async t => {
+	const test_ = harness(denied());
+	const runLog = new InProcessRunLogSource();
+	let reading: LiveTelemetry | undefined;
+
+	test_.shutdown.fire('SIGTERM');
+
+	await run(
+		{kind: 'dashboard'},
+		{
+			...withoutFactory(test_.options),
+			runLog,
+			createStream() {
+				throw new Error('a denied grant builds no stream');
+			},
+			requestInputMonitoring() {
+				// Stubbed: the real one asks macOS, and nobody is at this keyboard.
+			},
+			historySource: stubHistory(),
+			async renderApp(view) {
+				reading = view.telemetry.read();
+			},
+		},
+	);
+
+	const entries = runLog.read();
+	t.is(entries.length, 1, 'one grant, so one entry');
+	t.is(entries[0]?.class, 'Collection');
+	t.is(
+		entries[0]?.failed,
+		undefined,
+		'a Collector the grant took out is not a failure (CONTEXT.md)',
+	);
+	t.regex(
+		entries[0]?.summary ?? '',
+		/Mouse and Keyboard collection is disabled: Input Monitoring is denied\./v,
+	);
+	t.is(
+		entries[0]?.detail,
+		'mouse off\nkeyboard off',
+		'and the detail is the preflight’s own notes, which say where to grant it',
+	);
+	t.deepEqual(
+		reading,
+		{
+			status: 'disabled',
+			message: 'Input Monitoring is denied for this helper.',
+		},
+		'the live view draws the same report it always did',
+	);
 });
 
 /*

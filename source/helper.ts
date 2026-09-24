@@ -441,23 +441,26 @@ export function requestInputMonitoring(helperPath = HELPER_PATH): void {
 }
 
 /*
-Where a problem goes when nothing else was supplied. A warning on stderr is the
-floor rather than the ideal: the alternative is a stream that fails silently,
-which is the one thing the helper's error lines exist to prevent — a consumer
-must be able to tell "no input" from "no permission".
+What a problem says, in one sentence and with no prefix.
+
+Composed here rather than at each reporting site, because there are two: the
+terminal, through the reporter below, and the dashboard's Run Log, which appends
+the problem as an entry. Two spellings of "the capture helper exited" would
+eventually disagree about what happened, and this is the only thing either of
+them has to say about it.
+
+The `[eventtap]` prefix belongs to the reporter rather than to the sentence: it
+says where a line came from on a terminal that has other things on it, and a Run
+Log entry draws the class in a column of its own.
 */
-export function defaultProblemReporter(problem: StreamProblem): void {
+export function problemMessage(problem: StreamProblem): string {
 	switch (problem.kind) {
 		case 'error-line': {
-			process.stderr.write(`[eventtap] ${problem.error.message}\n`);
-			return;
+			return problem.error.message;
 		}
 
 		case 'unreadable-line': {
-			process.stderr.write(
-				`[eventtap] unreadable line on stdout: ${problem.line}\n`,
-			);
-			return;
+			return `unreadable line on stdout: ${problem.line}`;
 		}
 
 		case 'exited': {
@@ -465,9 +468,21 @@ export function defaultProblemReporter(problem: StreamProblem): void {
 				problem.signal === undefined
 					? `code ${String(problem.code)}`
 					: `signal ${problem.signal}`;
-			process.stderr.write(
-				`[eventtap] the capture helper exited (${how}); input is no longer being collected.\n`,
-			);
+
+			return `the capture helper exited (${how}); input is no longer being collected.`;
 		}
 	}
+}
+
+/*
+Where a problem goes when nothing else was supplied. A warning on stderr is the
+floor rather than the ideal: the alternative is a stream that fails silently,
+which is the one thing the helper's error lines exist to prevent — a consumer
+must be able to tell "no input" from "no permission".
+
+Where the caller has a frame to keep whole, this is not the reporter it wants:
+the dashboard appends Run Log entries instead.
+*/
+export function defaultProblemReporter(problem: StreamProblem): void {
+	process.stderr.write(`[eventtap] ${problemMessage(problem)}\n`);
 }

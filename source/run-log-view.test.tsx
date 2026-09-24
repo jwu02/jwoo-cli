@@ -36,6 +36,16 @@ function failed(at: Date = AT): RunLogEntry {
 	};
 }
 
+/*
+A problem the helper or the stream reported: one sentence, drawn red, and its
+own class in the column beside the clock. The class is what tells it apart from
+a Flush at a glance, which is why it is asserted here rather than taken as
+decoration.
+*/
+function problem(summary: string): RunLogEntry {
+	return {at: AT, class: 'Helper', failed: true, summary, detail: summary};
+}
+
 function frameOf(entries: readonly RunLogEntry[]): string {
 	const {lastFrame} = render(
 		<RunLogView entries={entries} timeZone={TIME_ZONE} />,
@@ -95,6 +105,47 @@ test('a Flush that failed is drawn as one that will come back', t => {
 	const frame = frameOf([failed()]);
 
 	t.regex(frame, /11:00:00\s+Flush\s+failed — will retry/v);
+});
+
+/*
+The helper's own words, under the class that says they are the helper's. The
+sentence is long on purpose: a block that cut it would be drawing something
+other than what the diagnostics view would show.
+*/
+test('a helper problem is drawn as itself, beside the block’s other entries', t => {
+	const frame = frameOf([
+		written(),
+		problem(
+			'the capture helper exited (code 1); input is no longer being collected.',
+		),
+	]);
+
+	t.regex(
+		frame,
+		/11:00:00\s+Helper\s+the capture helper exited \(code 1\); input is no longer being collected\./v,
+	);
+});
+
+/*
+A run that started with no grant. Its class is the one thing on the landing view
+that says the numbers above it are missing for a reason — and it is drawn as a
+state rather than as a fault, so it is not the failed-Flush line.
+*/
+test('collection that started disabled is drawn as its own class', t => {
+	const frame = frameOf([
+		{
+			at: AT,
+			class: 'Collection',
+			summary:
+				'Mouse and Keyboard collection is disabled: Input Monitoring is denied.',
+			detail: 'Mouse collection is disabled: Input Monitoring is denied.',
+		},
+	]);
+
+	t.regex(
+		frame,
+		/11:00:00\s+Collection\s+Mouse and Keyboard collection is disabled: Input Monitoring is denied\./v,
+	);
 });
 
 /*

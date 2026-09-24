@@ -31,7 +31,9 @@ import {MouseCollector} from './mouse.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
 import {type RawEvent} from './raw-event.js';
 import {
+	collectionEntry,
 	flushEntry,
+	helperEntry,
 	InProcessRunLogSource,
 	type RunLogSource,
 } from './run-log.js';
@@ -104,10 +106,19 @@ required.
 */
 export type CollectorFactoryOptions = {
 	/*
-	The stream the Collectors read. The default is the real one, which spawns
-	the helper lazily in its own `start()` and never before.
+	The stream the Collectors read, built with the reporter its problems go to.
+	The default is the real one, which spawns the helper lazily in its own
+	`start()` and never before.
+
+	The reporter is handed over rather than reached for afterwards because a
+	stream's problems are settled when it is built: a helper that could not run,
+	a line of stdout that would not parse and an exit are reported by the stream
+	itself, and a caller building one of its own reports them where it was told
+	to — which is the only way the dashboard can keep them off the terminal.
 	*/
-	readonly createStream?: () => EventSource;
+	readonly createStream?: (
+		onProblem: (problem: StreamProblem) => void,
+	) => EventSource;
 	/*
 	Called once, on a run whose report says the grant is missing. macOS will not
 	show the prompt to a process with nobody at the keyboard, so the one run
@@ -115,16 +126,15 @@ export type CollectorFactoryOptions = {
 	*/
 	readonly requestInputMonitoring?: () => void;
 	/*
-	Where the helper's failure line goes. It arrives as an event like any other
-	and is owned by no Collector, so the wiring that consumes the stream is what
-	reports it (ADR-0008) — and a caller that wants to see that it happened, or
-	to keep it out of a test's output, supplies this.
+	Where the helper's problems go: its own failure line, a line of stdout that
+	would not parse, and its exit. A caller that wants to see that one happened,
+	or to keep it out of a test's output, supplies this.
 
-	That line, and not the stream's other problems: a line that would not parse,
-	an exit, a helper that could not run are reported through the `EventStream`
-	the caller builds, which is theirs. Both default to the same reporter,
-	because a failure that reached nothing would leave a run looking exactly
-	like an idle machine.
+	The failure line arrives as an event like any other and is owned by no
+	Collector, so the wiring that consumes the stream is what reports it
+	(ADR-0008). It defaults to a stderr warning, because a failure that reached
+	nothing would leave a run looking exactly like an idle machine — and the
+	dashboard, which has a frame to keep whole, appends Run Log entries instead.
 	*/
 	readonly onProblem?: (problem: StreamProblem) => void;
 };
@@ -138,10 +148,22 @@ reports the grant, and waits to be stopped, which is what keeps this the same
 shape as any other degraded run.
 */
 export function defaultCollectorFactory({
-	createStream = () => new HelperStream({}),
+	createStream,
 	requestInputMonitoring = askForInputMonitoring,
 	onProblem = defaultProblemReporter,
 }: CollectorFactoryOptions): CollectorFactory {
+	/*
+	The default stream is built here rather than as a default above, because it
+	has to be told where to report its problems and only this has read that yet.
+	It is handed the same reporter the caller's would be, so there is one rule
+	rather than one for each: whatever builds the stream says where its problems
+	go, and the helper is where that reporter lands.
+	*/
+	const buildStream =
+		createStream ??
+		((report: (problem: StreamProblem) => void) =>
+			new HelperStream({onProblem: report}));
+
 	return (report, state) => {
 		if (report.status !== 'granted') {
 			requestInputMonitoring();
@@ -159,7 +181,7 @@ export function defaultCollectorFactory({
 		process: a run stopped before it starts would then leave one behind, and
 		owning that lifetime is the Session's whole job.
 		*/
-		const stream = createStream();
+		const stream = buildStream(onProblem);
 
 		return {collectors: collectorsOver(stream, state, onProblem), stream};
 	};
@@ -357,6 +379,7 @@ function sessionFor(
 		report,
 		logger,
 		runLog,
+		problemReporter,
 		onFlush,
 	}: {
 		readonly config: Config;
@@ -365,13 +388,30 @@ function sessionFor(
 		readonly logger: Logger;
 		readonly runLog: InProcessRunLogSource;
 		/*
+		Where the helper's problems go on a run whose caller supplied no reporter
+		of its own. Left out by `collect`, which keeps the stderr reporter it has
+		always had; the dashboard appends entries instead, because the frame is
+		the only output there.
+		*/
+		readonly problemReporter?: (problem: StreamProblem) => void;
+		/*
 		Whatever else wants to hear about a Flush, which is the live view — the
 		one observer whose counters depend on whether the write landed.
 		*/
 		readonly onFlush?: (attempt: FlushAttempt) => void;
 	},
 ): CollectionSession {
-	const setup = (options.collectors ?? defaultCollectorFactory(options))(
+	/*
+	A reporter the caller supplied is the one that runs — a caller that asked to
+	see the problems itself has said where it wants them — so the mode's is the
+	default and not the rule. The `undefined` of a mode that left one out is
+	what `defaultCollectorFactory` reads as "the stderr reporter".
+	*/
+	const factoryOptions: CollectorFactoryOptions = {
+		...options,
+		onProblem: options.onProblem ?? problemReporter,
+	};
+	const setup = (options.collectors ?? defaultCollectorFactory(factoryOptions))(
 		report,
 		state,
 	);
@@ -424,21 +464,47 @@ function reportShutdown({signal, finalFlush}: Shutdown, logger: Logger): void {
 async function runCollect(options: RunOptions): Promise<void> {
 	const logger = options.logger ?? console;
 	const config = options.config ?? loadConfig();
-	const report = await runPermissions(options);
+	const {runLog, report} = await preflightWithLog(options);
 	const session = sessionFor(options, {
 		config,
 		state: stateFor(options, config),
 		report,
 		logger,
-		/*
-		Built here even though nothing draws it: the Run Log is the record of a
-		run, and a `collect` run is one. Nothing reads it back — the terminal is
-		where a headless run reports, and its exit code is what a shell reads.
-		*/
-		runLog: options.runLog ?? new InProcessRunLogSource(),
+		runLog,
 	});
 
 	reportShutdown(await session.run(), logger);
+}
+
+/*
+The preflight, and the Run Log it leaves behind.
+
+One place rather than one per command, because the order is the whole of it: the
+log is built before the preflight runs, so that a run starting with no grant has
+the entry in it before the first frame is drawn. A third command would otherwise
+have to know that, and the way to get it wrong looks like nothing at all.
+
+Built in `collect` too, even though nothing draws it: the Run Log is the record
+of a run, and a `collect` run is one. Nothing reads it back there — the terminal
+is where a headless run reports, and its exit code is what a shell reads — but a
+caller that supplied one can see afterwards what the run found.
+*/
+async function preflightWithLog(
+	options: RunOptions,
+): Promise<{runLog: InProcessRunLogSource; report: PermissionReport}> {
+	const runLog = options.runLog ?? new InProcessRunLogSource();
+	const report = await runPermissions(options);
+
+	/*
+	Only where there is something to say. A run that was granted starts with an
+	empty log, which the block draws as "nothing yet" — a line about a check that
+	passed would be an entry about nothing happening.
+	*/
+	if (report.status === 'disabled') {
+		runLog.append(collectionEntry(report, new Date()));
+	}
+
+	return {runLog, report};
 }
 
 /*
@@ -458,26 +524,32 @@ async function runDashboard(options: RunOptions): Promise<void> {
 	const logger = options.logger ?? console;
 	const config = options.config ?? loadConfig();
 	/*
+	The same instance the view reads, because the log the wiring appends to and
+	the one on screen have to be one object — or the block would show a run that
+	never did anything.
+
 	The dashboard runs the same preflight `collect` does, and it is not only for
 	the Collectors: the report is what lets the live view say "collection is
 	disabled" rather than draw zeroes, which are the same numbers and not the
 	same thing.
 	*/
-	const report = await runPermissions(options);
+	const {runLog, report} = await preflightWithLog(options);
 	const state = stateFor(options, config);
 	const telemetry = new InProcessTelemetrySource({report, state});
-	/*
-	The same instance the view reads: the Run Log a session appends to and the
-	one on screen have to be one object, or the block would show a run that
-	never did anything.
-	*/
-	const runLog = options.runLog ?? new InProcessRunLogSource();
 	const session = sessionFor(options, {
 		config,
 		state,
 		report,
 		logger,
 		runLog,
+		/*
+		The helper's problems become entries rather than lines of stderr, which
+		would land in the middle of the frame. Appended here and not in a view:
+		an entry is a fact about the run, and the block polls what it finds.
+		*/
+		problemReporter(problem) {
+			runLog.append(helperEntry(problem, new Date()));
+		},
 		onFlush(attempt) {
 			telemetry.recordFlush(attempt);
 		},

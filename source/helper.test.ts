@@ -127,33 +127,48 @@ test('the helper streams every event type it prints', async t => {
 	);
 });
 
-test('a line split across two reads is reassembled', async t => {
-	/*
-	Cat delivers the file in whatever chunks the pipe gives it, which is the
-	shape a real stdout has and a single `data` handler would silently drop.
-	Two events, written together and read as one buffer, is enough to catch a
-	splitter that does not hold a remainder.
-	*/
+/*
+The helper's lines, written out for `/bin/cat` to print back. Built from the
+wire format rather than from anything the code under test exports, so a change
+to the format shows up here rather than being followed by these tests.
+*/
+const A_PRESS = '{"type":"keyDown","timestampNs":1,"keycode":0,"flagsRaw":256}';
+const A_RELEASE = '{"type":"keyUp","timestampNs":2,"keycode":0,"flagsRaw":256}';
+
+/*
+`cat` printing a file of lines, with everything it produces recorded. Cat
+delivers the file in whatever chunks the pipe gives it, which is the shape a
+real stdout has — and the helper cannot be asked to print a broken line or to
+exit under its own steam, which is why the other two tests below want it too.
+*/
+async function catStream(
+	seen: Recorder,
+	lines: readonly string[],
+	onProblem: (problem: StreamProblem) => void = quiet(),
+): Promise<EventStream> {
 	const directory = await mkdtemp(join(tmpdir(), 'eventstream-'));
 	const file = join(directory, 'events.jsonl');
-	await writeFile(
-		file,
-		[
-			'{"type":"keyDown","timestampNs":1,"keycode":0,"flagsRaw":256}',
-			'{"type":"keyUp","timestampNs":2,"keycode":0,"flagsRaw":256}',
-			'',
-		].join('\n'),
-	);
+	// Newline-terminated, as the helper writes every line.
+	await writeFile(file, [...lines, ''].join('\n'));
 
-	const seen = recorder();
-	const stream = new EventStream({
+	return new EventStream({
 		helperPath: '/bin/cat',
 		helperArgs: [file],
 		onEvent(event) {
 			seen.events.push(event);
 		},
-		onProblem: quiet(),
+		onProblem,
 	});
+}
+
+test('a line split across two reads is reassembled', async t => {
+	/*
+	Two events, written together and read as one buffer, is enough to catch a
+	splitter that does not hold a remainder — which is what a single `data`
+	handler would silently drop.
+	*/
+	const seen = recorder();
+	const stream = await catStream(seen, [A_PRESS, A_RELEASE]);
 
 	stream.start();
 	await until(() => seen.events.length >= 2, 'both lines');
@@ -163,6 +178,60 @@ test('a line split across two reads is reassembled', async t => {
 		seen.events.map(event => event.type),
 		['keyDown', 'keyUp'],
 	);
+});
+
+/*
+A line that is not an event. One bad line in a stream that runs for hours must
+not end collection, so it is skipped — but it is *said*, and that is the half
+that matters: a wire format that broke would otherwise look exactly like a
+machine nobody is touching.
+
+The dashboard turns this into a Run Log entry and `collect` into a `[eventtap]`
+warning, and both are only as good as this report arriving at all.
+*/
+test('a line that would not parse is reported rather than dropped', async t => {
+	const seen = recorder();
+	const stream = await catStream(
+		seen,
+		['{"type":"keyDown"}', A_PRESS],
+		problem => {
+			seen.problems.push(problem);
+		},
+	);
+
+	stream.start();
+	await until(() => seen.events.length > 0, 'the event after the bad line');
+	stream.stop();
+
+	/*
+	Filtered, because `cat` exiting at the end of the file is a problem of its
+	own and may have arrived too — the test below this one is about that one.
+	*/
+	t.deepEqual(
+		seen.problems.filter(problem => problem.kind === 'unreadable-line'),
+		[{kind: 'unreadable-line', line: '{"type":"keyDown"}'}],
+	);
+	t.is(seen.events.length, 1, 'and the line after it still arrived');
+});
+
+/*
+A helper that has gone says so, because nothing else can: a dead helper and an
+idle machine produce the same counters, and this report is the whole of the
+difference. `cat` exiting at the end of its file is as close as a test can get
+to a tap that has shut down.
+*/
+test('a helper that exits is reported, so its death is not silence', async t => {
+	const seen = recorder();
+	const stream = await catStream(seen, [A_PRESS], problem => {
+		seen.problems.push(problem);
+	});
+
+	stream.start();
+	await until(() => seen.problems.length > 0, 'the exit');
+	stream.stop();
+
+	t.deepEqual(seen.problems, [{kind: 'exited', code: 0, signal: undefined}]);
+	t.is(seen.events.length, 1, 'and what it printed first still arrived');
 });
 
 test('a helper that cannot start is reported rather than thrown', async t => {
