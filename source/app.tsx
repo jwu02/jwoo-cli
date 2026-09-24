@@ -33,6 +33,13 @@ import {useHistory} from './use-history.js';
 import {useRunLog} from './use-run-log.js';
 import {useTelemetry} from './use-telemetry.js';
 
+/*
+Which view is drawn, as one value rather than a flag per view. The keys are
+absolute — every view key says which view it wants — so exactly one of them is
+showing at a time and there is no pair of flags to keep in step.
+*/
+type View = 'history' | 'live';
+
 export type AppProps = {
 	readonly history: HistorySource;
 	readonly telemetry: TelemetrySource;
@@ -42,7 +49,7 @@ export type AppProps = {
 
 export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 	const [range, setRange] = useState<Range>('today');
-	const [isLive, setIsLive] = useState(false);
+	const [view, setView] = useState<View>('history');
 	const {exit} = useApp();
 	const state = useHistory(history, range);
 
@@ -54,7 +61,7 @@ export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 			}
 
 			case 'l': {
-				setIsLive(true);
+				setView('live');
 				break;
 			}
 
@@ -65,13 +72,13 @@ export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 			*/
 			case 't': {
 				setRange('today');
-				setIsLive(false);
+				setView('history');
 				break;
 			}
 
 			case 'w': {
 				setRange('week');
-				setIsLive(false);
+				setView('history');
 				break;
 			}
 
@@ -81,7 +88,7 @@ export default function App({history, telemetry, runLog, timeZone}: AppProps) {
 
 	return (
 		<Box flexDirection="column">
-			{isLive ? (
+			{view === 'live' ? (
 				<Live source={telemetry} timeZone={timeZone} />
 			) : (
 				<HistoryView state={state} range={range} />
