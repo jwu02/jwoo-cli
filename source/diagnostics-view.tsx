@@ -24,11 +24,8 @@ counts, and the same sentence twice would read as two entries.
 */
 
 import {Box, Text} from 'ink';
-import {clockTime} from './format.js';
+import {CLOCK_WIDTH, clockTime} from './format.js';
 import {type RunLogEntry} from './run-log.js';
-
-// "11:00:00", and a gap after it.
-const CLOCK_WIDTH = 10;
 
 export function DiagnosticsView({
 	entries,

@@ -18,11 +18,8 @@ the diagnostics view's (#22), and this module never draws it.
 */
 
 import {Box, Text} from 'ink';
-import {clockTime} from './format.js';
+import {CLOCK_WIDTH, clockTime} from './format.js';
 import {type RunLogEntry} from './run-log.js';
-
-// "11:00:00", and a gap after it.
-const CLOCK_WIDTH = 10;
 
 // "Collection", the longest of the four classes, and a gap after it.
 const CLASS_WIDTH = 11;

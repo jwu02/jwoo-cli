@@ -41,3 +41,11 @@ export function clockTime(at: Date, timeZone: string): string {
 
 	return [hour, minute, second].map(value => twoDigits(value)).join(':');
 }
+
+/*
+The column a clock reading is drawn in: "11:00:00", and a gap after it.
+Alongside `clockTime` rather than in a view because both views that draw one draw
+it at this width, and a time that sat two columns further left in the Run Log
+than in diagnostics would make the same second look like a different one.
+*/
+export const CLOCK_WIDTH = 10;
