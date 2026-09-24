@@ -43,9 +43,10 @@ export function clockTime(at: Date, timeZone: string): string {
 }
 
 /*
-The column a clock reading is drawn in: "11:00:00", and a gap after it.
-Alongside `clockTime` rather than in a view because both views that draw one draw
-it at this width, and a time that sat two columns further left in the Run Log
-than in diagnostics would make the same second look like a different one.
+The column a clock reading is drawn in: "11:00:00", and a gap after it. Beside
+`clockTime` rather than in a view because two views draw one, and the class
+beside it — which is what the width is for, rather than the reading itself —
+has to start at the same offset in both. A time that pushed the same class
+further along in the block than in diagnostics would read as a wider clock.
 */
 export const CLOCK_WIDTH = 10;

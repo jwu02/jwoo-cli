@@ -137,6 +137,13 @@ _Avoid_: activity log (Activity is countable input), event log (events are the h
 format), flush history (history is the storage read — the other view), session log, log file
 (nothing here is written to disk)
 
+**Diagnostics View**:
+The Run Log drawn whole: the entries the block under the other views holds, one per entry, each
+with its second, its class, its summary and its full text, at the width of the terminal rather
+than in a column. It is not a second record of the run — it is the one record, read in full —
+which is why the block is not drawn beneath it.
+_Avoid_: log view, debug view, detail pane, and any reading of it as a separate log
+
 ## Deliberately absent
 
 These are not gaps. They are out of scope, and the vocabulary should not drift back toward them.

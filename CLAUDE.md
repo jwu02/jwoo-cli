@@ -288,8 +288,9 @@ its account.
 `history | live | diagnostics` union rather than a flag per view, and every view key names the
 view it wants: `d` opens diagnostics from anywhere, `t` and `w` are the history view at their
 range, `l` is the live view, `q` quits. Nothing toggles and there is no way back to "whatever was
-showing". That one value is also what decides the block, which draws under history and live and
-not under diagnostics.
+showing". That one value also decides the block: every view but diagnostics gets it, written as
+the exclusion rather than as the two views that want it, so a view added later inherits the block
+rather than quietly losing it.
 
 **Unmount the Ink root in any test that leaves a polling hook mounted.** A pending `setInterval`
 holds ava's worker open, and the run ends in `✘ Timed out while running tests` rather than in a
