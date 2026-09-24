@@ -14,9 +14,8 @@ the two must not read alike.
 */
 
 import {Box, Text} from 'ink';
-import {twoDigits} from './format.js';
+import {clockTime} from './format.js';
 import {type Totals} from './history.js';
-import {localFields} from './local-time.js';
 import {Row, TotalsView} from './totals-view.js';
 import {type LastFlush, type LiveTelemetry} from './telemetry.js';
 
@@ -124,8 +123,7 @@ function flushLabel(
 		return 'not yet';
 	}
 
-	const {hour, minute, second} = localFields(lastFlush.at, timeZone);
-	const clock = [hour, minute, second].map(value => twoDigits(value)).join(':');
+	const clock = clockTime(lastFlush.at, timeZone);
 
 	return lastFlush.ok ? clock : `${clock} · failed`;
 }

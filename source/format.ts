@@ -11,6 +11,8 @@ The locale is pinned rather than taken from the machine, so the tests assert the
 same digits everywhere.
 */
 
+import {localFields} from './local-time.js';
+
 export const COUNT_FORMAT = new Intl.NumberFormat('en-GB');
 
 export const METRES_FORMAT = new Intl.NumberFormat('en-GB', {
@@ -23,4 +25,19 @@ clock reading of `9:5:3` is the kind of thing that only shows up in a screenshot
 */
 export function twoDigits(value: number): string {
 	return String(value).padStart(2, '0');
+}
+
+/*
+An instant as a local clock reading, to the second.
+
+One spelling, because the live view's flush line and a Run Log entry are
+answering the same question about the same event — *when* — and a frame that said
+`11:00:00` in one place and `11:00` in the other would look like two different
+times. The zone is a parameter for the reason `local-time.ts` gives: the tests
+assert the same digits everywhere.
+*/
+export function clockTime(at: Date, timeZone: string): string {
+	const {hour, minute, second} = localFields(at, timeZone);
+
+	return [hour, minute, second].map(value => twoDigits(value)).join(':');
 }

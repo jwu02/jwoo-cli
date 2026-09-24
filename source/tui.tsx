@@ -15,11 +15,17 @@ import {type DashboardView} from './main.js';
 export async function renderApp({
 	history,
 	telemetry,
+	runLog,
 	timeZone,
 	ended,
 }: DashboardView): Promise<void> {
 	const instance = render(
-		<App history={history} telemetry={telemetry} timeZone={timeZone} />,
+		<App
+			history={history}
+			telemetry={telemetry}
+			runLog={runLog}
+			timeZone={timeZone}
+		/>,
 	);
 
 	/*

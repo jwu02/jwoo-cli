@@ -19,6 +19,11 @@ import {KeyboardCollector} from './keyboard.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
 import {type HelperError, keyEventAt, type RawEvent} from './raw-event.js';
 import {
+	InProcessRunLogSource,
+	type RunLogEntry,
+	type RunLogSource,
+} from './run-log.js';
+import {
 	type Collector,
 	type EventStream,
 	type ShutdownReason,
@@ -604,24 +609,35 @@ test('the helper’s failure line reaches the reporter and no Collector', async 
 });
 
 /*
+A database that has gone away, as the Session sees one: a Flush that writes
+nothing and leaves Telemetry State alone to be retried.
+*/
+const FAILING_STORE: TelemetryStore = {
+	async flush(): Promise<FlushResult> {
+		return undefined;
+	},
+	async close(): Promise<void> {
+		// Nothing to release.
+	},
+};
+
+/*
 Countered by the success case above, which must *not* set it. A shell reads the
 exit code, so a lost final Flush has to reach it rather than only the log.
 */
 test('a failed final Flush exits non-zero, because the counters are lost', async t => {
 	const test_ = harness(granted());
 	test_.options.state?.addLeftClick();
-	const failing: TelemetryStore = {
-		async flush(): Promise<FlushResult> {
-			return undefined;
-		},
-		async close(): Promise<void> {
-			// Nothing to release.
-		},
-	};
 
 	const previous = process.exitCode;
 	try {
-		const running = run({kind: 'collect'}, {...test_.options, store: failing});
+		const running = run(
+			{kind: 'collect'},
+			{
+				...test_.options,
+				store: FAILING_STORE,
+			},
+		);
 		test_.shutdown.fire('SIGTERM');
 		await running;
 
@@ -780,6 +796,151 @@ test('a Flush is counted into the live totals', async t => {
 function totalsOf(reading: LiveTelemetry | undefined): Totals | undefined {
 	return reading?.status === 'collecting' ? reading.totals : undefined;
 }
+
+/*
+The Run Log's two ends, which neither module's own test can see: the Session
+reports each Flush attempt, and the composition root is what turns one into an
+entry. Dashboard mode, over the factory the composition root builds when none
+was given — so the counts in an entry are the ones the Collectors collected,
+through the stream that factory built and wired.
+
+The entries are read back from the source the *view* was handed rather than from
+one the test supplied, so a Run Log the view does not share with the session
+fails here instead of drawing an empty block forever.
+*/
+type Logged = {
+	readonly entries: readonly RunLogEntry[];
+	readonly state: TelemetryState;
+};
+
+async function logged(
+	events: readonly RawEvent[],
+	store?: TelemetryStore,
+): Promise<Logged> {
+	const test_ = harness(granted());
+	const stream = new FakeStream();
+	const state = new TelemetryState();
+	let runLog: RunLogSource | undefined;
+
+	const running = run(
+		{kind: 'dashboard'},
+		{
+			...withoutFactory(test_.options),
+			...(store && {store}),
+			state,
+			createStream: () => stream,
+			/*
+			Unreachable, because the report is granted — but stubbed rather than
+			left to the default, which spawns the real helper and asks macOS for a
+			grant.
+			*/
+			requestInputMonitoring() {
+				throw new Error('a granted run must not ask for the grant');
+			},
+			historySource: stubHistory(),
+			async renderApp(view) {
+				runLog = view.runLog;
+				/*
+				What `tui.tsx` does: the frame stays up until the run ends, and
+				the Run Log is read once it has — so the final Flush has landed.
+				*/
+				await view.ended;
+			},
+		},
+	);
+
+	await stream.started;
+	for (const event of events) {
+		stream.emit(event);
+	}
+
+	test_.shutdown.fire('SIGINT');
+	await running;
+
+	return {entries: runLog?.read() ?? [], state};
+}
+
+/*
+A Flush that wrote, as an entry: the three counts the Flush carried, in the
+spellings the totals above the block use. Nothing is counted by hand here — the
+events go in through the helper's own stream and come out of the log.
+*/
+test('a Flush that landed is an entry with the counts it wrote', async t => {
+	const {entries} = await logged([
+		keyEventAt('keyDown', A_KEY, BARE),
+		// One inch at the configured DPI, in ten steps of a tenth of it: a
+		// distance needs two points, and the first move is the baseline.
+		{type: 'mouseMoved', timestampNs: 0, x: 0, y: 0},
+		{type: 'mouseMoved', timestampNs: 0, x: CONFIG.mouseDpi * 10, y: 0},
+		{type: 'mouseDown', timestampNs: 0, x: 0, y: 0, button: 'left'},
+	]);
+
+	t.is(entries.length, 1);
+	const [entry] = entries;
+	t.is(entry?.class, 'Flush');
+	t.is(entry?.failed, undefined);
+	t.is(entry?.summary, 'Clicks 1 · Mouse Distance 0.3 m · Press Total 1');
+});
+
+/*
+The failure the block exists for, and the reason its line says the write is
+coming back: the counters were never cleared, so the same Snapshot is retried on
+the next Flush Interval (ADR-0009).
+*/
+test('a Flush that failed is an entry that will retry, with the counters still held', async t => {
+	/*
+	The counters never made it, so the run ends non-zero and sets the exit code
+	— which ava's worker reads when it exits. Left set, it would end this file
+	non-zero with every test in it passing.
+	*/
+	const previous = process.exitCode;
+	try {
+		const {entries, state} = await logged(
+			[keyEventAt('keyDown', A_KEY, BARE)],
+			FAILING_STORE,
+		);
+
+		t.is(entries.length, 1);
+		t.is(entries[0]?.class, 'Flush');
+		t.true(entries[0]?.failed === true, 'which is what draws it red');
+		t.is(entries[0]?.summary, 'failed — will retry');
+		t.true(
+			state.hasActivity(),
+			'left whole, so the Flush is retried rather than lost',
+		);
+	} finally {
+		process.exitCode = previous;
+	}
+});
+
+/*
+A Flush is attempted only when there was Activity, so the log lists attempts and
+not intervals: an idle run records nothing, which is what keeps the block from
+filling with lines about writes that never happened.
+*/
+test('an interval with no Activity is not an entry', async t => {
+	const {entries} = await logged([]);
+
+	t.deepEqual(entries, []);
+});
+
+/*
+`collect` records too, and there is no view to read it from — which is why the
+composition root takes a Run Log as an option at all.
+*/
+test('collect records its Flush attempts as well', async t => {
+	const test_ = harness(granted());
+	const runLog = new InProcessRunLogSource();
+	test_.options.state?.addLeftClick();
+
+	const running = run({kind: 'collect'}, {...test_.options, runLog});
+	test_.shutdown.fire('SIGINT');
+	await running;
+
+	const entries = runLog.read();
+	t.is(entries.length, 1);
+	t.regex(entries[0]?.summary ?? '', /Clicks 1/v);
+});
 
 /*
 A quit is not the only way out of the dashboard, and the source must be closed

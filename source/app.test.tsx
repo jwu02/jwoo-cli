@@ -1,4 +1,4 @@
-import test from 'ava';
+import test, {type ExecutionContext} from 'ava';
 import {render} from 'ink-testing-library';
 import App from './app.js';
 import {
@@ -7,6 +7,7 @@ import {
 	type LoadResult,
 } from './history.js';
 import {type Range} from './ranges.js';
+import {type RunLogEntry, type RunLogSource} from './run-log.js';
 import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
 
 /*
@@ -82,12 +83,43 @@ class StubTelemetrySource implements TelemetrySource {
 	}
 }
 
+/*
+The Run Log's entries, with a Press Total that is neither view's — so a frame
+assertion cannot be satisfied by the numbers above the block. The summary is the
+seam's own spelling of a successful Flush (`flushEntry`), pinned here so the
+block is drawn from something the CLI would actually produce.
+*/
+class StubRunLogSource implements RunLogSource {
+	entries: RunLogEntry[] = [written()];
+
+	read(): readonly RunLogEntry[] {
+		return [...this.entries];
+	}
+}
+
+const RUN_LOG_PRESS_TOTAL = '1,234';
+
+function written(at = new Date('2026-09-22T10:00:00.000Z')): RunLogEntry {
+	return {
+		at,
+		class: 'Flush',
+		summary: `Clicks 10 · Mouse Distance 250.5 m · Press Total ${RUN_LOG_PRESS_TOTAL}`,
+		detail: `Clicks 10 · Mouse Distance 250.5 m · Press Total ${RUN_LOG_PRESS_TOTAL}`,
+	};
+}
+
 function dashboard(
 	history: HistorySource,
+	runLog: RunLogSource = new StubRunLogSource(),
 	telemetry: TelemetrySource = new StubTelemetrySource(),
 ) {
 	return (
-		<App history={history} telemetry={telemetry} timeZone="Europe/London" />
+		<App
+			history={history}
+			telemetry={telemetry}
+			runLog={runLog}
+			timeZone="Europe/London"
+		/>
 	);
 }
 
@@ -100,9 +132,27 @@ async function settle(): Promise<void> {
 	}
 }
 
+/*
+Unmounted rather than left to the end of the run, in every case here: the Run
+Log block is under both views and polls on both, so any root left mounted when a
+test finishes leaves a timer behind that ava waits on. It is not only the tests
+that switch to the live view.
+*/
+function mount(
+	t: ExecutionContext,
+	...props: Parameters<typeof dashboard>
+): ReturnType<typeof render> {
+	const instance = render(dashboard(...props));
+	t.teardown(() => {
+		instance.unmount();
+	});
+
+	return instance;
+}
+
 test.serial('the landing view is the history for today', async t => {
 	const source = new StubHistorySource();
-	const {lastFrame} = render(dashboard(source));
+	const {lastFrame} = mount(t, source);
 	await settle();
 
 	// The default landing view, and the one that works before anything has
@@ -113,7 +163,7 @@ test.serial('the landing view is the history for today', async t => {
 
 test.serial('w switches the view to this week', async t => {
 	const source = new StubHistorySource();
-	const {stdin, lastFrame} = render(dashboard(source));
+	const {stdin, lastFrame} = mount(t, source);
 	await settle();
 
 	stdin.write('w');
@@ -125,7 +175,7 @@ test.serial('w switches the view to this week', async t => {
 
 test.serial('t switches back to today', async t => {
 	const source = new StubHistorySource();
-	const {stdin, lastFrame} = render(dashboard(source));
+	const {stdin, lastFrame} = mount(t, source);
 	await settle();
 
 	stdin.write('w');
@@ -139,15 +189,7 @@ test.serial('t switches back to today', async t => {
 
 test.serial('l switches to the live view', async t => {
 	const source = new StubHistorySource();
-	/*
-	Unmounted rather than left to the end of the run: the live view polls, and a
-	component still mounted when the test finishes leaves a timer behind that
-	ava waits on.
-	*/
-	const {stdin, lastFrame, unmount} = render(dashboard(source));
-	t.teardown(() => {
-		unmount();
-	});
+	const {stdin, lastFrame} = mount(t, source);
 	await settle();
 
 	stdin.write('l');
@@ -172,10 +214,7 @@ way back, which is what makes the heading above the numbers unambiguous.
 */
 test.serial('a range key is the way back from the live view', async t => {
 	const source = new StubHistorySource();
-	const {stdin, lastFrame, unmount} = render(dashboard(source));
-	t.teardown(() => {
-		unmount();
-	});
+	const {stdin, lastFrame} = mount(t, source);
 	await settle();
 
 	stdin.write('l');
@@ -187,6 +226,89 @@ test.serial('a range key is the way back from the live view', async t => {
 	t.regex(frame, /Press Total\s+1,111/v);
 	t.false(frame.includes('since the CLI started'));
 });
+
+/*
+The point of putting the block here rather than inside a view: the dashboard
+lands on the history view, which knows nothing about this run, so a session
+whose every Flush failed would otherwise open on a frame with nothing to say
+about it.
+*/
+test.serial('the Run Log is drawn under the history view', async t => {
+	const source = new StubHistorySource();
+	const {lastFrame} = mount(t, source);
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.regex(frame, /Run Log/v);
+	t.regex(
+		frame,
+		new RegExp(String.raw`Press Total\s+${RUN_LOG_PRESS_TOTAL}`, 'v'),
+		'with the counts the Flush wrote',
+	);
+	t.regex(frame, /Clicks 10 · Mouse Distance 250\.5 m/v);
+	// The history's own numbers are still above it: the block is under the
+	// view, not instead of it.
+	t.regex(frame, /Press Total\s+1,111/v);
+});
+
+test.serial('the Run Log is drawn under the live view too', async t => {
+	const source = new StubHistorySource();
+	const {stdin, lastFrame} = mount(t, source);
+	await settle();
+
+	stdin.write('l');
+	await settle();
+
+	const frame = lastFrame() ?? '';
+	t.regex(frame, /since the CLI started/v);
+	t.regex(frame, /Run Log/v);
+	t.regex(
+		frame,
+		new RegExp(String.raw`Press Total\s+${RUN_LOG_PRESS_TOTAL}`, 'v'),
+	);
+});
+
+/*
+Nothing appended is a state rather than a gap, and the block says so on both
+views — it is the same block either way.
+*/
+test.serial(
+	'an empty Run Log says so rather than drawing a bare heading',
+	async t => {
+		const source = new StubHistorySource();
+		const runLog = new StubRunLogSource();
+		runLog.entries = [];
+		const {lastFrame} = mount(t, source, runLog);
+		await settle();
+
+		t.regex(lastFrame() ?? '', /Run Log\s+Nothing yet\./v);
+	},
+);
+
+/*
+A problem is visible from wherever the dashboard happens to be open, which is
+the whole reason the block is not inside a view.
+*/
+test.serial(
+	'a failed Flush is drawn under the history view, where the run starts',
+	async t => {
+		const source = new StubHistorySource();
+		const runLog = new StubRunLogSource();
+		runLog.entries = [
+			{
+				at: new Date('2026-09-22T10:05:00.000Z'),
+				class: 'Flush',
+				failed: true,
+				summary: 'failed — will retry',
+				detail: 'The counters are still in Telemetry State.',
+			},
+		];
+		const {lastFrame} = mount(t, source, runLog);
+		await settle();
+
+		t.regex(lastFrame() ?? '', /11:05:00\s+Flush\s+failed — will retry/v);
+	},
+);
 
 /*
 `q` is not asserted here. It delegates straight to Ink's `exit()`, and

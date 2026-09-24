@@ -31,6 +31,11 @@ import {MouseCollector} from './mouse.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
 import {type RawEvent} from './raw-event.js';
 import {
+	flushEntry,
+	InProcessRunLogSource,
+	type RunLogSource,
+} from './run-log.js';
+import {
 	type Collector,
 	CollectionSession,
 	type EventStream,
@@ -226,8 +231,9 @@ export type Logger = Pick<Console, 'log' | 'warn'>;
 
 /*
 What the dashboard needs to draw itself, handed over as one object because it is
-one decision: the view draws two sources, and which sources those are is what
-the composition root decides.
+one decision: the view draws three sources, and which sources those are is what
+the composition root decides. The Run Log arrives as its reading face — a view
+can see what the run did and cannot add to it.
 
 `ended` is the run's lifetime as the view sees it. A run can end without the
 view asking — a SIGTERM while the dashboard is open — and a frame left on screen
@@ -236,6 +242,7 @@ afterwards would go on claiming to be live.
 export type DashboardView = {
 	readonly history: HistorySource;
 	readonly telemetry: TelemetrySource;
+	readonly runLog: RunLogSource;
 	readonly timeZone: string;
 	readonly ended: Promise<void>;
 };
@@ -263,6 +270,13 @@ export type RunOptions = CollectorFactoryOptions & {
 	readonly store?: TelemetryStore;
 	readonly historySource?: HistorySource;
 	readonly state?: TelemetryState;
+	/*
+	The Run Log the run appends to. An option for the reason `state` is one: a
+	test that wants to see what a run recorded supplies its own and reads it
+	afterwards, and in `collect` — where there is no view to read one — that is
+	the only way to see it at all.
+	*/
+	readonly runLog?: InProcessRunLogSource;
 	/*
 	An option so a test can set a Flush Interval without an environment to load
 	one from. `loadConfig` reads the real environment, and the tests have none.
@@ -342,12 +356,18 @@ function sessionFor(
 		state,
 		report,
 		logger,
+		runLog,
 		onFlush,
 	}: {
 		readonly config: Config;
 		readonly state: TelemetryState;
 		readonly report: PermissionReport;
 		readonly logger: Logger;
+		readonly runLog: InProcessRunLogSource;
+		/*
+		Whatever else wants to hear about a Flush, which is the live view — the
+		one observer whose counters depend on whether the write landed.
+		*/
 		readonly onFlush?: (attempt: FlushAttempt) => void;
 	},
 ): CollectionSession {
@@ -364,7 +384,16 @@ function sessionFor(
 		flushIntervalSeconds: config.flushIntervalSeconds,
 		shutdown: options.shutdown ?? processSignal,
 		logger,
-		onFlush,
+		/*
+		The Run Log is written here rather than by an observer, because both
+		commands record Flushes and only one of them has a view to hear about
+		them. A Flush is attempted only when there was Activity, so these are
+		attempts and not intervals (CONTEXT.md).
+		*/
+		onFlush(attempt) {
+			runLog.append(flushEntry(attempt));
+			onFlush?.(attempt);
+		},
 	});
 }
 
@@ -401,6 +430,12 @@ async function runCollect(options: RunOptions): Promise<void> {
 		state: stateFor(options, config),
 		report,
 		logger,
+		/*
+		Built here even though nothing draws it: the Run Log is the record of a
+		run, and a `collect` run is one. Nothing reads it back — the terminal is
+		where a headless run reports, and its exit code is what a shell reads.
+		*/
+		runLog: options.runLog ?? new InProcessRunLogSource(),
 	});
 
 	reportShutdown(await session.run(), logger);
@@ -431,11 +466,18 @@ async function runDashboard(options: RunOptions): Promise<void> {
 	const report = await runPermissions(options);
 	const state = stateFor(options, config);
 	const telemetry = new InProcessTelemetrySource({report, state});
+	/*
+	The same instance the view reads: the Run Log a session appends to and the
+	one on screen have to be one object, or the block would show a run that
+	never did anything.
+	*/
+	const runLog = options.runLog ?? new InProcessRunLogSource();
 	const session = sessionFor(options, {
 		config,
 		state,
 		report,
 		logger,
+		runLog,
 		onFlush(attempt) {
 			telemetry.recordFlush(attempt);
 		},
@@ -470,6 +512,7 @@ async function runDashboard(options: RunOptions): Promise<void> {
 		await render({
 			history: source,
 			telemetry,
+			runLog,
 			timeZone: config.timeZone,
 			ended,
 		});
