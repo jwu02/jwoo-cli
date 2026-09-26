@@ -15,13 +15,12 @@ It owns the Push's timing too, and nothing else about it: a Drain is asked for
 after a Flush that landed and once as the run starts, and never waited on from
 the Flush path — a hanging Atlas must not delay the next local write, which is
 the write that matters (ADR-0012). What a Drain found is the Pusher's to report,
-and how much is still waiting for one is the store's: the count below is taken
-on the way out, because the store is closed by the time anyone outside the run
-could ask it.
+and how much is still waiting for one is the seam's to answer: the run ends by
+asking it to settle, which is the one Drain a run waits for, and the Shutdown's
+count is that answer rather than a second reading of the same backlog.
 */
 
 import process from 'node:process';
-import {type Era} from './store/local-store.js';
 import {type Snapshot, type TelemetryState} from './state.js';
 
 /*
@@ -50,20 +49,17 @@ export type EventStream = {
 };
 
 /*
-The Local Store, as the Session reaches for it: a Flush, the Push Backlog, and a
-close.
+The Local Store, as the Session reaches for it: a Flush and a close.
 
 Declared here rather than in `local-store.ts` for the reason the `EventStream`
 above is: the Session's job is owning a lifetime, and a module names only what it
 uses. A fake can stand in without a SQLite file behind it — which is the rule
 ADR-0012 leaves in place, a fake for every seam above the store.
 
-The Backlog is here rather than taken from the Pusher because it is a fact about
-the store and not about a Drain: a run whose Pusher was never built still has
-eras waiting, and a Drain that stopped at the first failure never saw most of
-what is behind it. It is the eras rather than a count because that is the query
-the store already answers — the one the Drains walk — and a second method
-counting the same rows would be a second thing to keep in step with it.
+The Push Backlog is deliberately not here. It is what the Pusher drains and what
+the Push seam answers about, so the Session learns about it the way it asks for a
+Drain — through the seam — rather than reaching past it into the store for a
+second, differently-timed count of the same rows.
 
 No Promise anywhere on it. `node:sqlite` has no promise in it and the store
 answers synchronously (ADR-0012), so saying otherwise here would be a pretence
@@ -75,12 +71,12 @@ time.
 */
 export type FlushStore = {
 	flush(snapshot: Snapshot): Date | undefined;
-	backlog(): readonly Era[];
 	close(): void;
 };
 
 /*
-The Push, as the Session reaches for it: a Drain, and a close.
+The Push, as the Session reaches for it: a Drain, the settle that ends a run, and
+a close.
 
 Narrow on purpose, as the `EventStream` is: the Session decides *when* a Drain is
 asked for and knows nothing about MongoDB. The `Pusher` in `push.ts` is one
@@ -88,6 +84,18 @@ implementation of this and the only real one.
 */
 export type Pusher = {
 	drain(): Promise<void>;
+	/*
+	The last Push a run makes, and what it leaves: a fresh awaited pass over the
+	Push Backlog — with any Drain already in flight waited out first, so the era
+	the final Flush wrote is in front of it — answering how many eras are still
+	unpushed.
+
+	This is where the Shutdown's count comes from, and it is the one Drain a run
+	waits for. Asked of the seam rather than read off the store afterwards
+	because the seam is what a Push is, and what it leaves is the only thing
+	that can be said about what is still owed.
+	*/
+	settle(): Promise<number>;
 	close(): Promise<void>;
 };
 
@@ -96,12 +104,18 @@ A Drain that failed is reported through its own attempt callback, so this is for
 the promise itself failing — which the Session must not let reach a Flush path,
 because it fires Drains without awaiting them and a rejection nobody holds ends
 the process.
+
+`ifBroken` is what the caller gets when the seam could not answer at all, and it
+is the caller's to choose because the two callers want different things from a
+seam that is down: a Drain fired off the Flush path has no use for an answer,
+and the one `settle()` is asking for a count.
 */
-async function settled(attempt: Promise<void>): Promise<void> {
+async function settled<T>(attempt: Promise<T>, ifBroken: T): Promise<T> {
 	try {
-		await attempt;
+		return await attempt;
 	} catch {
 		// Reported where the Push seam reports: through its attempt callback.
+		return ifBroken;
 	}
 }
 
@@ -118,11 +132,12 @@ export type Shutdown = {
 	readonly signal: NodeJS.Signals | undefined;
 	readonly finalFlush: boolean;
 	/*
-	How long the Push Backlog was when the store closed: a count rather than the
-	eras, because what a caller does with it is say how much is waiting. Counted
-	here because the store is the only thing that knows and it is about to be
-	closed — and reported to the caller rather than acted on, because a Push that
-	has not happened costs the website an era and never costs the CLI one.
+	How much was still waiting for a Push when the run ended: a count rather than
+	the eras, because what a caller does with it is say how much is waiting.
+	Answered by the Push seam, asked to settle once on the way out — the same
+	seam that carries the eras is the one that says what it could not carry — and
+	reported to the caller rather than acted on, because a Push that has not
+	happened costs the website an era and never costs the CLI one.
 	*/
 	readonly backlogLength: number;
 };
@@ -207,11 +222,13 @@ export type SessionOptions = {
 	readonly flushIntervalSeconds: number;
 	readonly shutdown: ShutdownSignal;
 	/*
-	Where the Flushed eras go from here. Absent is a run that never Pushes, which
-	is what a test that is not about the Push wants — the composition root always
-	supplies one (ADR-0012).
+	Where the Flushed eras go from here, and the seam that answers how much is
+	still waiting for one. Required rather than optional: a collecting run that
+	cannot Push is not a thing the composition root has ever built, and the
+	guards an absent Pusher would need are machinery for a case only a test could
+	reach (ADR-0012).
 	*/
-	readonly pusher?: Pusher;
+	readonly pusher: Pusher;
 	/*
 	Called after every Flush attempt, successful or not.
 
@@ -234,7 +251,7 @@ export class CollectionSession {
 	readonly #stream: EventStream | undefined;
 	readonly #intervalMs: number;
 	readonly #shutdown: ShutdownSignal;
-	readonly #pusher: Pusher | undefined;
+	readonly #pusher: Pusher;
 	readonly #onFlush: ((attempt: FlushAttempt) => void) | undefined;
 
 	#timer: NodeJS.Timeout | undefined;
@@ -256,20 +273,11 @@ export class CollectionSession {
 	be left waiting for a signal that is never coming.
 	*/
 	#endRun: (() => void) | undefined;
-	/*
-	The Drain in flight, if any.
-
-	Held because the last Drain on the way out has to be a fresh pass over the
-	backlog, and a pass that merely joined a Drain already running would never
-	look at the era the final Flush had just written. `stop()` waits this one out
-	first, and then asks for another.
-	*/
-	#drainInFlight: Promise<void> | undefined;
 	#finalFlush = false;
 	/*
-	What the last run of `stop()` counted, held for the same reason `#finalFlush`
-	is: a second call has to answer with the first run's outcome rather than
-	close a store that is already closed to find out.
+	What the Push seam answered when the last run of `stop()` settled it, held for
+	the same reason `#finalFlush` is: a second call has to answer with the first
+	run's outcome rather than ask a seam that has already been closed.
 	*/
 	#backlogLength = 0;
 
@@ -285,22 +293,22 @@ export class CollectionSession {
 	}
 
 	/*
-	Asks for a Drain and holds the promise, never awaiting it: the Flush path and
-	the start of a run both want the backlog moving and neither can afford to
-	wait on MongoDB to find out that it did.
+	Asks for a Drain and answers with nothing: the Flush path and the start of a
+	run both want the backlog moving and neither can afford to wait on MongoDB to
+	find out that it did — the promise is the Pusher's to hold, and the rejection
+	it might carry is swallowed where the seam reports, through its attempt
+	callback.
 
-	A Pusher is single-flight, so a call that lands while one is already running
+	Synchronous because of what it asks: the call itself has to happen in this
+	turn of the event loop, so that a Drain landing behind one already in flight
 	joins it rather than starting a second pass over the same eras.
-	*/
-	async #startDrain(): Promise<void> {
-		const pusher = this.#pusher;
-		if (pusher === undefined) {
-			return;
-		}
 
-		const attempt = settled(pusher.drain());
-		this.#drainInFlight = attempt;
-		return attempt;
+	That join rule is why the one Drain a run *does* wait for, the last one, is
+	asked for through `settle()` instead: it waits the in-flight pass out before
+	starting its own, and a pass asked for here would only have joined.
+	*/
+	#startDrain(): void {
+		void settled(this.#pusher.drain(), undefined);
 	}
 
 	/*
@@ -375,8 +383,14 @@ export class CollectionSession {
 	It answers with a plain boolean rather than a promise, as the store does: a
 	Flush that has returned has landed or it has failed, and there is no third
 	state for a caller to wait in.
+
+	`isFinal` marks the last Flush a run makes, which is the one that fires no
+	Drain: the era written below goes out on the fresh pass `settle()` runs on the
+	way out, so a Drain fired here could only be a second pass over the same
+	backlog — one more round trip before the run can end, for an era that was
+	already accounted for.
 	*/
-	#flush(): boolean {
+	#flush(isFinal = false): boolean {
 		if (!this.#state.hasActivity()) {
 			// Nothing to write is not a failure. The final Flush reports on
 			// counters left behind, and there are none.
@@ -400,16 +414,16 @@ export class CollectionSession {
 		this.#onFlush?.({at: new Date(), ok: isWritten, snapshot});
 
 		/*
-		Only after a Flush that landed: a failed one left its era unwritten, so
-		there is nothing new for a Drain to carry, and the backlog it would walk is
-		the one the last Drain already walked.
+		Only after a Flush that landed, and never after the last one: a failed Flush
+		left its era unwritten, so there is nothing new for a Drain to carry, and
+		the backlog it would walk is the one the last Drain already walked.
 
 		Not awaited, and that is the whole of ADR-0012's Flush rule: the write that
 		matters has already happened, and an Atlas that has gone away must not delay
 		the next one.
 		*/
-		if (isWritten) {
-			void this.#startDrain();
+		if (isWritten && !isFinal) {
+			this.#startDrain();
 		}
 
 		return isWritten;
@@ -417,7 +431,7 @@ export class CollectionSession {
 
 	/*
 	Runs until a signal arrives or `stop()` is called, then shuts down. The
-	returned promise resolves only once the final Flush, the last Drain attempt
+	returned promise resolves only once the final Flush, the Push seam's settle
 	and the closes have finished, so `await`ing it is a complete shutdown and not
 	merely the start of one — whichever of the two ended it.
 
@@ -450,7 +464,7 @@ export class CollectionSession {
 			has to fail does so under a run that is already collecting rather than
 			in front of a frame that is not up yet.
 			*/
-			void this.#startDrain();
+			this.#startDrain();
 		} catch (error: unknown) {
 			// Stops the Collectors that did start, closes the store, and lets the
 			// broken install reach the caller.
@@ -471,11 +485,17 @@ export class CollectionSession {
 	outcome on a second call, which is why the signal is missing from it: after
 	a SIGTERM, only `run()` can say which signal it was.
 
-	The order on the way out is the whole of it: the Drain in flight, the final
-	Flush, one last Drain attempt — awaited, because it is the last — then the
-	store and then the Mongo client. The store closes after the Drain because the
-	Drain reads it, and the client after the store because that is the order they
-	were opened in (ADR-0012).
+	The order on the way out is the whole of it: the final Flush, which fires no
+	Drain of its own, then one settle of the Push seam — awaited, because it is
+	the last Push this run makes — then the store and then the Mongo client. The
+	store closes after the settle because the settle reads it, and the client
+	after the store because that is the order they were opened in (ADR-0012).
+
+	Nothing is waited for *before* the Flush either, and nothing is asked for
+	after it: the Flush that fires no Drain is the final one, so the settle is
+	the only pass after it, and the wait that puts the in-flight Drain behind
+	that pass is `settle()`'s own — a fact about a Drain, and one this method no
+	longer keeps a copy of.
 
 	There is no in-flight Flush to wait for on the way in, and that is not an
 	omission: a Flush is a synchronous write, so an interval's has already landed
@@ -515,38 +535,25 @@ export class CollectionSession {
 			collector.stop();
 		}
 
-		/*
-		The Drain in flight is waited out before the final Flush, so that the Drain
-		the final Flush asks for is a fresh pass rather than a join. A pass that
-		merely joined the one already running would have read the backlog before the
-		era below existed, and that era would sit unpushed until the next run.
-
-		Waited, but not depended on: it is already swallowed, and the Flush below
-		is the write this whole shutdown exists for.
-		*/
-		if (this.#drainInFlight !== undefined) {
-			await this.#drainInFlight;
-		}
-
-		this.#finalFlush = this.#flush();
+		// The last Flush this run makes, and the one that fires no Drain.
+		this.#finalFlush = this.#flush(true);
 
 		/*
-		One last Drain, awaited, before the store closes — the store closes after
-		the Drain because the Drain reads it. Asked for rather than handed the one
-		the final Flush may have started: a Flush that failed started none, and a
-		backlog left over from earlier intervals still deserves the attempt.
-		*/
-		await this.#startDrain();
+		The Push seam is asked to settle, and this is the one Drain a run waits
+		for: a fresh pass over the backlog, carrying the era the Flush above just
+		wrote, with whatever was in flight before it waited out.
 
-		/*
-		Counted here, after the last Drain has had its say and while the store is
-		still open to answer: a Drain acknowledges the eras it carried, so counting
-		before it would report ground that has just been made up. This is the one
-		reading of the store the Session takes that is not a Flush, and it is taken
-		rather than left to the caller because the close below is the last moment it
-		can be — `backlog()` on a closed store is a driver error, not an answer.
+		Its answer is the Shutdown's count, and asking the seam is what makes the
+		count the right one: a Drain acknowledges the eras it carried, so a count
+		taken before the last pass would report ground the run then made up — and a
+		count taken after the store closed could not be taken at all.
+
+		A seam that could not answer leaves the count unknown, and unknown is
+		reported as nothing waiting rather than as a number nobody has: what the
+		Shutdown says about a backlog is the one report here that decides nothing,
+		and the Flush above has already landed.
 		*/
-		this.#backlogLength = this.#store.backlog().length;
+		this.#backlogLength = await settled(this.#pusher.settle(), 0);
 
 		/*
 		Called at most once, because a Flush that threw leaves the store unclosed
@@ -558,13 +565,10 @@ export class CollectionSession {
 		}
 
 		/*
-		The Mongo client goes last, after the store, because the Drain that just
+		The Mongo client goes last, after the store, because the settle that just
 		finished was reading the one and writing through the other.
 		*/
-		const pusher = this.#pusher;
-		if (pusher !== undefined) {
-			await pusher.close();
-		}
+		await this.#pusher.close();
 
 		/*
 		Last, so that whoever is awaiting `run()` is released with the same

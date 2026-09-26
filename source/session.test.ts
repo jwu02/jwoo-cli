@@ -10,7 +10,6 @@ import {
 	type ShutdownReason,
 	type ShutdownSignal,
 } from './session.js';
-import {type Era} from './store/local-store.js';
 import {TelemetryState} from './state.js';
 
 /*
@@ -51,12 +50,6 @@ class FakeStore implements FlushStore {
 	#failures: number;
 	readonly trace: string[];
 	readonly snapshots: Array<Record<string, unknown>> = [];
-	/*
-	The Push Backlog, which is a length here and nothing more: what a Drain does
-	with an era is `push.test.ts`'s business, and the Session asks only how much
-	is waiting.
-	*/
-	readonly waiting: Era[] = [];
 	closed = 0;
 
 	constructor(failures = 0, trace: string[] = []) {
@@ -77,39 +70,10 @@ class FakeStore implements FlushStore {
 		return new Date();
 	}
 
-	/*
-	Throws once closed, as the real one does — SQLite answers "database is not
-	open" — so a Session that counted the backlog after closing the store would
-	fail here rather than report a backlog of zero.
-	*/
-	backlog(): readonly Era[] {
-		if (this.closed > 0) {
-			throw new Error('database is not open');
-		}
-
-		this.trace.push('backlog');
-		return this.waiting;
-	}
-
 	close(): void {
 		this.closed += 1;
 		this.trace.push('store:close');
 	}
-}
-
-/*
-An era with nothing in it, because what one holds is not what these tests are
-about: the Session counts them.
-*/
-function era(stamp: number): Era {
-	return {
-		stamp: new Date(stamp),
-		leftClicks: 0,
-		rightClicks: 0,
-		movementMeters: 0,
-		pressTotal: 0,
-		keyCounts: {},
-	};
 }
 
 /*
@@ -127,6 +91,14 @@ class FakePusher implements Pusher {
 	readonly trace: string[];
 	passes = 0;
 	closed = 0;
+	/*
+	What the seam's settle answers with. A count set by the test rather than read
+	from anywhere, because that is the whole of what the Session asks of it — and
+	the point of the count living here is that the Session has nowhere else to get
+	one.
+	*/
+	settles = 0;
+	waiting = 0;
 	/*
 	A Drain the Pusher cannot carry out at all, which is not the same as one that
 	failed against the server: the seam itself is broken, and the promise rejects
@@ -160,6 +132,19 @@ class FakePusher implements Pusher {
 		await this.#inFlight;
 	}
 
+	/*
+	Shaped like the real one: the pass in flight waited out, then a pass of its
+	own, then the count. The wait is what makes `passes` here two rather than one
+	when something was already running.
+	*/
+	async settle(): Promise<number> {
+		this.settles += 1;
+		this.trace.push('settle');
+		await this.#inFlight;
+		await this.drain();
+		return this.waiting;
+	}
+
 	async close(): Promise<void> {
 		this.closed += 1;
 		this.trace.push('pusher:close');
@@ -171,19 +156,28 @@ type TestSession = {
 	readonly signal: FakeShutdownSignal;
 	readonly store: FakeStore;
 	readonly state: TelemetryState;
+	readonly pusher: FakePusher;
 };
 
+/*
+A Pusher is built whether a test asked for one or not, because a collecting run
+has one: the option is required, and the composition root has always supplied it.
+A test that does not care gets one that Drains into nothingness; the trace comes
+from the test when the ordering is what it is asserting.
+*/
 function build(options: Partial<SessionOptions> = {}): TestSession {
 	const store = (options.store as FakeStore | undefined) ?? new FakeStore();
 	const state = options.state ?? new TelemetryState();
 	const signal =
 		(options.shutdown as FakeShutdownSignal | undefined) ??
 		new FakeShutdownSignal();
+	const pusher = (options.pusher as FakePusher | undefined) ?? new FakePusher();
 
 	return {
 		store,
 		state,
 		signal,
+		pusher,
 		session: new CollectionSession({
 			store,
 			state,
@@ -191,7 +185,7 @@ function build(options: Partial<SessionOptions> = {}): TestSession {
 			stream: options.stream,
 			flushIntervalSeconds: options.flushIntervalSeconds ?? 300,
 			shutdown: signal,
-			pusher: options.pusher,
+			pusher,
 			onFlush: options.onFlush,
 		}),
 	};
@@ -394,34 +388,32 @@ What the run leaves behind. A Drain is best-effort, so a run can end with eras
 the website has not been given — a fact about the network rather than about the
 run, and the one thing a shutdown says that is not about this machine.
 
-Counted from the store rather than from the last Drain's report, because the
-two disagree exactly when it matters: a Drain that stopped at the first failure
-leaves everything it did not reach, and there is no Drain at all on a run whose
-Pusher was never built.
+The count is the Push seam's, which is what makes it the count after the last
+pass rather than the one before it: a Drain acknowledges the eras it carried, and
+a Drain that stopped at the first failure leaves everything it did not reach.
 */
-test('a shutdown reports the Push Backlog the store still holds', async t => {
-	const store = new FakeStore();
-	store.waiting.push(era(1), era(2), era(3));
-	const {session, signal} = build({store});
+test('a shutdown reports what the Push seam settled on', async t => {
+	const {session, signal, pusher} = build();
+	pusher.waiting = 3;
 
 	const running = session.run();
 	signal.fire('SIGTERM');
 	const shutdown = await running;
 
+	t.is(pusher.settles, 1, 'settled once, and once only');
 	t.is(shutdown.backlogLength, 3);
 });
 
 test('a run that emptied its backlog reports none waiting', async t => {
-	const store = new FakeStore();
-	const {session, signal} = build({store});
+	const {session, signal, pusher} = build();
 
 	const running = session.run();
 	signal.fire('SIGTERM');
 	const shutdown = await running;
 
+	t.is(pusher.settles, 1);
 	t.is(shutdown.backlogLength, 0);
 });
-
 test('Every Collector is started and stopped once', async t => {
 	const mouse = collector();
 	const keyboard = collector();
@@ -669,20 +661,25 @@ test('a Drain is asked for after a Flush that landed, and not after one that fai
 		'flush:failed',
 		'flush:ok',
 		'drain', // Asked for by the Flush that landed
-		'drain', // One last attempt on the way out
-		'backlog', // Counted after the last Drain, so it is what survived it
+		'settle', // And the seam's own pass on the way out, asked for once
+		'drain',
 		'store:close',
 		'pusher:close',
 	]);
+	t.is(pusher.passes, 3, 'the settled pass is a fresh one, not a join');
 });
 
 /*
 The order on the way out, which is the whole of ADR-0012's shutdown rule: the
-Drain in flight is waited out, the final Flush lands, one last Drain is asked
-for and awaited, and only then do the store and the Mongo client close — the
-store after the Drain because the Drain reads it.
+final Flush — which fires no Drain of its own — then the Push seam settling once,
+awaited, and only then the store and the Mongo client — the store after the
+settle because the settle reads it.
+
+The era the final Flush writes is the reason the settle is awaited and asked for
+as a settle: it is the only pass that is guaranteed to be looking at a backlog
+the Flush is already in.
 */
-test('the last Drain is awaited before the store and the client close', async t => {
+test('the settled Push is awaited before the store and the client close', async t => {
 	const trace: string[] = [];
 	const store = new FakeStore(0, trace);
 	const pusher = new FakePusher(trace);
@@ -694,15 +691,64 @@ test('the last Drain is awaited before the store and the client close', async t 
 	await running;
 
 	t.deepEqual(trace, [
-		'drain', // The startup backlog, which `stop()` waits out first
-		'flush:ok',
-		'drain', // Asked for by the final Flush, and awaited before anything closes
-		'backlog', // And counted while the store is still open to answer
+		'drain', // The startup backlog, in flight as the signal arrives
+		'flush:ok', // The final Flush, which fires no Drain
+		'settle', // The last Push of the run
+		'drain',
 		'store:close',
 		'pusher:close',
 	]);
 	t.is(store.closed, 1);
 	t.is(pusher.closed, 1);
+});
+
+/*
+The wait a signal must not cut short. A Drain that is mid-pass when the run ends
+is still a pass that has to finish before the last one starts — otherwise the
+settle's own pass joins it, reads a backlog the final Flush has already added to,
+and the era it wrote waits for the next run.
+*/
+test('a signal mid-Drain is waited out before the settled pass', async t => {
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>(resolve => {
+		release = () => {
+			resolve();
+		};
+	});
+	const trace: string[] = [];
+	const store = new FakeStore(0, trace);
+	const pusher = new FakePusher(trace, async () => gate);
+	const {session, signal, state} = build({store, pusher});
+	state.addLeftClick();
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+
+	let isEnded = false;
+	void running.then(() => {
+		isEnded = true;
+	});
+	await delay(5);
+
+	t.false(isEnded, 'the run is still waiting on the Drain in flight');
+	t.deepEqual(
+		trace,
+		['drain', 'flush:ok', 'settle'],
+		'and has asked for nothing else',
+	);
+
+	release?.();
+	const shutdown = await running;
+
+	t.true(shutdown.finalFlush);
+	t.deepEqual(trace, [
+		'drain',
+		'flush:ok',
+		'settle',
+		'drain', // The settled pass, run only once the Drain above finished
+		'store:close',
+		'pusher:close',
+	]);
 });
 
 /*

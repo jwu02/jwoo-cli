@@ -42,9 +42,17 @@ merely unreachable (ADR-0012).
 **The Push is a Drain over the store's backlog, and never a wait on the Flush path.** The
 backlog is the store's own query (`pushed_at IS NULL ORDER BY stamp`), walked oldest era first
 and stopped at the first failure so it stays a tail rather than a scatter of holes. One Drain
-fires as the run starts and one after each successful Flush, and neither is awaited: a hanging
-Atlas must not delay the next local write. What a Drain found reaches the Run Log through the
-same callback shape a Flush attempt does.
+fires as the run starts and one after each successful Flush — the last Flush of a run fires
+none — and no ordinary Drain is awaited: a hanging Atlas must not delay the next local write.
+What a Drain found reaches the Run Log through the same callback shape a Flush attempt does.
+
+**The one Drain a run waits for is the seam's own `settle()`.** A run ends by asking the Push
+seam to settle once: it waits out any Drain in flight, runs a fresh awaited pass over the
+backlog — so the era the final Flush wrote is in front of it — and answers how many eras are
+still unpushed. That answer is the Shutdown's `backlogLength`, and the final Flush fires no
+Drain of its own, so the sequencing that used to live in `CollectionSession.stop()` — waiting
+the in-flight pass out, asking for one more, then counting the store afterwards — is the seam's
+to do and is stated once, in `push.ts`.
 
 ## Seams, and no database server in the test suite
 
@@ -164,18 +172,20 @@ grant produces counters that are zero in exactly the way a machine nobody has to
 the user who has just granted the permission is the one who cannot tell them apart.
 
 `session.ts` is where the Flush Interval and the final Flush live. `run()` resolves only once the
-final Flush and the close have finished — awaiting it is a complete shutdown, not the start of
-one. The signal listeners are released _after_ the run rather than inside the handler, so a
-second Ctrl-C cannot cut a Flush short. The shutdown source is injectable: `processSignal` is the
-real one and the only place `process.on` is called; a test raises a signal through a fake.
+final Flush, the Push seam's settle and the closes have finished — awaiting it is a complete
+shutdown, not the start of one. The signal listeners are released _after_ the run rather than
+inside the handler, so a second Ctrl-C cannot cut a Flush short. The shutdown source is
+injectable: `processSignal` is the real one and the only place `process.on` is called; a test
+raises a signal through a fake.
 
 **The Flush write is honest-sync, and there is no in-flight Flush to wait for.** `FlushStore`
-carries no Promise on any of its three methods, because `node:sqlite` has none: an interval's
-Flush has already landed or already failed by the time anything can ask the run to end, so a
-final Flush cannot snapshot the same uncleared counters and write them twice. The ordering
-`stop()` owns: the Drain already in flight waited out, then the final Flush, then the awaited
-last Drain, then the backlog counted while the store can still answer it, then a synchronous
-store close and the Mongo client's. `Shutdown.finalFlush` reports whether the counters actually
+carries a Flush and a close and no Promise on either, because `node:sqlite` has none: an
+interval's Flush has already landed or already failed by the time anything can ask the run to
+end, so a final Flush cannot snapshot the same uncleared counters and write them twice. The
+ordering `stop()` owns: the final Flush, which fires no Drain of its own, then the Push seam
+settled once and awaited — the seam waits out the Drain in flight before its own fresh pass, and
+its answer is the `backlogLength` — then a synchronous store close and the Mongo client's.
+`Shutdown.finalFlush` reports whether the counters actually
 made it, and the run resolves with that value rather than acting on it: `cli.tsx` sets a
 non-zero exit code when they did not, because a shell reads the exit code and not the log, and
 because a process-wide value written from inside a run would end any caller that was not the

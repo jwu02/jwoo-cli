@@ -214,6 +214,17 @@ class FakePusher implements Pusher {
 		);
 	}
 
+	/*
+	The run's last Push. Nothing here reaches MongoDB, so what it leaves is what
+	the store was already holding — which is what the composition root's Shutdown
+	report is drawn from, and why the eras a test wants stranded are put in the
+	store rather than in this.
+	*/
+	async settle(): Promise<number> {
+		await this.drain();
+		return this.backlogs[0]?.backlog().length ?? 0;
+	}
+
 	async close(): Promise<void> {
 		if (this.closed === 0) {
 			this.closed += 1;
