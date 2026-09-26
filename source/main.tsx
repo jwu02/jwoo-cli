@@ -6,6 +6,12 @@ builds the `MongoClient` — and the only place the Local Store is opened. It ow
 both lifetimes and closes them on every path, because a client left open keeps
 the process alive after the work has finished.
 
+There is one run skeleton, and the commands that collect differ from each other
+by a **mode**: one value carrying where their reports go and how their run ends.
+`collect` and the dashboard are the two modes. A mode is not a command —
+`permissions` answers a question and never opens a Session, so it is a command
+with no mode at all.
+
 The Local Store is opened before the preflight and before anything is drawn, and
 that order is the whole of ADR-0012's fail-fast rule: it is the one write a Flush
 is required to reach, so a store that cannot be opened is a run that would spend
@@ -521,7 +527,7 @@ async function closeRun({store, pusher}: RunDeps): Promise<void> {
 }
 
 /*
-The Session, built the same way whichever command asked for one.
+The Session, built the same way whichever mode asked for one.
 
 A missing grant degrades collection rather than stopping the CLI: the factory is
 given the report and builds only what it allows, and whatever it does build
@@ -540,9 +546,7 @@ function sessionFor(
 		runLog,
 		store,
 		pusher,
-		problemReporter,
-		helperStderr,
-		onFlush,
+		hooks,
 	}: {
 		readonly config: Config;
 		readonly state: TelemetryState;
@@ -556,25 +560,7 @@ function sessionFor(
 		*/
 		readonly store: RunStore;
 		readonly pusher: Pusher;
-		/*
-		Where the helper's problems go on a run whose caller supplied no reporter
-		of its own. Left out by `collect`, which keeps the stderr reporter it has
-		always had; the dashboard appends entries instead, because the frame is
-		the only output there.
-		*/
-		readonly problemReporter?: (problem: StreamProblem) => void;
-		/*
-		Where the helper's own diagnostics go, on the same terms: left out by
-		`collect`, which passes them through to the terminal it always has, and a
-		sink that drops them in dashboard mode, where a line arriving mid-draw
-		corrupts the frame (ADR-0010).
-		*/
-		readonly helperStderr?: (chunk: string) => void;
-		/*
-		Whatever else wants to hear about a Flush, which is the live view — the
-		one observer whose counters depend on whether the write landed.
-		*/
-		readonly onFlush?: (attempt: FlushAttempt) => void;
+		readonly hooks: SessionHooks;
 	},
 ): CollectionSession {
 	/*
@@ -585,8 +571,8 @@ function sessionFor(
 	*/
 	const factoryOptions: CollectorFactoryOptions = {
 		...options,
-		onProblem: options.onProblem ?? problemReporter,
-		onHelperStderr: options.onHelperStderr ?? helperStderr,
+		onProblem: options.onProblem ?? hooks.problemReporter,
+		onHelperStderr: options.onHelperStderr ?? hooks.helperStderr,
 	};
 	const setup = (options.collectors ?? defaultCollectorFactory(factoryOptions))(
 		report,
@@ -609,69 +595,317 @@ function sessionFor(
 		*/
 		onFlush(attempt) {
 			runLog.append(flushEntry(attempt));
-			onFlush?.(attempt);
+			hooks.onFlush?.(attempt);
 		},
 	});
 }
 
 /*
-The Push seam's warnings, as Run Log entries.
+The Session's mode-specific half, as `sessionFor` takes it.
 
-A logger rather than a reporter, because a logger is the shape the seam offers
-and it is not the seam's business whether there is a frame to keep quiet. What
-it raises through one is a TTL index it could not create — raised as it is
-built, before any Flush has happened — and in dashboard mode that is an entry
-rather than a line of stderr in the middle of the drawing (ADR-0010).
-
-The extra arguments a warning was given are kept, because they are where a
-driver's error travels.
+Every field is optional, and a mode that leaves one out is a mode saying "the
+default": `collect` leaves the problem reporter and the helper's stderr out and
+keeps the stderr the CLI has always had, while the dashboard supplies both.
 */
-function pushLoggerFor(runLog: InProcessRunLogSource): Pick<Console, 'warn'> {
+type SessionHooks = {
+	/*
+	Where the helper's problems go on a run whose caller supplied no reporter of
+	its own — the dashboard appends entries, because the frame is the only output
+	there.
+	*/
+	readonly problemReporter?: (problem: StreamProblem) => void;
+	/*
+	Where the helper's own diagnostics go, on the same terms: a sink that drops
+	them under a frame, where a line arriving mid-draw corrupts the drawing
+	(ADR-0010).
+	*/
+	readonly helperStderr?: (chunk: string) => void;
+	/*
+	Whatever else wants to hear about a Flush, which is the live view — the one
+	observer whose counters depend on whether the write landed.
+	*/
+	readonly onFlush?: (attempt: FlushAttempt) => void;
+};
+
+/*
+What a mode answers at each point the skeleton reaches one. Three stages rather
+than one flat shape, because the lifecycle decides what exists when: the sinks
+are needed to open the store, before the preflight has been asked; the hooks are
+built *from* the preflight's report and the Telemetry State, which do not exist
+until after it; and the completion step needs the Session, which is last of all.
+A mode built in one piece could only guess at what the later stages know.
+
+`Carried` is whatever a mode builds in its hooks and needs again in its
+completion step — the dashboard's Telemetry Source, which is built from the
+report and the state and is then one of the sources the frame draws. The
+skeleton hands it back and never looks at it.
+*/
+type RunMode<Carried> = {
+	readonly sinks: RunSinks;
+	readonly hooks: (
+		report: PermissionReport,
+		state: TelemetryState,
+	) => ModeSetup<Carried>;
+	readonly complete: (
+		session: CollectionSession,
+		deps: RunDeps,
+		carried: Carried,
+	) => Promise<Shutdown>;
+};
+
+/*
+What the hooks stage hands back: what the Session is built with, and what the
+completion step will be handed later.
+*/
+type ModeSetup<Carried> = {
+	readonly session: SessionHooks;
+	readonly carried: Carried;
+};
+
+/*
+What a factory is handed: the run's own values, read once by the skeleton. The
+mode is built per run rather than being a constant, because closing over these
+is what lets a stage say where its reports go without being told again.
+*/
+type RunFacts = {
+	readonly options: RunOptions;
+	readonly config: Config;
+	readonly runLog: InProcessRunLogSource;
+	readonly logger: Logger;
+};
+
+type RunModeFactory<Carried> = (facts: RunFacts) => RunMode<Carried>;
+
+/*
+The headless mode, in which every report goes to the terminal.
+
+The Push seam's warnings keep stderr, which is where a headless run reports: the
+run's own logger is for the run's own report, and a TTL index the server would
+not create is the seam's. Its Drain attempts go the other way — through the run's
+logger, because they are sentences about this run rather than about the seam —
+and both are stderr in a real one. The read face's warnings go the same way, and
+are unreachable here: `collect` draws no history, so nothing asks the store a
+question — the default is what a run that never reads keeps.
+
+Nothing is carried: a headless run has no view to hand anything to.
+*/
+function collectMode({logger}: RunFacts): RunMode<undefined> {
 	return {
-		warn(message: string, ...extra: unknown[]) {
-			runLog.append(pushWarningEntry(message, extra, new Date()));
+		sinks: {
+			logger: console,
+			onReadWarning: defaultReadWarningReporter,
+			/*
+			What a Drain attempt says on the terminal: what the entry holds. There
+			is one spelling of what a Push did, and this is that spelling going
+			somewhere else — which is the whole of the difference between the two
+			modes, and the reason the destination is the run's own logger rather
+			than the console.
+
+			The whole text rather than the summary, and the difference only shows
+			when a driver's message ran to more than one line: folding one is the
+			block's business, where an entry gets a single row, and a `collect` run
+			has no block and no diagnostics view — so the sentence alone would
+			leave the rest of what the driver said nowhere at all. A one-line
+			message is its own full text, and prints once.
+			*/
+			onPushAttempt(attempt) {
+				const entry = pushEntry(attempt);
+				if (entry !== undefined) {
+					logger.warn(entry.detail);
+				}
+			},
+		},
+		hooks: () => ({
+			session: {
+				/*
+				A headless run has no frame to keep whole, so a Flush that failed is
+				a line on stderr. It is said from the attempt the Session reports
+				rather than by the Session or the store, because this is the one
+				place that knows which mode it is answering (ADR-0010).
+
+				A failed *final* Flush is then warned about twice — here, and once
+				more by `reportShutdown` — which is the shape this has always had,
+				and the two lines say different things: one that the write failed,
+				the other that the counters were lost with it.
+				*/
+				onFlush(attempt) {
+					if (!attempt.ok) {
+						logger.warn('Flush failed; counters will retry on the next Flush');
+					}
+				},
+			},
+			carried: undefined,
+		}),
+		async complete(session) {
+			return session.run();
 		},
 	};
 }
 
 /*
-Each Drain attempt, as the dashboard records it.
+The mode the dashboard runs in: every report becomes a Run Log entry, because
+the frame is the only output (ADR-0010). Nothing writes to stderr while it is
+up: Ink draws by overwriting the lines it last drew, so a line landing mid-draw
+leaves the rest of the frame off by one from where Ink thinks it is.
 
-`pushEntry` answers `undefined` for the attempt that is not worth a line — one
-era, the steady state — and what it does answer with is appended here rather
-than by the seam, which cannot know whether there is a frame to draw it in
-(ADR-0010).
+What it carries is the Telemetry Source, built here from the report and the
+state so that the live view and the Session's Flush reports are two ends of one
+object — a source the view drew and no Flush ever reached would show counters
+that never move.
 */
-function pushEntriesFor(
-	runLog: InProcessRunLogSource,
-): (attempt: PushAttempt) => void {
-	return attempt => {
-		const entry = pushEntry(attempt);
-		if (entry !== undefined) {
-			runLog.append(entry);
-		}
-	};
-}
+function dashboardMode({
+	options,
+	config,
+	runLog,
+}: RunFacts): RunMode<InProcessTelemetrySource> {
+	return {
+		sinks: {
+			/*
+			The Push seam's warnings, as entries. A logger rather than a reporter,
+			because a logger is the shape the seam offers and it is not the seam's
+			business whether there is a frame to keep quiet. What it raises
+			through one is a TTL index it could not create — raised as it is
+			built, before any Flush has happened — and under a frame that is an
+			entry rather than a line of stderr in the middle of the drawing.
 
-/*
-The same attempt, as a headless run reports it: what the entry holds, on the
-terminal. There is one spelling of what a Push did, and this is that spelling
-going somewhere else — which is the whole of the difference between the two
-modes, and the reason this takes a logger rather than reaching for the console
-itself.
+			The extra arguments a warning was given are kept, because they are
+			where a driver's error travels.
+			*/
+			logger: {
+				warn(message: string, ...extra: unknown[]) {
+					runLog.append(pushWarningEntry(message, extra, new Date()));
+				},
+			},
+			/*
+			The read face's warnings become entries, as the helper's do and for
+			the same reason: the dashboard lands on the history view, and the
+			sentence a failed read carries is a fact about this run rather than
+			about the range on screen. The view draws a pointer and the log holds
+			the whole of it — drawn in both places it would be one failure said
+			twice, one of them across the frame.
+			*/
+			onReadWarning(warning) {
+				runLog.append(historyEntry(warning, new Date()));
+			},
+			/*
+			Each Drain attempt, as the dashboard records it. `pushEntry` answers
+			`undefined` for the attempt that is not worth a line — one era, the
+			steady state — and what it does answer with is appended here rather
+			than by the seam, which cannot know whether there is a frame to draw
+			it in (ADR-0010).
+			*/
+			onPushAttempt(attempt) {
+				const entry = pushEntry(attempt);
+				if (entry !== undefined) {
+					runLog.append(entry);
+				}
+			},
+		},
+		hooks(report, state) {
+			const telemetry = new InProcessTelemetrySource({report, state});
 
-The whole text rather than the summary, and the difference only shows when a
-driver's message ran to more than one line: folding one is the block's business,
-where an entry gets a single row, and a `collect` run has no block and no
-diagnostics view — so the sentence alone would leave the rest of what the driver
-said nowhere at all. A one-line message is its own full text, and prints once.
-*/
-function pushSentencesFor(logger: Logger): (attempt: PushAttempt) => void {
-	return attempt => {
-		const entry = pushEntry(attempt);
-		if (entry !== undefined) {
-			logger.warn(entry.detail);
-		}
+			return {
+				session: {
+					/*
+					The helper's problems become entries rather than lines of
+					stderr, which would land in the middle of the frame. Appended
+					here and not in a view: an entry is a fact about the run, and
+					the block polls what it finds.
+					*/
+					problemReporter(problem) {
+						runLog.append(helperEntry(problem, new Date()));
+					},
+					/*
+					The helper's other output goes nowhere at all. Its notes — a
+					tap re-enabled, the listener announcing itself — are written
+					to stderr for a terminal to read, and a frame has no room for
+					them. Nothing that matters goes with them: a statement about
+					collection arrives as an event on stdout, and those become
+					entries.
+					*/
+					helperStderr: noop,
+					/*
+					The last leg of the live totals: the Session reports each
+					Flush attempt and the source is what folds a successful one
+					in. Without it the view draws counters that never move.
+					*/
+					onFlush(attempt) {
+						telemetry.recordFlush(attempt);
+					},
+				},
+				carried: telemetry,
+			};
+		},
+		/*
+		The dashboard's choreography, which is what it does instead of waiting on
+		`run()`: the view goes up over a run that has already started, and comes
+		down before the Shutdown is reported.
+		*/
+		async complete(session, deps, telemetry) {
+			/*
+			A statement rather than `options.renderApp ?? (await import(...)).renderApp`,
+			which would import ink on every path — including the one where the
+			caller supplied a renderer precisely so that it would not.
+			*/
+			let render = options.renderApp;
+			if (render === undefined) {
+				({renderApp: render} = await import('./views/tui.js'));
+			}
+
+			/*
+			When the run began: the instant before the Session starts the
+			Collectors, which is the moment the live view's totals count from.
+			Taken here, next to the call that begins the run, so it is that
+			instant rather than whenever a frame happened to be drawn — a
+			dashboard that opens slowly still says when the run it is drawing
+			began.
+			*/
+			const startedAt = new Date();
+
+			/*
+			Started before the view is mounted, so the counters are already moving
+			by the time the first frame is drawn.
+			*/
+			const running = session.run();
+
+			/*
+			`run()`, saying only *that* it ended rather than how. The view has to
+			come down when a signal ends the run, and the rejection has to be
+			claimed here or a Collector that could not start would end the process
+			outright, before the caller can report it as the failure it is.
+			*/
+			const ended = running.then(noop).catch(noop);
+
+			try {
+				await render({
+					/*
+					The store itself, and not a reader beside it: the history view
+					reads what the Flush wrote, and one object is what makes that
+					the same file rather than two that have to be kept in step
+					(ADR-0012).
+					*/
+					history: deps.store,
+					telemetry,
+					runLog,
+					timeZone: config.timeZone,
+					startedAt,
+					ended,
+				});
+			} finally {
+				/*
+				Stopped rather than left to a signal: `q` arrives as input in a
+				raw-mode terminal and never generates one, so this is the only
+				thing that knows the view has gone.
+
+				Nothing closes the reader here. The store the view was reading is
+				the one `stop()` closes, after the final Flush has landed — which
+				is the order it has to be, since the Flush is what the view reads.
+				*/
+				await session.stop();
+			}
+
+			return running;
+		},
 	};
 }
 
@@ -724,66 +958,6 @@ function reportShutdown(
 	);
 }
 
-async function runCollect(options: RunOptions): Promise<void> {
-	const logger = options.logger ?? console;
-	const config = options.config ?? loadConfig();
-	const runLog = options.runLog ?? new InProcessRunLogSource();
-	/*
-	The store is opened here, before the preflight and before anything else, and
-	a store that will not open ends the run on this line — with SQLite's own
-	sentence, printed by the entry point, and not a frame drawn (ADR-0012).
-
-	The Push seam's warnings keep the terminal, which is where a headless run
-	reports: the run's own logger is for the run's own report, and a TTL index
-	the server would not create is the seam's. Its Drain attempts go the other
-	way — through the run's logger, because they are sentences about this run
-	rather than about the seam — and both are stderr in a real one. The read
-	face's warnings go the same way, and are unreachable here: `collect` draws no
-	history, so nothing asks the store a question — the default is what a run
-	that never reads keeps.
-	*/
-	const deps = openRun(options, config, {
-		logger: console,
-		onReadWarning: defaultReadWarningReporter,
-		onPushAttempt: pushSentencesFor(logger),
-	});
-
-	try {
-		const report = await preflightWithLog(options, runLog);
-		const session = sessionFor(options, {
-			config,
-			state: stateFor(options, config),
-			report,
-			runLog,
-			...deps,
-			/*
-			A headless run has no frame to keep whole, so a Flush that failed is a
-			line on stderr. It is said from the attempt the Session reports rather
-			than by the Session or the store, because this is the one place that
-			knows which command it is answering (ADR-0010).
-
-			A failed *final* Flush is then warned about twice — here, and once more
-			by `reportShutdown` below — which is the shape this has always had, and
-			the two lines say different things: one that the write failed, the other
-			that the counters were lost with it.
-			*/
-			onFlush(attempt) {
-				if (!attempt.ok) {
-					logger.warn('Flush failed; counters will retry on the next Flush');
-				}
-			},
-		});
-
-		reportShutdown(await session.run(), logger);
-	} finally {
-		/*
-		On every path, and not only the happy one: the Session closes both at the
-		end of a run, and this catches the run that never got that far.
-		*/
-		await closeRun(deps);
-	}
-}
-
 /*
 The preflight, and the entry it leaves in the Run Log.
 
@@ -817,154 +991,53 @@ async function preflightWithLog(
 }
 
 /*
-The TUI, which collects while it is open. The alternative — a dashboard that
-draws counters nothing is counting into — is a view that is empty by
-construction, and `collect` is already the way to run without a dashboard.
+One run, whichever mode asked for it: open, preflight, session, complete,
+report, close.
 
-Every source the frame draws is built here and handed down rather than
-constructed inside a component, because they are lifetimes: the store is opened
-once and closed once, and a view that made its own would have nothing to close
-it with.
+The order is the whole of what the two flows used to state twice. The store is
+opened first and it throws from there rather than from anywhere later — ADR-0012's
+fail-fast rule, and the first thing any run does. Nothing is drawn until it has
+opened, which is what keeps a store that cannot be opened quiet as well as early.
+Both lifetimes are closed on every path, including the ones a run never reached.
 
-`tui.js` is reached through a dynamic import rather than a static one, and that
-is load-bearing rather than tidy: it is the module that pulls in ink and react,
-and `collect` must not load either (ADR-0001).
+Nothing here says which command is running. What differs between the two is the
+mode, and the mode is the only thing this function is told about.
 */
-async function runDashboard(options: RunOptions): Promise<void> {
+async function runCollection<Carried>(
+	options: RunOptions,
+	createMode: RunModeFactory<Carried>,
+): Promise<void> {
 	const logger = options.logger ?? console;
 	const config = options.config ?? loadConfig();
 	/*
-	The same instance the view reads, because the log the wiring appends to and
-	the one on screen have to be one object — or the block would show a run that
-	never did anything.
-
-	Built before the store, because the store's Push warnings become entries in
-	it — and before the preflight for the reason `preflightWithLog` gives.
+	The Run Log the view reads and the wiring appends to is one object, or the
+	block would show a run that never did anything. Built before the store,
+	because the store's Push warnings become entries in it — and before the
+	preflight for the reason `preflightWithLog` gives.
 	*/
 	const runLog = options.runLog ?? new InProcessRunLogSource();
-	/*
-	Opened before the preflight and before the frame, and a store that will not
-	open ends the run on this line with nothing drawn (ADR-0012).
-
-	The read face's warnings become entries, as the helper's do and for the same
-	reason: the dashboard lands on the history view, and the sentence a failed
-	read carries is a fact about this run rather than about the range on screen.
-	The view draws a pointer and the log holds the whole of it — drawn in both
-	places it would be one failure said twice, one of them across the frame.
-
-	The reporter is settled here, before the store exists, because it is settled
-	*by* the store's construction: the seam reports a failed read as it answers
-	one, so where its reports go has to be known by the time it is built.
-	*/
-	const deps = openRun(options, config, {
-		logger: pushLoggerFor(runLog),
-		onPushAttempt: pushEntriesFor(runLog),
-		onReadWarning(warning) {
-			runLog.append(historyEntry(warning, new Date()));
-		},
-	});
+	const mode = createMode({options, config, runLog, logger});
+	const deps = openRun(options, config, mode.sinks);
 
 	try {
-		/*
-		The dashboard runs the same preflight `collect` does, and it is not only
-		for the Collectors: the report is what lets the live view say "collection
-		is disabled" rather than draw zeroes, which are the same numbers and not
-		the same thing.
-		*/
 		const report = await preflightWithLog(options, runLog);
 		const state = stateFor(options, config);
-		const telemetry = new InProcessTelemetrySource({report, state});
+		const setup = mode.hooks(report, state);
 		const session = sessionFor(options, {
 			config,
 			state,
 			report,
 			runLog,
 			...deps,
-			/*
-			The helper's problems become entries rather than lines of stderr, which
-			would land in the middle of the frame. Appended here and not in a view:
-			an entry is a fact about the run, and the block polls what it finds.
-			*/
-			problemReporter(problem) {
-				runLog.append(helperEntry(problem, new Date()));
-			},
-			/*
-			The helper's other output goes nowhere at all. Its notes — a tap
-			re-enabled, the listener announcing itself — are written to stderr for a
-			terminal to read, and a frame has no room for them: Ink draws by
-			overwriting the lines it last drew, so a line landing mid-draw leaves the
-			rest of the frame off by one from where Ink thinks it is. Nothing that
-			matters goes with it — a statement about collection arrives as an event
-			on stdout, and those become entries.
-			*/
-			helperStderr: discardHelperStderr,
-			onFlush(attempt) {
-				telemetry.recordFlush(attempt);
-			},
+			hooks: setup.session,
 		});
 
-		/*
-		A statement rather than `options.renderApp ?? (await import(...)).renderApp`,
-		which would import ink on every path — including the one where the caller
-		supplied a renderer precisely so that it would not.
-		*/
-		let render = options.renderApp;
-		if (render === undefined) {
-			({renderApp: render} = await import('./views/tui.js'));
-		}
-
-		/*
-		When the run began: the instant before the Session starts the Collectors,
-		which is the moment the live view's totals count from. Taken here, next to
-		the call that begins the run, so it is that instant rather than whenever a
-		frame happened to be drawn — a dashboard that opens slowly still says when
-		the run it is drawing began.
-		*/
-		const startedAt = new Date();
-
-		/*
-		Started before the view is mounted, so the counters are already moving by the
-		time the first frame is drawn.
-		*/
-		const running = session.run();
-
-		/*
-		`run()`, saying only *that* it ended rather than how. The view has to come
-		down when a signal ends the run, and the rejection has to be claimed here or
-		a Collector that could not start would end the process outright, before the
-		`await` below can report it as the failure it is.
-		*/
-		const ended = running.then(noop).catch(noop);
-
-		try {
-			await render({
-				/*
-				The store itself, and not a reader beside it: the history view reads
-				what the Flush wrote, and one object is what makes that the same file
-				rather than two that have to be kept in step (ADR-0012).
-				*/
-				history: deps.store,
-				telemetry,
-				runLog,
-				timeZone: config.timeZone,
-				startedAt,
-				ended,
-			});
-		} finally {
-			/*
-			Stopped rather than left to a signal: `q` arrives as input in a raw-mode
-			terminal and never generates one, so this is the only thing that knows the
-			view has gone.
-
-			Nothing closes the reader here any more. The store the view was reading is
-			the one `stop()` closes, after the final Flush has landed — which is the
-			order it has to be, since the Flush is what the view reads.
-			*/
-			await session.stop();
-		}
-
-		reportShutdown(await running, logger);
+		reportShutdown(await mode.complete(session, deps, setup.carried), logger);
 	} finally {
+		/*
+		On every path, and not only the happy one: the Session closes both at the
+		end of a run, and this catches the run that never got that far.
+		*/
 		await closeRun(deps);
 	}
 }
@@ -972,19 +1045,12 @@ async function runDashboard(options: RunOptions): Promise<void> {
 /*
 A no-op rather than an arrow, because the lint rule that forbids an empty
 function body is the point: there is genuinely nothing to do here, and one name
-says so once.
+says so. It has two call sites, and each is deliberate: the helper's stderr,
+which has nowhere to go under a frame, and the promise that says only *that* the
+run ended, whose rejection the caller reports.
 */
 function noop(): void {
-	// See the call site: the failure is reported by `await running`, not here.
-}
-
-/*
-A sink that drops what it is handed, for the one caller that wants one: the
-helper's stderr under a frame. Named rather than an arrow for the same reason
-`noop` is — an empty body is the intent here, and a name is what says so.
-*/
-function discardHelperStderr(): void {
-	// See the call site: the helper's notes have nowhere to go under a frame.
+	// See the call sites: nothing to do, on purpose, in both places.
 }
 
 export async function run(
@@ -993,11 +1059,11 @@ export async function run(
 ): Promise<void> {
 	switch (command.kind) {
 		case 'dashboard': {
-			return runDashboard(options);
+			return runCollection(options, dashboardMode);
 		}
 
 		case 'collect': {
-			return runCollect(options);
+			return runCollection(options, collectMode);
 		}
 
 		case 'permissions': {
