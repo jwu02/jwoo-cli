@@ -208,8 +208,8 @@ function sumOf(
 
 /*
 Records warnings for assertions without echoing them, so an expected warning
-does not clutter the test output — the same job `storage.test.ts`'s
-`FakeLogger` does for the write seam. The default reporter writes to stderr,
+does not clutter the test output — the same job `push.test.ts`'s
+`FakeLogger` does for the Push seam. The default reporter writes to stderr,
 which is right for a run and wrong for a suite that is deliberately provoking
 the failure.
 */

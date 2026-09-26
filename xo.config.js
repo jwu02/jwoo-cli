@@ -61,4 +61,15 @@ export default [
 			'@typescript-eslint/naming-convention': 'off',
 		},
 	},
+	{
+		/*
+		The Push writes a Key Count Document whose fields are Key Labels
+		themselves, so this test builds eras holding `A` and `Return` — the wire
+		format the website reads, spelled the way it is on the wire (ADR-0004).
+		*/
+		files: ['source/push.test.ts'],
+		rules: {
+			'@typescript-eslint/naming-convention': 'off',
+		},
+	},
 ];

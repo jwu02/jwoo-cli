@@ -21,7 +21,7 @@ import {type Range} from './ranges.js';
 Fakes
 -----
 An in-memory stand-in for the slice of the driver this reader touches, in the
-same spirit as `storage.test.ts`. `aggregate` is synchronous because the
+same spirit as `push.test.ts`. `aggregate` is synchronous because the
 driver's is — the `await` belongs on `toArray()` — and a fake that returned a
 promise would let a reader that forgot to call `toArray()` pass every test here
 while fetching nothing against a real server.

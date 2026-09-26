@@ -1,7 +1,7 @@
 /*
 The history seam, read from MongoDB.
 
-The mirror of `storage.ts` on the read side. Everything that knows about
+The mirror of `push.ts` on the read side. Everything that knows about
 MongoDB lives behind `HistorySource`, so the view can be rendered from a fake
 and no test needs a running database. The narrowed driver types follow the same
 rule as the store's: each module declares only the slice it actually calls, and

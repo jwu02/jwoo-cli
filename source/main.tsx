@@ -1,9 +1,17 @@
 /*
 What each subcommand does.
 
-The composition root, and the only place a `MongoClient` is built. It owns the
-client's lifetime and closes it on every path, because a client left open keeps
-the process alive after the work has finished.
+The composition root, and the only place a `MongoClient` is built — inside the
+Pusher — and the only place the Local Store is opened. It owns both lifetimes and
+closes them on every path, because a client left open keeps the process alive
+after the work has finished.
+
+The Local Store is opened before the preflight and before anything is drawn, and
+that order is the whole of ADR-0012's fail-fast rule: it is the one write a Flush
+is required to reach, so a store that cannot be opened is a run that would spend
+hours collecting into a retry that can never succeed. The Pusher's half of the
+same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
+it, or cannot be built at all, is a run that carries on.
 
 The pieces arrive as options rather than being reached for directly: this module
 is where permission, store, state and Collector meet, and a test that had to
@@ -28,10 +36,20 @@ import {
 	type StreamSinks,
 } from './helper.js';
 import {MongoHistorySource, type HistorySource} from './history.js';
-import {type ReadWarning, type ReadWarningReporter} from './local-store.js';
+import {
+	LocalStore,
+	type ReadWarning,
+	type ReadWarningReporter,
+} from './local-store.js';
 import {KeyboardCollector} from './keyboard.js';
 import {MouseCollector} from './mouse.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
+/*
+The class is this module's name for the real Push; the type it is held as is
+`session.ts`'s slice of it, which a stand-in can satisfy — the same split
+`EventStream as HelperStream` above makes.
+*/
+import {type PushBacklog, Pusher as MongoPusher} from './push.js';
 import {type RawEvent} from './raw-event.js';
 import {
 	collectionEntry,
@@ -47,12 +65,13 @@ import {
 	CollectionSession,
 	type EventStream,
 	type FlushAttempt,
+	type FlushStore,
+	type Pusher,
 	processSignal,
 	type Shutdown,
 	type ShutdownSignal,
 } from './session.js';
 import {TelemetryState} from './state.js';
-import {MongoTelemetryStore, type TelemetryStore} from './storage.js';
 import {InProcessTelemetrySource, type TelemetrySource} from './telemetry.js';
 
 /*
@@ -286,6 +305,25 @@ export type DashboardView = {
 	readonly ended: Promise<void>;
 };
 
+/*
+The Local Store as this module opens it: the two faces a command wires, which
+are the write face the Session Flushes through and the Push Backlog the Pusher
+drains.
+
+Two faces rather than the class, so a test can hand over a stand-in without a
+SQLite file — the rule ADR-0012 leaves in place, a fake for every seam above the
+store. A third face joins them when the history view reads the store too.
+*/
+export type RunStore = FlushStore & PushBacklog;
+
+/*
+What a run reaches the outside through, built once and closed on every path.
+*/
+type RunDeps = {
+	readonly store: RunStore;
+	readonly pusher: Pusher;
+};
+
 export type RunOptions = CollectorFactoryOptions & {
 	readonly permissions: PermissionSource;
 	/*
@@ -302,15 +340,23 @@ export type RunOptions = CollectorFactoryOptions & {
 	readonly shutdown?: ShutdownSignal;
 	readonly logger?: Logger;
 	/*
-	The write seam as the composition root reaches for it, built with the logger
-	its warnings go to — the shape `createHistorySource` has, and for the same
-	reason. What the seam reports is settled when it is built, so a caller
-	building one of its own reports where it was told to; that is what lets a
-	test drive a TTL index the server would not create to an entry, or to the
-	terminal, without a database. There is no test **server** in this repo, and
-	the store builds a `MongoClient`.
+	The Local Store, as the composition root opens it. The one implementation is
+	the file itself, so a caller supplying this is a test handing over a
+	stand-in — which is what lets an unopenable store, or a Flush that fails, be
+	driven without a SQLite file and without leaving one behind.
 	*/
-	readonly createStore?: (logger: Pick<Console, 'warn'>) => TelemetryStore;
+	readonly createStore?: () => RunStore;
+	/*
+	The Push seam, built over the store's Push Backlog and with the logger its
+	warnings go to — the shape `createStore` used to have, and for the same
+	reason. A caller supplying this is a test: what a Drain carries is
+	`push.test.ts`'s, and what a test wants here is a Drain that does nothing
+	rather than one that reaches for Atlas.
+	*/
+	readonly createPusher?: (
+		backlog: PushBacklog,
+		logger: Pick<Console, 'warn'>,
+	) => Pusher;
 	/*
 	The read seam as the dashboard reaches for it, built with the reporter its
 	warnings go to — the shape `createStream` has, and for the same reason. What
@@ -391,6 +437,55 @@ function stateFor(options: RunOptions, config: Config): TelemetryState {
 }
 
 /*
+Opens what a run reaches the outside through: the Local Store, and the Push over
+it.
+
+The store first, and it throws from here rather than from anywhere later — that
+is the whole of ADR-0012's fail-fast rule, and this is the first thing either
+command does. The Pusher is built over the store because the store *is* the Push
+Backlog; a Pusher that could not be built closes the store it was handed, so a
+bad `MONGO_URI` does not leave an open file behind on the way out.
+*/
+async function openRun(
+	options: RunOptions,
+	config: Config,
+	logger: Pick<Console, 'warn'>,
+): Promise<RunDeps> {
+	const store = (options.createStore ?? (() => new LocalStore(config)))();
+
+	try {
+		/*
+		The default takes the logger it is handed rather than closing over this
+		function's, so that the one value travels by one route. A `createPusher`
+		that ignores the logger is a caller saying it knows where its own
+		warnings go, which is the same thing the option means everywhere else.
+		*/
+		const buildPusher =
+			options.createPusher ??
+			((backlog: PushBacklog, pushLogger: Pick<Console, 'warn'>) =>
+				new MongoPusher(config, backlog, {logger: pushLogger}));
+
+		return {store, pusher: buildPusher(store, logger)};
+	} catch (error) {
+		await store.close();
+		throw error;
+	}
+}
+
+/*
+Closes them, in the order they were opened: a Drain reads the store, so the store
+outlives it, and the client is what the Drain wrote through.
+
+Idempotent on both, and it has two owners: the Session closes them at the end of
+a run, and this closes them on the paths a run never reached — a preflight that
+threw, a Collector that would not start. Whichever gets there first does it.
+*/
+async function closeRun({store, pusher}: RunDeps): Promise<void> {
+	await store.close();
+	await pusher.close();
+}
+
+/*
 The Session, built the same way whichever command asked for one.
 
 A missing grant degrades collection rather than stopping the CLI: the factory is
@@ -408,15 +503,24 @@ function sessionFor(
 		state,
 		report,
 		runLog,
+		store,
+		pusher,
 		problemReporter,
 		helperStderr,
-		storeLogger,
 		onFlush,
 	}: {
 		readonly config: Config;
 		readonly state: TelemetryState;
 		readonly report: PermissionReport;
 		readonly runLog: InProcessRunLogSource;
+		/*
+		The Local Store, opened by the caller rather than here: opening it is the
+		fail-fast path, and it has to happen before the preflight and before
+		anything is drawn — which is not something this function, reached after
+		both, can arrange.
+		*/
+		readonly store: RunStore;
+		readonly pusher: Pusher;
 		/*
 		Where the helper's problems go on a run whose caller supplied no reporter
 		of its own. Left out by `collect`, which keeps the stderr reporter it has
@@ -431,13 +535,6 @@ function sessionFor(
 		corrupts the frame (ADR-0010).
 		*/
 		readonly helperStderr?: (chunk: string) => void;
-		/*
-		Where the write seam's warnings go. Left out by `collect`, which keeps
-		the store's own default — a line on stderr; the dashboard appends
-		entries, which is what puts a TTL index the server would not create in
-		the Run Log rather than in the middle of the frame.
-		*/
-		readonly storeLogger?: Pick<Console, 'warn'>;
 		/*
 		Whatever else wants to hear about a Flush, which is the live view — the
 		one observer whose counters depend on whether the write landed.
@@ -461,20 +558,9 @@ function sessionFor(
 		state,
 	);
 
-	/*
-	Built with the logger its warnings go to, whichever builder is used: a
-	caller's own receives it, and so does the real store — which is the whole of
-	what keeps a TTL index it could not create off the frame (ADR-0010).
-	`console` when nothing said otherwise, which is the store's own default and
-	what a headless run keeps.
-	*/
-	const buildStore =
-		options.createStore ??
-		((logger: Pick<Console, 'warn'>) =>
-			new MongoTelemetryStore(config, undefined, {logger}));
-
 	return new CollectionSession({
-		store: buildStore(storeLogger ?? console),
+		store,
+		pusher,
 		state,
 		collectors: setup.collectors,
 		stream: setup.stream,
@@ -494,18 +580,21 @@ function sessionFor(
 }
 
 /*
-The write seam's warnings, as Run Log entries.
+The Push seam's warnings, as Run Log entries.
 
-A logger rather than a reporter, because a logger is the shape the store offers
-and it is not the store's business whether there is a frame to keep quiet. What
+A logger rather than a reporter, because a logger is the shape the seam offers
+and it is not the seam's business whether there is a frame to keep quiet. What
 it raises through one is a TTL index it could not create — raised as it is
 built, before any Flush has happened — and in dashboard mode that is an entry
 rather than a line of stderr in the middle of the drawing (ADR-0010).
 
 The extra arguments a warning was given are kept, because they are where a
 driver's error travels.
+
+The entry it appends is still the Run Log's `Storage` class: which class a Push
+belongs under is the reporting work, and this is only the cutover.
 */
-function storeLoggerFor(runLog: InProcessRunLogSource): Pick<Console, 'warn'> {
+function pushLoggerFor(runLog: InProcessRunLogSource): Pick<Console, 'warn'> {
 	return {
 		warn(message: string, ...extra: unknown[]) {
 			runLog.append(storageEntry(message, extra, new Date()));
@@ -540,40 +629,62 @@ function reportShutdown({signal, finalFlush}: Shutdown, logger: Logger): void {
 async function runCollect(options: RunOptions): Promise<void> {
 	const logger = options.logger ?? console;
 	const config = options.config ?? loadConfig();
-	const {runLog, report} = await preflightWithLog(options);
-	const session = sessionFor(options, {
-		config,
-		state: stateFor(options, config),
-		report,
-		runLog,
+	const runLog = options.runLog ?? new InProcessRunLogSource();
+	/*
+	The store is opened here, before the preflight and before anything else, and
+	a store that will not open ends the run on this line — with SQLite's own
+	sentence, printed by the entry point, and not a frame drawn (ADR-0012).
+
+	The Push seam's warnings keep the terminal, which is where a headless run
+	reports: the run's own logger is for the run's own report, and a TTL index
+	the server would not create is the seam's.
+	*/
+	const deps = await openRun(options, config, console);
+
+	try {
+		const report = await preflightWithLog(options, runLog);
+		const session = sessionFor(options, {
+			config,
+			state: stateFor(options, config),
+			report,
+			runLog,
+			...deps,
+			/*
+			A headless run has no frame to keep whole, so a Flush that failed is a
+			line on stderr. It is said from the attempt the Session reports rather
+			than by the Session or the store, because this is the one place that
+			knows which command it is answering (ADR-0010).
+
+			A failed *final* Flush is then warned about twice — here, and once more
+			by `reportShutdown` below — which is the shape this has always had, and
+			the two lines say different things: one that the write failed, the other
+			that the counters were lost with it.
+			*/
+			onFlush(attempt) {
+				if (!attempt.ok) {
+					logger.warn('Flush failed; counters will retry on the next Flush');
+				}
+			},
+		});
+
+		reportShutdown(await session.run(), logger);
+	} finally {
 		/*
-		A headless run has no frame to keep whole, so a Flush that failed is a
-		line on stderr. It is said from the attempt the Session reports rather
-		than by the Session or the store, because this is the one place that
-		knows which command it is answering (ADR-0010).
-
-		A failed *final* Flush is then warned about twice — here, and once more
-		by `reportShutdown` below — which is the shape this has always had, and
-		the two lines say different things: one that the write failed, the other
-		that the counters were lost with it.
+		On every path, and not only the happy one: the Session closes both at the
+		end of a run, and this catches the run that never got that far.
 		*/
-		onFlush(attempt) {
-			if (!attempt.ok) {
-				logger.warn('Flush failed; counters will retry on the next Flush');
-			}
-		},
-	});
-
-	reportShutdown(await session.run(), logger);
+		await closeRun(deps);
+	}
 }
 
 /*
-The preflight, and the Run Log it leaves behind.
+The preflight, and the entry it leaves in the Run Log.
 
 One place rather than one per command, because the order is the whole of it: the
-log is built before the preflight runs, so that a run starting with no grant has
-the entry in it before the first frame is drawn. A third command would otherwise
-have to know that, and the way to get it wrong looks like nothing at all.
+log is built — by the caller, before the store is opened — so that a run starting
+with no grant has the entry in it before the first frame is drawn. A third
+command would otherwise have to know that, and the way to get it wrong looks like
+nothing at all.
 
 Built in `collect` too, even though nothing draws it: the Run Log is the record
 of a run, and a `collect` run is one. Nothing reads it back there — the terminal
@@ -582,8 +693,8 @@ caller that supplied one can see afterwards what the run found.
 */
 async function preflightWithLog(
 	options: RunOptions,
-): Promise<{runLog: InProcessRunLogSource; report: PermissionReport}> {
-	const runLog = options.runLog ?? new InProcessRunLogSource();
+	runLog: InProcessRunLogSource,
+): Promise<PermissionReport> {
 	const report = await runPermissions(options);
 
 	/*
@@ -595,7 +706,7 @@ async function preflightWithLog(
 		runLog.append(collectionEntry(report, new Date()));
 	}
 
-	return {runLog, report};
+	return report;
 }
 
 /*
@@ -619,115 +730,126 @@ async function runDashboard(options: RunOptions): Promise<void> {
 	the one on screen have to be one object — or the block would show a run that
 	never did anything.
 
-	The dashboard runs the same preflight `collect` does, and it is not only for
-	the Collectors: the report is what lets the live view say "collection is
-	disabled" rather than draw zeroes, which are the same numbers and not the
-	same thing.
+	Built before the store, because the store's Push warnings become entries in
+	it — and before the preflight for the reason `preflightWithLog` gives.
 	*/
-	const {runLog, report} = await preflightWithLog(options);
-	const state = stateFor(options, config);
-	const telemetry = new InProcessTelemetrySource({report, state});
-	const session = sessionFor(options, {
-		config,
-		state,
-		report,
-		runLog,
-		/*
-		The helper's problems become entries rather than lines of stderr, which
-		would land in the middle of the frame. Appended here and not in a view:
-		an entry is a fact about the run, and the block polls what it finds.
-		*/
-		problemReporter(problem) {
-			runLog.append(helperEntry(problem, new Date()));
-		},
-		/*
-		The helper's other output goes nowhere at all. Its notes — a tap
-		re-enabled, the listener announcing itself — are written to stderr for a
-		terminal to read, and a frame has no room for them: Ink draws by
-		overwriting the lines it last drew, so a line landing mid-draw leaves the
-		rest of the frame off by one from where Ink thinks it is. Nothing that
-		matters goes with it — a statement about collection arrives as an event
-		on stdout, and those become entries.
-		*/
-		helperStderr: discardHelperStderr,
-		/*
-		The write seam's warnings, likewise: entries rather than lines of
-		stderr.
-		*/
-		storeLogger: storeLoggerFor(runLog),
-		onFlush(attempt) {
-			telemetry.recordFlush(attempt);
-		},
-	});
-
+	const runLog = options.runLog ?? new InProcessRunLogSource();
 	/*
-	The read seam's warnings become entries, as the helper's do and for the same
-	reason: the dashboard lands on the history view, and the sentence a failed
-	read carries is a fact about this run rather than about the range on screen.
-	The view draws a pointer and the log holds the whole of it — drawn in both
-	places it would be one failure said twice, one of them across the frame.
+	Opened before the preflight and before the frame, and a store that will not
+	open ends the run on this line with nothing drawn (ADR-0012).
 	*/
-	const reportReadWarning = (warning: ReadWarning): void => {
-		runLog.append(historyEntry(warning, new Date()));
-	};
-
-	const source =
-		options.createHistorySource?.(reportReadWarning) ??
-		new MongoHistorySource(config, undefined, {onWarning: reportReadWarning});
-
-	/*
-	A statement rather than `options.renderApp ?? (await import(...)).renderApp`,
-	which would import ink on every path — including the one where the caller
-	supplied a renderer precisely so that it would not.
-	*/
-	let render = options.renderApp;
-	if (render === undefined) {
-		({renderApp: render} = await import('./tui.js'));
-	}
-
-	/*
-	When the run began: the instant before the Session starts the Collectors,
-	which is the moment the live view's totals count from. Taken here, next to
-	the call that begins the run, so it is that instant rather than whenever a
-	frame happened to be drawn — a dashboard that opens slowly still says when
-	the run it is drawing began.
-	*/
-	const startedAt = new Date();
-
-	/*
-	Started before the view is mounted, so the counters are already moving by the
-	time the first frame is drawn.
-	*/
-	const running = session.run();
-
-	/*
-	`run()`, saying only *that* it ended rather than how. The view has to come
-	down when a signal ends the run, and the rejection has to be claimed here or
-	a Collector that could not start would end the process outright, before the
-	`await` below can report it as the failure it is.
-	*/
-	const ended = running.then(noop).catch(noop);
+	const deps = await openRun(options, config, pushLoggerFor(runLog));
 
 	try {
-		await render({
-			history: source,
-			telemetry,
-			runLog,
-			timeZone: config.timeZone,
-			startedAt,
-			ended,
-		});
-	} finally {
 		/*
-		Stopped rather than left to a signal: `q` arrives as input in a raw-mode
-		terminal and never generates one, so this is the only thing that knows the
-		view has gone.
+		The dashboard runs the same preflight `collect` does, and it is not only
+		for the Collectors: the report is what lets the live view say "collection
+		is disabled" rather than draw zeroes, which are the same numbers and not
+		the same thing.
 		*/
-		await session.stop();
-		await source.close();
-	}
+		const report = await preflightWithLog(options, runLog);
+		const state = stateFor(options, config);
+		const telemetry = new InProcessTelemetrySource({report, state});
+		const session = sessionFor(options, {
+			config,
+			state,
+			report,
+			runLog,
+			...deps,
+			/*
+			The helper's problems become entries rather than lines of stderr, which
+			would land in the middle of the frame. Appended here and not in a view:
+			an entry is a fact about the run, and the block polls what it finds.
+			*/
+			problemReporter(problem) {
+				runLog.append(helperEntry(problem, new Date()));
+			},
+			/*
+			The helper's other output goes nowhere at all. Its notes — a tap
+			re-enabled, the listener announcing itself — are written to stderr for a
+			terminal to read, and a frame has no room for them: Ink draws by
+			overwriting the lines it last drew, so a line landing mid-draw leaves the
+			rest of the frame off by one from where Ink thinks it is. Nothing that
+			matters goes with it — a statement about collection arrives as an event
+			on stdout, and those become entries.
+			*/
+			helperStderr: discardHelperStderr,
+			onFlush(attempt) {
+				telemetry.recordFlush(attempt);
+			},
+		});
 
-	reportShutdown(await running, logger);
+		/*
+		The read seam's warnings become entries, as the helper's do and for the same
+		reason: the dashboard lands on the history view, and the sentence a failed
+		read carries is a fact about this run rather than about the range on screen.
+		The view draws a pointer and the log holds the whole of it — drawn in both
+		places it would be one failure said twice, one of them across the frame.
+		*/
+		const reportReadWarning = (warning: ReadWarning): void => {
+			runLog.append(historyEntry(warning, new Date()));
+		};
+
+		const source =
+			options.createHistorySource?.(reportReadWarning) ??
+			new MongoHistorySource(config, undefined, {onWarning: reportReadWarning});
+
+		/*
+		A statement rather than `options.renderApp ?? (await import(...)).renderApp`,
+		which would import ink on every path — including the one where the caller
+		supplied a renderer precisely so that it would not.
+		*/
+		let render = options.renderApp;
+		if (render === undefined) {
+			({renderApp: render} = await import('./tui.js'));
+		}
+
+		/*
+		When the run began: the instant before the Session starts the Collectors,
+		which is the moment the live view's totals count from. Taken here, next to
+		the call that begins the run, so it is that instant rather than whenever a
+		frame happened to be drawn — a dashboard that opens slowly still says when
+		the run it is drawing began.
+		*/
+		const startedAt = new Date();
+
+		/*
+		Started before the view is mounted, so the counters are already moving by the
+		time the first frame is drawn.
+		*/
+		const running = session.run();
+
+		/*
+		`run()`, saying only *that* it ended rather than how. The view has to come
+		down when a signal ends the run, and the rejection has to be claimed here or
+		a Collector that could not start would end the process outright, before the
+		`await` below can report it as the failure it is.
+		*/
+		const ended = running.then(noop).catch(noop);
+
+		try {
+			await render({
+				history: source,
+				telemetry,
+				runLog,
+				timeZone: config.timeZone,
+				startedAt,
+				ended,
+			});
+		} finally {
+			/*
+			Stopped rather than left to a signal: `q` arrives as input in a raw-mode
+			terminal and never generates one, so this is the only thing that knows the
+			view has gone.
+			*/
+			await session.stop();
+			await source.close();
+		}
+
+		reportShutdown(await running, logger);
+	} finally {
+		await closeRun(deps);
+	}
 }
 
 /*

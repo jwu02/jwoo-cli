@@ -4,12 +4,13 @@ import {
 	CollectionSession,
 	type EventStream,
 	type FlushAttempt,
+	type FlushStore,
+	type Pusher,
 	type SessionOptions,
 	type ShutdownReason,
 	type ShutdownSignal,
 } from './session.js';
 import {TelemetryState} from './state.js';
-import {type FlushResult, type TelemetryStore} from './storage.js';
 
 /*
 A stand-in for the OS. The Session takes shutdown from a source rather than
@@ -36,9 +37,16 @@ class FakeShutdownSignal implements ShutdownSignal {
 	}
 }
 
-class FakeStore implements TelemetryStore {
+/*
+The Local Store, standing in. Async on purpose: the store answers synchronously,
+and the machinery that waits on a Flush is what these tests are here to hold in
+place until it is contracted away. A fake that answered synchronously could not
+show a Flush caught in flight at all.
+*/
+class FakeStore implements FlushStore {
 	#failures: number;
 	readonly #hold: (() => Promise<void>) | undefined;
+	readonly trace: string[];
 	readonly snapshots: Array<Record<string, unknown>> = [];
 	closed = 0;
 	/*
@@ -47,26 +55,84 @@ class FakeStore implements TelemetryStore {
 	*/
 	started = 0;
 
-	constructor(failures = 0, hold?: () => Promise<void>) {
+	constructor(failures = 0, hold?: () => Promise<void>, trace: string[] = []) {
 		this.#failures = failures;
 		this.#hold = hold;
+		this.trace = trace;
 	}
 
-	async flush(snapshot: never): Promise<FlushResult> {
+	async flush(snapshot: never): Promise<Date | undefined> {
 		this.started += 1;
 		await this.#hold?.();
 		this.snapshots.push(snapshot);
 
 		if (this.#failures > 0) {
 			this.#failures -= 1;
+			this.trace.push('flush:failed');
 			return undefined;
 		}
 
-		return ['id'];
+		this.trace.push('flush:ok');
+		return new Date();
 	}
 
 	async close(): Promise<void> {
 		this.closed += 1;
+		this.trace.push('store:close');
+	}
+}
+
+/*
+The Push, standing in, recording *when* it was asked to Drain rather than what
+it did with one — the Session decides the timing, and what a Drain carries is
+`push.test.ts`'s business.
+
+Single-flight, as the real one is, and a pass finishes on a macrotask the way a
+round trip to a server does: a second ask in the same turn of the event loop
+finds the pass in flight and joins it.
+*/
+class FakePusher implements Pusher {
+	readonly #hold: (() => Promise<void>) | undefined;
+	#inFlight: Promise<void> | undefined;
+	readonly trace: string[];
+	passes = 0;
+	closed = 0;
+	/*
+	A Drain the Pusher cannot carry out at all, which is not the same as one that
+	failed against the server: the seam itself is broken, and the promise rejects
+	rather than the attempt reporting.
+	*/
+	failWith?: Error;
+
+	constructor(trace: string[] = [], hold?: () => Promise<void>) {
+		this.trace = trace;
+		this.#hold = hold;
+	}
+
+	async #pass(): Promise<void> {
+		await this.#hold?.();
+		await delay(0);
+
+		if (this.failWith) {
+			throw this.failWith;
+		}
+	}
+
+	async drain(): Promise<void> {
+		if (this.#inFlight === undefined) {
+			this.passes += 1;
+			this.trace.push('drain');
+			this.#inFlight = this.#pass().finally(() => {
+				this.#inFlight = undefined;
+			});
+		}
+
+		await this.#inFlight;
+	}
+
+	async close(): Promise<void> {
+		this.closed += 1;
+		this.trace.push('pusher:close');
 	}
 }
 
@@ -95,6 +161,7 @@ function build(options: Partial<SessionOptions> = {}): TestSession {
 			stream: options.stream,
 			flushIntervalSeconds: options.flushIntervalSeconds ?? 300,
 			shutdown: signal,
+			pusher: options.pusher,
 			onFlush: options.onFlush,
 		}),
 	};
@@ -228,9 +295,9 @@ test('shutdown with no Activity writes nothing', async t => {
 });
 
 /*
-The retry rule from `storage.ts`, seen from the Session: a failed Flush leaves
-Telemetry State whole, so the next attempt writes the same counters rather than
-losing them — here, the one key press appears in both attempts.
+The retry rule the store's write face states, seen from the Session: a failed
+Flush leaves Telemetry State whole, so the next attempt writes the same counters
+rather than losing them — here, the one key press appears in both attempts.
 */
 test('a failed Flush keeps Telemetry State for the next attempt', async t => {
 	const store = new FakeStore(1);
@@ -533,6 +600,137 @@ test('a Collector that throws on start propagates, and the store still closes', 
 	});
 
 	await t.throwsAsync(session.run(), {message: 'no tap'});
+	t.is(store.closed, 1);
+});
+
+/*
+The Push's timing, which is the Session's whole share of it: a Drain is asked
+for once as the run starts — for a backlog an earlier run left behind — and
+after every Flush that landed, because the era that Flush wrote is the one worth
+carrying.
+
+A Flush that failed asks for none. Its era was never written, so there is
+nothing new to carry, and the backlog a Drain would walk is the one the last
+Drain already walked.
+*/
+test('a Drain is asked for after a Flush that landed, and not after one that failed', async t => {
+	const trace: string[] = [];
+	// Set up to fail exactly one Flush, so the retry is an interval's rather
+	// than the shutdown's.
+	const store = new FakeStore(1, undefined, trace);
+	const pusher = new FakePusher(trace);
+	const {session, signal, state} = build({
+		store,
+		pusher,
+		flushIntervalSeconds: 0.005,
+	});
+	state.addLeftClick();
+
+	const running = session.run();
+	await until(() => store.snapshots.length === 1, {what: 'the failed Flush'});
+	await until(() => store.snapshots.length === 2, {
+		what: 'the Flush that retried it',
+	});
+
+	signal.fire('SIGTERM');
+	await running;
+
+	t.deepEqual(trace, [
+		'drain', // The backlog this run started with
+		'flush:failed',
+		'flush:ok',
+		'drain', // Asked for by the Flush that landed
+		'drain', // One last attempt on the way out
+		'store:close',
+		'pusher:close',
+	]);
+});
+
+/*
+The order on the way out, which is the whole of ADR-0012's shutdown rule: the
+Drain in flight is waited out, the final Flush lands, one last Drain is asked
+for and awaited, and only then do the store and the Mongo client close — the
+store after the Drain because the Drain reads it.
+*/
+test('the last Drain is awaited before the store and the client close', async t => {
+	const trace: string[] = [];
+	const store = new FakeStore(0, undefined, trace);
+	const pusher = new FakePusher(trace);
+	const {session, signal, state} = build({store, pusher});
+	state.addLeftClick();
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+	await running;
+
+	t.deepEqual(trace, [
+		'drain', // The startup backlog, which `stop()` waits out first
+		'flush:ok',
+		'drain', // Asked for by the final Flush, and awaited before anything closes
+		'store:close',
+		'pusher:close',
+	]);
+	t.is(store.closed, 1);
+	t.is(pusher.closed, 1);
+});
+
+/*
+The Flush rule ADR-0012 turns on. A Drain waits on a network the CLI does not
+control, and the write that matters is the local one — so a Drain still hanging
+must not hold up the next Flush, let alone the run.
+*/
+test('a Flush is not delayed by a Drain still in flight', async t => {
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>(resolve => {
+		release = () => {
+			resolve();
+		};
+	});
+	const store = new FakeStore();
+	const pusher = new FakePusher([], async () => gate);
+	const {session, signal, state} = build({
+		store,
+		pusher,
+		flushIntervalSeconds: 0.005,
+	});
+	state.addLeftClick();
+
+	const running = session.run();
+	await until(() => store.snapshots.length === 1, {what: 'the first Flush'});
+	state.addLeftClick();
+	await until(() => store.snapshots.length === 2, {
+		what: 'a second Flush, with the startup Drain still hanging',
+	});
+
+	// Released so the shutdown below is not waiting on the gate too.
+	release?.();
+	signal.fire('SIGTERM');
+	const shutdown = await running;
+
+	t.true(shutdown.finalFlush);
+	t.is(store.closed, 1);
+});
+
+/*
+A Drain that rejects is not the Session's to report — the Pusher reports through
+its own attempt callback — but it must not reach the Flush path either. The
+Session fires Drains without awaiting them, so an unheld rejection would end the
+process rather than the run.
+*/
+test('a Drain that rejects does not bring the run down', async t => {
+	const trace: string[] = [];
+	const store = new FakeStore(0, undefined, trace);
+	const pusher = new FakePusher(trace);
+	pusher.failWith = new Error('the push seam is broken');
+
+	const {session, signal, state} = build({store, pusher});
+	state.addLeftClick();
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+	const shutdown = await running;
+
+	t.true(shutdown.finalFlush, 'the local write was unaffected');
 	t.is(store.closed, 1);
 });
 

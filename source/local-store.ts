@@ -29,7 +29,7 @@ import {type Snapshot} from './state.js';
 A row as the driver hands it back.
 
 Declared here rather than taken from the driver's own `SQLOutputValue`, for the
-reason `storage.ts` declares its own slices of the Mongo driver: a module names
+reason `push.ts` declares its own slices of the Mongo driver: a module names
 only what it uses. Unlike those slices this one is not async-shaped, because
 `node:sqlite` is not async — and that is the fact the whole module rests on.
 */
@@ -185,10 +185,10 @@ function openDatabase(path: string): DatabaseSync {
 /*
 The stamp a Flush landed under, or `undefined` when it did not.
 
-Named for the stamp rather than for the attempt, because the stamp is what the
-caller gets and the one fact it has about the era it just wrote. `storage.ts`
-owns `FlushResult` for the warnings a Mongo write reports, and two types sharing
-one name would undo the vocabulary the rest of this module keeps.
+Named for the stamp rather than for the write's outcome, because the stamp is
+what the caller gets and the one fact it has about the era it just wrote. There
+is no result type to go with it: the write is the whole of the report, and a
+Flush that failed says so by answering `undefined` (ADR-0010).
 */
 export type FlushStamp = Date | undefined;
 

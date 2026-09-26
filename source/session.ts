@@ -10,10 +10,14 @@ It owns the whole decision of when a Flush happens: on the Flush Interval, and
 once more on the way out. The second one is the point — Ctrl-C and `kill` both
 arrive as signals, and without a final Flush every counter accumulated since
 the last interval is lost.
+
+It owns the Push's timing too, and nothing else about it: a Drain is asked for
+after a Flush that landed and once as the run starts, and never waited on from
+the Flush path — a hanging Atlas must not delay the next local write, which is
+the write that matters (ADR-0012). What a Drain found is the Pusher's to report.
 */
 
 import process from 'node:process';
-import {type TelemetryStore} from './storage.js';
 import {type Snapshot, type TelemetryState} from './state.js';
 
 /*
@@ -31,7 +35,7 @@ The helper's event stream, as much of it as the Session needs: it starts and
 stops, and nothing else is its business.
 
 Narrow on purpose, and declared here rather than alongside the implementation
-for the same reason `storage.ts` declares its own slice of the driver — the
+for the same reason `push.ts` declares its own slice of the driver — the
 Session's job is owning a lifetime, and it should not need to know that there is
 a child process at the other end of it. A test can hand it a stand-in without
 spawning anything.
@@ -40,6 +44,51 @@ export type EventStream = {
 	start(): void;
 	stop(): void;
 };
+
+/*
+The Local Store's write face, as the Session reaches for it: a Flush and a close.
+
+Declared here rather than in `local-store.ts` for the reason the `EventStream`
+above is: the Session's job is owning a lifetime, and a module names only what it
+uses. A fake can stand in without a SQLite file behind it — which is the rule
+ADR-0012 leaves in place, a fake for every seam above the store.
+
+The Promise arms are the async shape this cutover was made with and not a
+pretence about the store: `node:sqlite` has no promise in it, and the store
+answers synchronously. They stay until the Flush's write path is made
+honest-sync through here, which is its own piece of work; until then the
+Session's call sites do not have to know which kind of store they were handed.
+*/
+export type FlushStore = {
+	flush(snapshot: Snapshot): Date | undefined | Promise<Date | undefined>;
+	close(): void | Promise<void>;
+};
+
+/*
+The Push, as the Session reaches for it: a Drain, and a close.
+
+Narrow on purpose, as the `EventStream` is: the Session decides *when* a Drain is
+asked for and knows nothing about MongoDB. The `Pusher` in `push.ts` is one
+implementation of this and the only real one.
+*/
+export type Pusher = {
+	drain(): Promise<void>;
+	close(): Promise<void>;
+};
+
+/*
+A Drain that failed is reported through its own attempt callback, so this is for
+the promise itself failing — which the Session must not let reach a Flush path,
+because it fires Drains without awaiting them and a rejection nobody holds ends
+the process.
+*/
+async function settled(attempt: Promise<void>): Promise<void> {
+	try {
+		await attempt;
+	} catch {
+		// Reported where the Push seam reports: through its attempt callback.
+	}
+}
 
 /*
 What a shutdown looks like once it has finished, rather than the moment it
@@ -117,7 +166,7 @@ export const processSignal: ShutdownSignal = {
 };
 
 export type SessionOptions = {
-	readonly store: TelemetryStore;
+	readonly store: FlushStore;
 	readonly state: TelemetryState;
 	/*
 	Only the Collectors that are meant to run. One that cannot run because its
@@ -134,6 +183,12 @@ export type SessionOptions = {
 	readonly flushIntervalSeconds: number;
 	readonly shutdown: ShutdownSignal;
 	/*
+	Where the Flushed eras go from here. Absent is a run that never Pushes, which
+	is what a test that is not about the Push wants — the composition root always
+	supplies one (ADR-0012).
+	*/
+	readonly pusher?: Pusher;
+	/*
 	Called after every Flush attempt, successful or not.
 
 	Not called when there was no Activity: no write was attempted, so there is
@@ -149,12 +204,13 @@ pending timer that is not `unref`'d is not enough on its own. The signal
 listeners do that job, which is why there is no keep-alive here.
 */
 export class CollectionSession {
-	readonly #store: TelemetryStore;
+	readonly #store: FlushStore;
 	readonly #state: TelemetryState;
 	readonly #collectors: readonly Collector[];
 	readonly #stream: EventStream | undefined;
 	readonly #intervalMs: number;
 	readonly #shutdown: ShutdownSignal;
+	readonly #pusher: Pusher | undefined;
 	readonly #onFlush: ((attempt: FlushAttempt) => void) | undefined;
 
 	#timer: NodeJS.Timeout | undefined;
@@ -184,6 +240,15 @@ export class CollectionSession {
 	this one, and then finds either cleared state or the retry it owes.
 	*/
 	#inFlight: Promise<unknown> | undefined;
+	/*
+	The Drain in flight, if any.
+
+	Held for the same reason `#inFlight` is, one step further out: the last Drain
+	on the way out has to be a fresh pass over the backlog, and a pass that merely
+	joined a Drain already running would never look at the era the final Flush had
+	just written. `stop()` waits this one out first, and then asks for another.
+	*/
+	#drainInFlight: Promise<void> | undefined;
 	#finalFlush = false;
 
 	constructor(options: SessionOptions) {
@@ -193,7 +258,27 @@ export class CollectionSession {
 		this.#stream = options.stream;
 		this.#intervalMs = options.flushIntervalSeconds * 1000;
 		this.#shutdown = options.shutdown;
+		this.#pusher = options.pusher;
 		this.#onFlush = options.onFlush;
+	}
+
+	/*
+	Asks for a Drain and holds the promise, never awaiting it: the Flush path and
+	the start of a run both want the backlog moving and neither can afford to
+	wait on MongoDB to find out that it did.
+
+	A Pusher is single-flight, so a call that lands while one is already running
+	joins it rather than starting a second pass over the same eras.
+	*/
+	async #startDrain(): Promise<void> {
+		const pusher = this.#pusher;
+		if (pusher === undefined) {
+			return;
+		}
+
+		const attempt = settled(pusher.drain());
+		this.#drainInFlight = attempt;
+		return attempt;
 	}
 
 	/*
@@ -249,7 +334,7 @@ export class CollectionSession {
 	/*
 	Activity decides whether a Flush is attempted at all. A failed Flush leaves
 	Telemetry State whole, so the same Snapshot is retried on the next interval —
-	the rule from `storage.ts`, applied here.
+	the rule the Local Store's write face states, applied here.
 
 	A failure is warned about by nobody here: the attempt below is the one thing
 	that says it happened, and whoever wants it said reaches for that. A warning
@@ -280,14 +365,27 @@ export class CollectionSession {
 		*/
 		this.#onFlush?.({at: new Date(), ok: isWritten, snapshot});
 
+		/*
+		Only after a Flush that landed: a failed one left its era unwritten, so
+		there is nothing new for a Drain to carry, and the backlog it would walk is
+		the one the last Drain already walked.
+
+		Not awaited, and that is the whole of ADR-0012's Flush rule: the write that
+		matters has already happened, and an Atlas that has gone away must not delay
+		the next one.
+		*/
+		if (isWritten) {
+			void this.#startDrain();
+		}
+
 		return isWritten;
 	}
 
 	/*
 	Runs until a signal arrives or `stop()` is called, then shuts down. The
-	returned promise resolves only once the final Flush and the close have
-	finished, so `await`ing it is a complete shutdown and not merely the start of
-	one — whichever of the two ended it.
+	returned promise resolves only once the final Flush, the last Drain attempt
+	and the closes have finished, so `await`ing it is a complete shutdown and not
+	merely the start of one — whichever of the two ended it.
 
 	The signal listeners are installed before the promise can resolve, so a
 	caller that waits cannot miss one. They are also removed *after* the run has
@@ -310,6 +408,15 @@ export class CollectionSession {
 				collector.start();
 				this.#started += 1;
 			}
+
+			/*
+			The startup backlog, fired once and not waited on. A machine that was
+			offline for the last few intervals has eras sitting in the Local Store
+			and no reason to wait an interval to try them again — and a Drain that
+			has to fail does so under a run that is already collecting rather than
+			in front of a frame that is not up yet.
+			*/
+			void this.#startDrain();
 		} catch (error: unknown) {
 			// Stops the Collectors that did start, closes the store, and lets the
 			// broken install reach the caller.
@@ -329,6 +436,12 @@ export class CollectionSession {
 	Flush of the same interval would write it twice. Returns the first run's
 	outcome on a second call, which is why the signal is missing from it: after
 	a SIGTERM, only `run()` can say which signal it was.
+
+	The order on the way out is the whole of it: the Flush in flight, the Drain in
+	flight, the final Flush, one last Drain attempt — awaited, because it is the
+	last — then the store and then the Mongo client. The store closes after the
+	Drain because the Drain reads it, and the client after the store because that
+	is the order they were opened in (ADR-0012).
 	*/
 	async stop(): Promise<Shutdown> {
 		if (this.#ended) {
@@ -370,7 +483,28 @@ export class CollectionSession {
 		*/
 		await this.#inFlight?.catch(() => undefined);
 
+		/*
+		The Drain in flight is waited out before the final Flush, so that the Drain
+		the final Flush asks for is a fresh pass rather than a join. A pass that
+		merely joined the one already running would have read the backlog before the
+		era below existed, and that era would sit unpushed until the next run.
+
+		Waited, but not depended on: it is already swallowed, and the Flush below
+		is the write this whole shutdown exists for.
+		*/
+		if (this.#drainInFlight !== undefined) {
+			await this.#drainInFlight;
+		}
+
 		this.#finalFlush = await this.#flush();
+
+		/*
+		One last Drain, awaited, before the store closes — the store closes after
+		the Drain because the Drain reads it. Asked for rather than handed the one
+		the final Flush may have started: a Flush that failed started none, and a
+		backlog left over from earlier intervals still deserves the attempt.
+		*/
+		await this.#startDrain();
 
 		/*
 		Called at most once, because a Flush that threw leaves the store unclosed
@@ -379,6 +513,15 @@ export class CollectionSession {
 		if (!this.#closed) {
 			this.#closed = true;
 			await this.#store.close();
+		}
+
+		/*
+		The Mongo client goes last, after the store, because the Drain that just
+		finished was reading the one and writing through the other.
+		*/
+		const pusher = this.#pusher;
+		if (pusher !== undefined) {
+			await pusher.close();
 		}
 
 		/*

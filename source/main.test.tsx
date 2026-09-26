@@ -3,6 +3,7 @@ import test from 'ava';
 import {type Config} from './config.js';
 import {type HistorySource} from './history.js';
 import {
+	type Era,
 	type HistoryData,
 	type LoadResult,
 	type ReadWarning,
@@ -14,11 +15,13 @@ import {
 	type DashboardView,
 	type Logger,
 	type RunOptions,
+	type RunStore,
 	run,
 } from './main.js';
 import {type StreamProblem, type StreamSinks} from './helper.js';
 import {KeyboardCollector} from './keyboard.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
+import {type PushBacklog} from './push.js';
 import {type HelperError, keyEventAt, type RawEvent} from './raw-event.js';
 import {
 	InProcessRunLogSource,
@@ -28,11 +31,11 @@ import {
 import {
 	type Collector,
 	type EventStream,
+	type Pusher,
 	type ShutdownReason,
 	type ShutdownSignal,
 } from './session.js';
 import {TelemetryState} from './state.js';
-import {type FlushResult, type TelemetryStore} from './storage.js';
 import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
 
 const CONFIG: Config = {
@@ -45,7 +48,10 @@ const CONFIG: Config = {
 	collectionTtlSeconds: 1,
 	heatmapTtlSeconds: 1,
 	timeZone: 'Europe/London',
-	// Unused here: nothing opens the Local Store until ADR-0012's wiring lands.
+	/*
+	Unused here: every test in this file hands the composition root a store
+	rather than letting it open the file, so a run never touches this path.
+	*/
 	localStorePath: '/tmp/jwoo-cli-test/telemetry.db',
 };
 
@@ -61,14 +67,23 @@ const FN = 63;
 const A_KEY = 0;
 
 /*
-A store that writes, or one that fails a set number of Flushes and then writes.
+The Local Store, standing in: a store that writes, or one that fails a set
+number of Flushes and then writes.
 
 The budget is what makes a *mid-run* failure testable: the Flush that fails has
 to be an interval's rather than the last one's, so that the retry lands and the
 run ends cleanly — which is the only shape in which "one failure, one report"
 can be counted.
+
+Async on purpose, as `session.test.ts`'s is: the machinery that waits on a Flush
+is still here, and a store that answered synchronously could not show a Flush
+caught in flight.
+
+`close` is idempotent, as the Local Store's is. Two things close it on the way
+out of a run — the Session, and the composition root on the paths a run never
+reached — and only one of them does the work.
 */
-class FakeStore implements TelemetryStore {
+class FakeStore implements RunStore {
 	#failures: number;
 	readonly snapshots: Array<Record<string, unknown>> = [];
 	closed = 0;
@@ -77,18 +92,53 @@ class FakeStore implements TelemetryStore {
 		this.#failures = failures;
 	}
 
-	async flush(snapshot: never): Promise<FlushResult> {
+	async flush(snapshot: never): Promise<Date | undefined> {
 		if (this.#failures > 0) {
 			this.#failures -= 1;
 			return undefined;
 		}
 
 		this.snapshots.push(snapshot);
-		return ['id'];
+		return new Date();
+	}
+
+	/*
+	The Push Backlog, which is empty: what a Drain carries is `push.test.ts`'s,
+	and a run that Pushed something here would be reaching for Atlas.
+	*/
+	backlog(): readonly Era[] {
+		return [];
+	}
+
+	markPushed(): void {
+		// Nothing is in the backlog, so nothing is ever acknowledged.
 	}
 
 	async close(): Promise<void> {
-		this.closed += 1;
+		if (this.closed === 0) {
+			this.closed += 1;
+		}
+	}
+}
+
+/*
+The Push, standing in. What the composition root has to get right about it is
+where it is built from and that it is closed with everything else; what a Drain
+carries is `push.test.ts`'s.
+*/
+class FakePusher implements Pusher {
+	readonly backlogs: PushBacklog[] = [];
+	drains = 0;
+	closed = 0;
+
+	async drain(): Promise<void> {
+		this.drains += 1;
+	}
+
+	async close(): Promise<void> {
+		if (this.closed === 0) {
+			this.closed += 1;
+		}
 	}
 }
 
@@ -250,6 +300,11 @@ function denied(): PermissionReport {
 class FakePermissions implements PermissionSource {
 	readonly #report: PermissionReport;
 	readonly calls: number[] = [];
+	/*
+	A helper that cannot be asked at all — a missing binary, a crash, a hang —
+	which `permissions.ts` raises rather than reporting as a missing grant.
+	*/
+	failWith?: Error;
 
 	constructor(report: PermissionReport) {
 		this.#report = report;
@@ -257,6 +312,11 @@ class FakePermissions implements PermissionSource {
 
 	async preflight(): Promise<PermissionReport> {
 		this.calls.push(this.calls.length);
+
+		if (this.failWith) {
+			throw this.failWith;
+		}
+
 		return this.#report;
 	}
 }
@@ -310,25 +370,27 @@ type Harness = {
 	readonly permissions: FakePermissions;
 	readonly shutdown: FakeShutdownSignal;
 	readonly store: FakeStore;
+	readonly pusher: FakePusher;
 	readonly logger: ReturnType<typeof logger>;
 	readonly reports: PermissionReport[];
 	readonly collectors: Array<ReturnType<typeof collector>>;
 	/*
-	The logger the composition root built the store with, one per run. What the
-	write seam's warnings are worth is decided by where that logger puts them,
-	and there is no other way to reach it from outside a run.
+	The logger the composition root built the Push seam with, one per run. What
+	its warnings are worth is decided by where that logger puts them, and there
+	is no other way to reach it from outside a run.
 	*/
-	readonly storeLoggers: Array<Pick<Console, 'warn'>>;
+	readonly pushLoggers: Array<Pick<Console, 'warn'>>;
 };
 
 function harness(report: PermissionReport): Harness {
 	const permissions = new FakePermissions(report);
 	const shutdown = new FakeShutdownSignal();
 	const store = new FakeStore();
+	const pusher = new FakePusher();
 	const lines = logger();
 	const reports: PermissionReport[] = [];
 	const collectors: Array<ReturnType<typeof collector>> = [];
-	const storeLoggers: Array<Pick<Console, 'warn'>> = [];
+	const pushLoggers: Array<Pick<Console, 'warn'>> = [];
 
 	const buildCollectors: CollectorFactory = seen => {
 		reports.push(seen);
@@ -341,20 +403,29 @@ function harness(report: PermissionReport): Harness {
 		permissions,
 		shutdown,
 		store,
+		pusher,
 		logger: lines,
 		reports,
 		collectors,
-		storeLoggers,
+		pushLoggers,
 		options: {
 			permissions,
 			shutdown,
 			/*
-			The harness's store, handed the logger the composition root decided
-			the mode's warnings go through and built the way the real one is.
+			The harness's store, opened here and not by the composition root — the
+			composition root's own opening of the real one is asserted below.
 			*/
-			createStore(storeLogger) {
-				storeLoggers.push(storeLogger);
+			createStore() {
 				return store;
+			},
+			/*
+			Built the way the real one is, and handed the logger the composition
+			root decided the mode's warnings go through.
+			*/
+			createPusher(backlog, pushLogger) {
+				pusher.backlogs.push(backlog);
+				pushLoggers.push(pushLogger);
+				return pusher;
 			},
 			state: new TelemetryState(),
 			logger: lines,
@@ -721,12 +792,19 @@ test('the helper’s failure line reaches the reporter and no Collector', async 
 });
 
 /*
-A database that has gone away, as the Session sees one: a Flush that writes
-nothing and leaves Telemetry State alone to be retried.
+A store that cannot be written — a full disk, a file that went away — as the
+Session sees one: a Flush that writes nothing and leaves Telemetry State alone
+to be retried.
 */
-const FAILING_STORE: TelemetryStore = {
-	async flush(): Promise<FlushResult> {
+const FAILING_STORE: RunStore = {
+	async flush(): Promise<Date | undefined> {
 		return undefined;
+	},
+	backlog(): readonly Era[] {
+		return [];
+	},
+	markPushed() {
+		// Nothing is in the backlog, so nothing is ever acknowledged.
 	},
 	async close(): Promise<void> {
 		// Nothing to release.
@@ -950,7 +1028,7 @@ type Logged = {
 
 async function logged(
 	events: readonly RawEvent[],
-	store?: TelemetryStore,
+	store?: RunStore,
 ): Promise<Logged> {
 	const test_ = harness(granted());
 	const stream = new FakeStream();
@@ -1438,8 +1516,8 @@ It is raised through the logger the store was built with, so what becomes of it
 is the composition root's decision and not the store's — an entry under a frame,
 a line on the terminal without one. The store is the harness's own here and the
 warning is raised while the frame is up, because the routing is what is under
-test; the real store's half of it, that a TTL index it could not create is a
-warning at all, is `storage.test.ts`'s.
+test; the real seam's half of it, that a TTL index it could not create is a
+warning at all, is `push.test.ts`'s.
 */
 test('the write seam’s warning is an entry in dashboard mode, and not a line on stderr', async t => {
 	const test_ = harness(granted());
@@ -1454,7 +1532,7 @@ test('the write seam’s warning is an entry in dashboard mode, and not a line o
 			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				written = captureStderr(() => {
-					test_.storeLoggers[0]?.warn(
+					test_.pushLoggers[0]?.warn(
 						'Failed to create TTL index on telemetry',
 						new Error('not authorized'),
 					);
@@ -1497,7 +1575,7 @@ test('collect keeps the write seam’s warning on stderr', async t => {
 
 	t.deepEqual(
 		captureStderr(() => {
-			test_.storeLoggers[0]?.warn('Failed to create TTL index on telemetry');
+			test_.pushLoggers[0]?.warn('Failed to create TTL index on telemetry');
 		}),
 		['Failed to create TTL index on telemetry\n'],
 	);
@@ -1611,6 +1689,82 @@ test('the history source is closed even when rendering throws', async t => {
 
 	t.deepEqual(closed, [1]);
 	t.is(test_.store.closed, 1, 'and the run behind it was stopped');
+});
+
+/*
+The Local Store's fail-fast rule, which is the whole of ADR-0012's order: it is
+the one write a Flush is required to reach, so a run that cannot open it ends at
+startup rather than collecting for hours into a retry that can never succeed.
+
+Before the preflight, which is what makes it quiet as well as early: no helper is
+asked, and no frame is drawn over the store's own sentence.
+*/
+for (const kind of ['collect', 'dashboard'] as const) {
+	test(`a store that cannot be opened ends a ${kind} run before the preflight`, async t => {
+		const test_ = harness(granted());
+		let rendered = 0;
+
+		await t.throwsAsync(
+			run(
+				{kind},
+				{
+					...test_.options,
+					createStore() {
+						throw new Error(
+							'Could not open the Local Store at /tmp/telemetry.db: file is not a database',
+						);
+					},
+					createHistorySource: () => stubHistory(),
+					async renderApp() {
+						rendered += 1;
+					},
+				},
+			),
+			{message: /file is not a database/v},
+		);
+
+		t.deepEqual(test_.permissions.calls, [], 'nothing was asked of the helper');
+		t.is(rendered, 0, 'and nothing was drawn');
+	});
+}
+
+/*
+The other side of the same order. A run that opened the store and then could not
+get as far as the preflight — a helper that cannot be asked is a broken install —
+still has a file open, and closing it is not the Session's to do: there is no
+Session yet.
+*/
+test('a store already opened is closed when the preflight cannot answer', async t => {
+	const test_ = harness(granted());
+	test_.permissions.failWith = new Error(
+		'the helper printed no permission report',
+	);
+
+	await t.throwsAsync(run({kind: 'collect'}, test_.options), {
+		message: 'the helper printed no permission report',
+	});
+
+	t.is(test_.store.closed, 1);
+	t.is(test_.pusher.closed, 1, 'and the Push went with it');
+});
+
+/*
+The composition root's half of the Push: the store is what a Drain reads, so the
+Pusher is built over the store itself and not over a copy of it, and it closes
+with everything else on the way out.
+*/
+test('the Push is built over the store, and closed with the run', async t => {
+	const test_ = harness(granted());
+	test_.options.state?.addLeftClick();
+
+	const running = run({kind: 'collect'}, test_.options);
+	test_.shutdown.fire('SIGINT');
+	await running;
+
+	t.is(test_.pusher.backlogs[0], test_.store, 'the store is the Push Backlog');
+	t.true(test_.pusher.drains > 0, 'and the run asked for a Drain');
+	t.is(test_.store.closed, 1);
+	t.is(test_.pusher.closed, 1);
 });
 
 /*
