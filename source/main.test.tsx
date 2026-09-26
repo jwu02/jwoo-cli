@@ -15,7 +15,9 @@ import {
 	type Logger,
 	type RunOptions,
 	type RunStore,
-	run,
+	runCollect,
+	runDashboard,
+	runPermissions,
 } from './main.js';
 import {type StreamProblem, type StreamSinks} from './capture/helper.js';
 import {KeyboardCollector} from './capture/keyboard.js';
@@ -528,7 +530,7 @@ function harness(report: PermissionReport): Harness {
 test('collect builds every Collector the grant allows', async t => {
 	const test_ = harness(granted());
 
-	const running = run({kind: 'collect'}, test_.options);
+	const running = runCollect(test_.options);
 	test_.shutdown.fire('SIGINT');
 	await running;
 
@@ -545,7 +547,7 @@ and the disabled Collectors are reported by name.
 test('a missing grant disables both Collectors without stopping the CLI', async t => {
 	const test_ = harness(denied());
 
-	const running = run({kind: 'collect'}, test_.options);
+	const running = runCollect(test_.options);
 	test_.shutdown.fire('SIGTERM');
 	await running;
 
@@ -564,7 +566,7 @@ test('collect Flushes on shutdown before the store closes', async t => {
 	const test_ = harness(granted());
 	test_.options.state?.addLeftClick();
 
-	const running = run({kind: 'collect'}, test_.options);
+	const running = runCollect(test_.options);
 	/*
 	The Flush Interval here is an hour, so the only Flush there can be is the one
 	the signal causes: a Snapshot present after a SIGINT is the final Flush and
@@ -601,17 +603,14 @@ test('a Collector counts into the State the Session flushes', async t => {
 	*/
 	test_.shutdown.fire('SIGINT');
 
-	await run(
-		{kind: 'collect'},
-		{
-			...test_.options,
-			collectors(_report, state) {
-				const keyboard = new KeyboardCollector({state});
-				keyboard.handle(keyEventAt('keyDown', 0, BARE));
-				return {collectors: [keyboard]};
-			},
+	await runCollect({
+		...test_.options,
+		collectors(_report, state) {
+			const keyboard = new KeyboardCollector({state});
+			keyboard.handle(keyEventAt('keyDown', 0, BARE));
+			return {collectors: [keyboard]};
 		},
-	);
+	});
 
 	t.is(test_.store.snapshots.length, 1);
 	t.deepEqual(test_.store.snapshots[0]?.['keyCounts'], {A: 1});
@@ -633,13 +632,10 @@ test('a stream the factory supplies is started and stopped by the Session', asyn
 
 	test_.shutdown.fire('SIGINT');
 
-	await run(
-		{kind: 'collect'},
-		{
-			...test_.options,
-			collectors: () => ({collectors: [], stream: tracedStream(trace)}),
-		},
-	);
+	await runCollect({
+		...test_.options,
+		collectors: () => ({collectors: [], stream: tracedStream(trace)}),
+	});
 
 	t.deepEqual(trace, ['start', 'stop']);
 });
@@ -708,19 +704,16 @@ test('a denied grant builds no Collectors and asks for it once', async t => {
 
 	test_.shutdown.fire('SIGTERM');
 
-	await run(
-		{kind: 'collect'},
-		{
-			...withoutFactory(test_.options),
-			createStream() {
-				streams.push(1);
-				return new FakeStream();
-			},
-			requestInputMonitoring() {
-				requests.push(1);
-			},
+	await runCollect({
+		...withoutFactory(test_.options),
+		createStream() {
+			streams.push(1);
+			return new FakeStream();
 		},
-	);
+		requestInputMonitoring() {
+			requests.push(1);
+		},
+	});
 
 	t.is(requests.length, 1);
 	t.is(streams.length, 0);
@@ -743,16 +736,13 @@ test('an event through the factory’s own stream reaches the final Flush', asyn
 	const stream = new FakeStream();
 	const requests: number[] = [];
 
-	const running = run(
-		{kind: 'collect'},
-		{
-			...withoutFactory(test_.options),
-			createStream: () => stream,
-			requestInputMonitoring() {
-				requests.push(1);
-			},
+	const running = runCollect({
+		...withoutFactory(test_.options),
+		createStream: () => stream,
+		requestInputMonitoring() {
+			requests.push(1);
 		},
-	);
+	});
 
 	await stream.started;
 	stream.emit(keyEventAt('keyDown', 0, BARE));
@@ -787,17 +777,14 @@ async function deliver(events: readonly RawEvent[]): Promise<Delivery> {
 	const stream = new FakeStream();
 	const problems: StreamProblem[] = [];
 
-	const running = run(
-		{kind: 'collect'},
-		{
-			...withoutFactory(test_.options),
-			createStream: () => stream,
-			onProblem(problem) {
-				problems.push(problem);
-			},
-			requestInputMonitoring: noGrantRequest,
+	const running = runCollect({
+		...withoutFactory(test_.options),
+		createStream: () => stream,
+		onProblem(problem) {
+			problems.push(problem);
 		},
-	);
+		requestInputMonitoring: noGrantRequest,
+	});
 
 	/*
 	Delivered after `start()`, so they reach a run that is genuinely under way,
@@ -918,13 +905,10 @@ test('a failed final Flush exits non-zero, because the counters are lost', async
 
 	const previous = process.exitCode;
 	try {
-		const running = run(
-			{kind: 'collect'},
-			{
-				...test_.options,
-				createStore: () => FAILING_STORE,
-			},
-		);
+		const running = runCollect({
+			...test_.options,
+			createStore: () => FAILING_STORE,
+		});
 		test_.shutdown.fire('SIGTERM');
 		await running;
 
@@ -938,7 +922,7 @@ test('a failed final Flush exits non-zero, because the counters are lost', async
 test('collect names the signal it stopped on', async t => {
 	const test_ = harness(granted());
 
-	const running = run({kind: 'collect'}, test_.options);
+	const running = runCollect(test_.options);
 	test_.shutdown.fire('SIGINT');
 	await running;
 
@@ -948,7 +932,7 @@ test('collect names the signal it stopped on', async t => {
 test('permissions reports the grant and collects nothing', async t => {
 	const test_ = harness(denied());
 
-	await run({kind: 'permissions'}, test_.options);
+	await runPermissions(test_.options);
 
 	t.is(test_.permissions.calls.length, 1);
 	t.is(test_.store.snapshots.length, 0);
@@ -974,16 +958,13 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 	// this run's rather than an import-time value or the drawing's own.
 	const before = new Date();
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...test_.options,
-			async renderApp(view) {
-				atRender = new Date();
-				rendered.push(view);
-			},
+	await runDashboard({
+		...test_.options,
+		async renderApp(view) {
+			atRender = new Date();
+			rendered.push(view);
 		},
-	);
+	});
 
 	/*
 	The view reads the store the Flush wrote, rather than a reader opened
@@ -1031,15 +1012,12 @@ test('a missing grant reaches the live view as a disabled reading', async t => {
 	const test_ = harness(denied());
 	const readings: LiveTelemetry[] = [];
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...test_.options,
-			async renderApp(view) {
-				readings.push(view.telemetry.read());
-			},
+	await runDashboard({
+		...test_.options,
+		async renderApp(view) {
+			readings.push(view.telemetry.read());
 		},
-	);
+	});
 
 	t.is(test_.permissions.calls.length, 1, 'the dashboard preflights');
 	t.deepEqual(readings, [
@@ -1066,15 +1044,12 @@ test('a Flush is counted into the live totals', async t => {
 	let telemetry: TelemetrySource | undefined;
 	test_.options.state?.addLeftClick();
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...test_.options,
-			async renderApp(view) {
-				telemetry = view.telemetry;
-			},
+	await runDashboard({
+		...test_.options,
+		async renderApp(view) {
+			telemetry = view.telemetry;
 		},
-	);
+	});
 
 	t.deepEqual(totalsOf(telemetry?.read()), {
 		leftClicks: 1,
@@ -1119,24 +1094,21 @@ async function logged(
 	const state = new TelemetryState();
 	let runLog: RunLogSource | undefined;
 
-	const running = run(
-		{kind: 'dashboard'},
-		{
-			...withoutFactory(test_.options),
-			...(store && {createStore: () => store}),
-			state,
-			createStream: () => stream,
-			requestInputMonitoring: noGrantRequest,
-			async renderApp(view) {
-				runLog = view.runLog;
-				/*
+	const running = runDashboard({
+		...withoutFactory(test_.options),
+		...(store && {createStore: () => store}),
+		state,
+		createStream: () => stream,
+		requestInputMonitoring: noGrantRequest,
+		async renderApp(view) {
+			runLog = view.runLog;
+			/*
 				What `tui.tsx` does: the frame stays up until the run ends, and
 				the Run Log is read once it has — so the final Flush has landed.
 				*/
-				await view.ended;
-			},
+			await view.ended;
 		},
-	);
+	});
 
 	await stream.started;
 	// Held across the delivery rather than the run: `handle` and the reporter it
@@ -1254,21 +1226,18 @@ test('an unreadable line and a helper exit are entries too', async t => {
 	const runLog = new InProcessRunLogSource();
 	let report: ((problem: StreamProblem) => void) | undefined;
 
-	const running = run(
-		{kind: 'dashboard'},
-		{
-			...withoutFactory(test_.options),
-			runLog,
-			createStream({onProblem}) {
-				report = onProblem;
-				return stream;
-			},
-			requestInputMonitoring: noGrantRequest,
-			async renderApp(view) {
-				await view.ended;
-			},
+	const running = runDashboard({
+		...withoutFactory(test_.options),
+		runLog,
+		createStream({onProblem}) {
+			report = onProblem;
+			return stream;
 		},
-	);
+		requestInputMonitoring: noGrantRequest,
+		async renderApp(view) {
+			await view.ended;
+		},
+	});
 
 	await stream.started;
 	report?.({kind: 'unreadable-line', line: 'not an event'});
@@ -1309,16 +1278,13 @@ async function entriesFromRead(
 	test_.store.readResult = result;
 	test_.store.readWarnings = warnings;
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...test_.options,
-			runLog,
-			async renderApp(view) {
-				view.history.load('today', new Date());
-			},
+	await runDashboard({
+		...test_.options,
+		runLog,
+		async renderApp(view) {
+			view.history.load('today', new Date());
 		},
-	);
+	});
 
 	return runLog.read();
 }
@@ -1359,15 +1325,12 @@ test('collect still prints helper problems to stderr', async t => {
 	const stream = new FakeStream();
 	const runLog = new InProcessRunLogSource();
 
-	const running = run(
-		{kind: 'collect'},
-		{
-			...withoutFactory(test_.options),
-			runLog,
-			createStream: () => stream,
-			requestInputMonitoring: noGrantRequest,
-		},
-	);
+	const running = runCollect({
+		...withoutFactory(test_.options),
+		runLog,
+		createStream: () => stream,
+		requestInputMonitoring: noGrantRequest,
+	});
 
 	await stream.started;
 	const written = captureStderr(() => {
@@ -1403,14 +1366,11 @@ test('collect warns once for a failed Flush, from the attempt itself', async t =
 	const store = new FakeStore(1);
 	test_.options.state?.addLeftClick();
 
-	const running = run(
-		{kind: 'collect'},
-		{
-			...test_.options,
-			createStore: () => store,
-			config: {...CONFIG, flushIntervalSeconds: 0.005},
-		},
-	);
+	const running = runCollect({
+		...test_.options,
+		createStore: () => store,
+		config: {...CONFIG, flushIntervalSeconds: 0.005},
+	});
 
 	await until(
 		() => test_.logger.warnings.length > 0,
@@ -1450,26 +1410,23 @@ test('a dashboard reports a failed Flush once, and writes nothing to stderr', as
 
 	const watch = watchStderr();
 	try {
-		await run(
-			{kind: 'dashboard'},
-			{
-				...withoutFactory(test_.options),
-				createStore: () => new FakeStore(1),
-				runLog,
-				state,
-				config: {...CONFIG, flushIntervalSeconds: 0.005},
-				createStream: () => new FakeStream(),
-				requestInputMonitoring: noGrantRequest,
-				async renderApp(view) {
-					await until(
-						() => runLog.read().some(entry => entry.failed === true),
-						'the failed interval Flush',
-					);
-					test_.shutdown.fire('SIGINT');
-					await view.ended;
-				},
+		await runDashboard({
+			...withoutFactory(test_.options),
+			createStore: () => new FakeStore(1),
+			runLog,
+			state,
+			config: {...CONFIG, flushIntervalSeconds: 0.005},
+			createStream: () => new FakeStream(),
+			requestInputMonitoring: noGrantRequest,
+			async renderApp(view) {
+				await until(
+					() => runLog.read().some(entry => entry.failed === true),
+					'the failed interval Flush',
+				);
+				test_.shutdown.fire('SIGINT');
+				await view.ended;
 			},
-		);
+		});
 	} finally {
 		watch.restore();
 	}
@@ -1495,27 +1452,26 @@ a silencing: a dashboard that stopped the chatter by stopping it everywhere
 would pass the first assertion and fail the second, and a `collect` run would
 have lost the tap's notes without anyone deciding it should (ADR-0010).
 */
-async function sinksFor(kind: 'collect' | 'dashboard'): Promise<StreamSinks> {
+async function sinksFor(
+	entry: (options: RunOptions) => Promise<void>,
+): Promise<StreamSinks> {
 	const test_ = harness(granted());
 	const stream = new FakeStream();
 	let sinks: StreamSinks | undefined;
 
 	test_.shutdown.fire('SIGINT');
 
-	await run(
-		{kind},
-		{
-			...withoutFactory(test_.options),
-			createStream(where) {
-				sinks = where;
-				return stream;
-			},
-			requestInputMonitoring: noGrantRequest,
-			async renderApp(view) {
-				await view.ended;
-			},
+	await entry({
+		...withoutFactory(test_.options),
+		createStream(where) {
+			sinks = where;
+			return stream;
 		},
-	);
+		requestInputMonitoring: noGrantRequest,
+		async renderApp(view) {
+			await view.ended;
+		},
+	});
 
 	if (sinks === undefined) {
 		throw new Error('the factory built no stream');
@@ -1525,8 +1481,8 @@ async function sinksFor(kind: 'collect' | 'dashboard'): Promise<StreamSinks> {
 }
 
 test('a dashboard sends the helper’s stderr nowhere, and collect sends it to the terminal', async t => {
-	const dashboard = await sinksFor('dashboard');
-	const collect = await sinksFor('collect');
+	const dashboard = await sinksFor(runDashboard);
+	const collect = await sinksFor(runCollect);
 
 	t.deepEqual(
 		captureStderr(() => {
@@ -1561,29 +1517,26 @@ test('the write seam’s warning is an entry in dashboard mode, and not a line o
 	const runLog = new InProcessRunLogSource();
 	let written: readonly string[] = [];
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...test_.options,
-			runLog,
-			async renderApp(view) {
-				written = captureStderr(() => {
-					test_.pushLoggers[0]?.warn(
-						'Failed to create TTL index on telemetry',
-						new Error('not authorized'),
-					);
-				});
+	await runDashboard({
+		...test_.options,
+		runLog,
+		async renderApp(view) {
+			written = captureStderr(() => {
+				test_.pushLoggers[0]?.warn(
+					'Failed to create TTL index on telemetry',
+					new Error('not authorized'),
+				);
+			});
 
-				/*
+			/*
 				The frame comes down when the run ends, so the signal is what
 				ends it — and it is raised after the warning, so the warning is
 				made while there is a frame to keep whole.
 				*/
-				test_.shutdown.fire('SIGINT');
-				await view.ended;
-			},
+			test_.shutdown.fire('SIGINT');
+			await view.ended;
 		},
-	);
+	});
 
 	t.deepEqual(written, [], 'the frame is the only output');
 	t.deepEqual(
@@ -1607,7 +1560,7 @@ test('collect keeps the write seam’s warning on stderr', async t => {
 	const runLog = new InProcessRunLogSource();
 
 	test_.shutdown.fire('SIGINT');
-	await run({kind: 'collect'}, {...test_.options, runLog});
+	await runCollect({...test_.options, runLog});
 
 	t.deepEqual(
 		captureStderr(() => {
@@ -1638,22 +1591,19 @@ test('a missing grant is one entry on a run that never starts', async t => {
 
 	test_.shutdown.fire('SIGTERM');
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...withoutFactory(test_.options),
-			runLog,
-			createStream() {
-				throw new Error('a denied grant builds no stream');
-			},
-			requestInputMonitoring() {
-				// Stubbed: the real one asks macOS, and nobody is at this keyboard.
-			},
-			async renderApp(view) {
-				reading = view.telemetry.read();
-			},
+	await runDashboard({
+		...withoutFactory(test_.options),
+		runLog,
+		createStream() {
+			throw new Error('a denied grant builds no stream');
 		},
-	);
+		requestInputMonitoring() {
+			// Stubbed: the real one asks macOS, and nobody is at this keyboard.
+		},
+		async renderApp(view) {
+			reading = view.telemetry.read();
+		},
+	});
 
 	const entries = runLog.read();
 	t.is(entries.length, 1, 'one grant, so one entry');
@@ -1691,7 +1641,7 @@ test('collect records its Flush attempts as well', async t => {
 	const runLog = new InProcessRunLogSource();
 	test_.options.state?.addLeftClick();
 
-	const running = run({kind: 'collect'}, {...test_.options, runLog});
+	const running = runCollect({...test_.options, runLog});
 	test_.shutdown.fire('SIGINT');
 	await running;
 
@@ -1709,15 +1659,12 @@ test('the store is closed even when rendering throws', async t => {
 	const test_ = harness(granted());
 
 	await t.throwsAsync(
-		run(
-			{kind: 'dashboard'},
-			{
-				...test_.options,
-				async renderApp() {
-					throw new Error('no tty');
-				},
+		runDashboard({
+			...test_.options,
+			async renderApp() {
+				throw new Error('no tty');
 			},
-		),
+		}),
 		{message: 'no tty'},
 	);
 
@@ -1732,26 +1679,26 @@ startup rather than collecting for hours into a retry that can never succeed.
 Before the preflight, which is what makes it quiet as well as early: no helper is
 asked, and no frame is drawn over the store's own sentence.
 */
-for (const kind of ['collect', 'dashboard'] as const) {
+for (const [kind, entry] of [
+	['collect', runCollect],
+	['dashboard', runDashboard],
+] as const) {
 	test(`a store that cannot be opened ends a ${kind} run before the preflight`, async t => {
 		const test_ = harness(granted());
 		let rendered = 0;
 
 		await t.throwsAsync(
-			run(
-				{kind},
-				{
-					...test_.options,
-					createStore() {
-						throw new Error(
-							'Could not open the Local Store at /tmp/telemetry.db: file is not a database',
-						);
-					},
-					async renderApp() {
-						rendered += 1;
-					},
+			entry({
+				...test_.options,
+				createStore() {
+					throw new Error(
+						'Could not open the Local Store at /tmp/telemetry.db: file is not a database',
+					);
 				},
-			),
+				async renderApp() {
+					rendered += 1;
+				},
+			}),
 			{message: /file is not a database/v},
 		);
 
@@ -1772,7 +1719,7 @@ test('a store already opened is closed when the preflight cannot answer', async 
 		'the helper printed no permission report',
 	);
 
-	await t.throwsAsync(run({kind: 'collect'}, test_.options), {
+	await t.throwsAsync(runCollect(test_.options), {
 		message: 'the helper printed no permission report',
 	});
 
@@ -1789,7 +1736,7 @@ test('the Push is built over the store, and closed with the run', async t => {
 	const test_ = harness(granted());
 	test_.options.state?.addLeftClick();
 
-	const running = run({kind: 'collect'}, test_.options);
+	const running = runCollect(test_.options);
 	test_.shutdown.fire('SIGINT');
 	await running;
 
@@ -1814,20 +1761,17 @@ test('a failed Drain is one red entry in dashboard mode', async t => {
 	const runLog = new InProcessRunLogSource();
 	test_.pusher.failsWith = new Error('connect ECONNREFUSED 127.0.0.1');
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...test_.options,
-			runLog,
-			async renderApp() {
-				/*
+	await runDashboard({
+		...test_.options,
+		runLog,
+		async renderApp() {
+			/*
 				The frame comes down here, and the run ends — which is what asks
 				for the last Drain, so both attempts the run makes are its own.
 				*/
-				test_.shutdown.fire('SIGINT');
-			},
+			test_.shutdown.fire('SIGINT');
 		},
-	);
+	});
 
 	const failures = runLog.read();
 	t.true(test_.pusher.drains > 0, 'the run really did Drain');
@@ -1857,20 +1801,17 @@ test('a gathered Drain is one plain entry, and a single era is none at all', asy
 	const test_ = harness(granted());
 	const runLog = new InProcessRunLogSource();
 
-	await run(
-		{kind: 'dashboard'},
-		{
-			...test_.options,
-			runLog,
-			async renderApp() {
-				const sink = test_.pushAttempts[0];
-				sink?.({at: new Date(), ok: true, pushed: 4});
-				sink?.({at: new Date(), ok: true, pushed: 1});
-				sink?.({at: new Date(), ok: true, pushed: 1234});
-				test_.shutdown.fire('SIGINT');
-			},
+	await runDashboard({
+		...test_.options,
+		runLog,
+		async renderApp() {
+			const sink = test_.pushAttempts[0];
+			sink?.({at: new Date(), ok: true, pushed: 4});
+			sink?.({at: new Date(), ok: true, pushed: 1});
+			sink?.({at: new Date(), ok: true, pushed: 1234});
+			test_.shutdown.fire('SIGINT');
 		},
-	);
+	});
 
 	t.deepEqual(
 		runLog.read().map(entry => [entry.class, entry.failed, entry.summary]),
@@ -1900,8 +1841,8 @@ test('collect sends the Push seam’s sentences to the terminal', async t => {
 	gathered.pusher.pushed = 3;
 	gathered.shutdown.fire('SIGINT');
 
-	await run({kind: 'collect'}, {...failed.options, runLog: failedLog});
-	await run({kind: 'collect'}, gathered.options);
+	await runCollect({...failed.options, runLog: failedLog});
+	await runCollect(gathered.options);
 
 	t.true(
 		failed.logger.warnings.includes('connect ECONNREFUSED 127.0.0.1'),
@@ -1930,7 +1871,7 @@ test('a driver’s multi-line message reaches a headless run whole', async t => 
 	test_.pusher.failsWith = new Error('server selection timed out\nafter 30s');
 	test_.shutdown.fire('SIGINT');
 
-	await run({kind: 'collect'}, test_.options);
+	await runCollect(test_.options);
 
 	t.true(
 		test_.logger.warnings.includes('server selection timed out\nafter 30s'),
@@ -1961,7 +1902,7 @@ test('a backlog that survives the run is logged without touching the exit code',
 
 	try {
 		test_.shutdown.fire('SIGTERM');
-		await run({kind: 'collect'}, test_.options);
+		await runCollect(test_.options);
 
 		t.is(
 			process.exitCode,
@@ -1987,7 +1928,7 @@ test('the stranded count is spelled the way the totals are', async t => {
 	);
 	test_.shutdown.fire('SIGTERM');
 
-	await run({kind: 'collect'}, test_.options);
+	await runCollect(test_.options);
 
 	t.is(test_.logger.lines.at(-1), '1,234 eras await Push.');
 });
@@ -2001,7 +1942,7 @@ test('one stranded era is spelled as one', async t => {
 	test_.store.waiting.push(era(1));
 	test_.shutdown.fire('SIGTERM');
 
-	await run({kind: 'collect'}, test_.options);
+	await runCollect(test_.options);
 
 	t.is(test_.logger.lines.at(-1), '1 era awaits Push.');
 });
@@ -2010,7 +1951,7 @@ test('a run that left no backlog behind says nothing about one', async t => {
 	const test_ = harness(granted());
 	test_.shutdown.fire('SIGTERM');
 
-	await run({kind: 'collect'}, test_.options);
+	await runCollect(test_.options);
 
 	t.false(
 		test_.logger.lines.some(line => line.includes('await Push')),
@@ -2027,31 +1968,28 @@ test('a Collector that throws on start stops the dashboard and propagates', asyn
 	const test_ = harness(granted());
 
 	await t.throwsAsync(
-		run(
-			{kind: 'dashboard'},
-			{
-				...test_.options,
-				collectors: () => ({
-					collectors: [
-						{
-							start() {
-								throw new Error('no tap');
-							},
-							stop() {
-								// Never reached: the Collector that threw is not stopped.
-							},
+		runDashboard({
+			...test_.options,
+			collectors: () => ({
+				collectors: [
+					{
+						start() {
+							throw new Error('no tap');
 						},
-					],
-				}),
-				async renderApp(view) {
-					/*
+						stop() {
+							// Never reached: the Collector that threw is not stopped.
+						},
+					},
+				],
+			}),
+			async renderApp(view) {
+				/*
 					What `tui.tsx` does: the view stays up until the run ends, and
 					the run has already ended badly here.
 					*/
-					await view.ended;
-				},
+				await view.ended;
 			},
-		),
+		}),
 		{message: 'no tap'},
 	);
 

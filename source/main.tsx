@@ -19,10 +19,16 @@ hours collecting into a retry that can never succeed. The Pusher's half of the
 same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
 it, or cannot be built at all, is a run that carries on.
 
+Three entry points stand at the top of it — `runCollect`, `runDashboard` and
+`runPermissions` — one per command, each taking no more than the command reads
+and each named for what it runs. Which one a command line means is decided a
+module up, in `cli.tsx`, which is also the only caller that supplies the real
+permissions source: nothing here imports the command type, so a pairing of
+command and entry point cannot be stated twice and drift.
+
 The pieces arrive as options rather than being reached for directly: this module
 is where permission, store, state and Collector meet, and a test that had to
-build a real one of each could not check the meeting. `cli.tsx` is the caller
-that supplies the real ones.
+build a real one of each could not check the meeting.
 
 The Collectors are one of those pieces, and their default is here rather than in
 the entry point (ADR-0008). Which Collector owns which event is a decision about
@@ -31,7 +37,6 @@ switch kept there was reached by no test at all.
 */
 
 import process from 'node:process';
-import {type Command} from './args.js';
 import {COUNT_FORMAT} from './format.js';
 import {type Config, loadConfig} from './store/config.js';
 import {
@@ -340,75 +345,93 @@ type RunDeps = {
 	readonly pusher: Pusher;
 };
 
-export type RunOptions = CollectorFactoryOptions & {
+/*
+The two things the `permissions` command reads, and the whole of what that
+command is handed: it asks a question and reports the answer, so it opens no
+store, starts no Session and draws no frame. Stated on its own because the
+entry point's signature is what says what the command depends on.
+
+`RunOptions` carries both, so a caller that wired a collection run can hand the
+same object to this entry point without converting it.
+*/
+export type PermissionsOptions = {
 	readonly permissions: PermissionSource;
-	/*
-	Which Collectors run, and the stream they read if they read one. Absent from
-	a CLI run, which wants the default — and `cli.tsx`, which still supplies the
-	permission source, no longer supplies this (ADR-0008).
-
-	The stream is not an option of its own beside this one. Whether there is one
-	at all is the same question as whether there are Collectors, and a stream
-	supplied here but not known to the factory would be one that nothing is
-	reading: a run that starts every Collector and feeds it no events.
-	*/
-	readonly collectors?: CollectorFactory;
-	readonly shutdown?: ShutdownSignal;
 	readonly logger?: Logger;
-	/*
-	The Local Store, as the composition root opens it, built with the reporter
-	the read face's warnings go to. The one implementation is the file itself, so
-	a caller supplying this is a test handing over a stand-in — which is what
-	lets an unopenable store, a Flush that fails, or a read that fails be driven
-	without a SQLite file and without leaving one behind.
-
-	The reporter is handed over rather than reached for afterwards, the shape
-	`createStream` and `createPusher` both have: what a seam reports is settled
-	when it is built, so a caller building one of its own reports where it was
-	told to. A reader is the third face of the store, not a module beside it, so
-	there is no second seam to supply.
-	*/
-	readonly createStore?: (onWarning: ReadWarningReporter) => RunStore;
-	/*
-	The Push seam, built over the store's Push Backlog and with both things it
-	reports through: the logger its own warnings go to, and the sink each Drain
-	attempt goes to — the shape `createStore` has, and for the same reason. A
-	caller supplying this is a test: what a Drain carries is `push.test.ts`'s,
-	and what a test wants here is a Drain that does nothing rather than one that
-	reaches for Atlas.
-	*/
-	readonly createPusher?: (
-		backlog: PushBacklog,
-		logger: Pick<Console, 'warn'>,
-		onAttempt: (attempt: PushAttempt) => void,
-	) => Pusher;
-	readonly state?: TelemetryState;
-	/*
-	The Run Log the run appends to. An option for the reason `state` is one: a
-	test that wants to see what a run recorded supplies its own and reads it
-	afterwards, and in `collect` — where there is no view to read one — that is
-	the only way to see it at all.
-	*/
-	readonly runLog?: InProcessRunLogSource;
-	/*
-	An option so a test can set a Flush Interval without an environment to load
-	one from. `loadConfig` reads the real environment, and the tests have none.
-	*/
-	readonly config?: Config;
-	/*
-	The dashboard's one dependency on ink, as an option for the same reason as
-	the rest: mounting a real Ink root needs a TTY, and what this module owns is
-	the sources' lifetime rather than the view.
-	*/
-	readonly renderApp?: (view: DashboardView) => Promise<void>;
 };
 
+export type RunOptions = CollectorFactoryOptions &
+	PermissionsOptions & {
+		/*
+		Which Collectors run, and the stream they read if they read one. Absent from
+		a CLI run, which wants the default — and `cli.tsx`, which still supplies the
+		permission source, no longer supplies this (ADR-0008).
+
+		The stream is not an option of its own beside this one. Whether there is one
+		at all is the same question as whether there are Collectors, and a stream
+		supplied here but not known to the factory would be one that nothing is
+		reading: a run that starts every Collector and feeds it no events.
+		*/
+		readonly collectors?: CollectorFactory;
+		readonly shutdown?: ShutdownSignal;
+		/*
+		The Local Store, as the composition root opens it, built with the reporter
+		the read face's warnings go to. The one implementation is the file itself, so
+		a caller supplying this is a test handing over a stand-in — which is what
+		lets an unopenable store, a Flush that fails, or a read that fails be driven
+		without a SQLite file and without leaving one behind.
+
+		The reporter is handed over rather than reached for afterwards, the shape
+		`createStream` and `createPusher` both have: what a seam reports is settled
+		when it is built, so a caller building one of its own reports where it was
+		told to. A reader is the third face of the store, not a module beside it, so
+		there is no second seam to supply.
+		*/
+		readonly createStore?: (onWarning: ReadWarningReporter) => RunStore;
+		/*
+		The Push seam, built over the store's Push Backlog and with both things it
+		reports through: the logger its own warnings go to, and the sink each Drain
+		attempt goes to — the shape `createStore` has, and for the same reason. A
+		caller supplying this is a test: what a Drain carries is `push.test.ts`'s,
+		and what a test wants here is a Drain that does nothing rather than one that
+		reaches for Atlas.
+		*/
+		readonly createPusher?: (
+			backlog: PushBacklog,
+			logger: Pick<Console, 'warn'>,
+			onAttempt: (attempt: PushAttempt) => void,
+		) => Pusher;
+		readonly state?: TelemetryState;
+		/*
+		The Run Log the run appends to. An option for the reason `state` is one: a
+		test that wants to see what a run recorded supplies its own and reads it
+		afterwards, and in `collect` — where there is no view to read one — that is
+		the only way to see it at all.
+		*/
+		readonly runLog?: InProcessRunLogSource;
+		/*
+		An option so a test can set a Flush Interval without an environment to load
+		one from. `loadConfig` reads the real environment, and the tests have none.
+		*/
+		readonly config?: Config;
+		/*
+		The dashboard's one dependency on ink, as an option for the same reason as
+		the rest: mounting a real Ink root needs a TTY, and what this module owns is
+		the sources' lifetime rather than the view.
+		*/
+		readonly renderApp?: (view: DashboardView) => Promise<void>;
+	};
+
 /*
-Both permissions and collection. Exported so the preflight can be exercised on
-its own — it is the answer to a question the user can ask without collecting.
+The `permissions` entry point: a command with no mode, because it answers a
+question and opens no Session.
+
+Reached twice, and the flag is the whole of the difference. The command was
+*asked*, so it reports a grant either way; a collection run asks the same
+question on its way to the Collectors, where a granted grant is the
+unremarkable case and a line about it would be noise on every start.
 */
 export async function runPermissions(
-	options: RunOptions,
+	options: PermissionsOptions,
 	{announceGranted = false}: {announceGranted?: boolean} = {},
 ): Promise<PermissionReport> {
 	const logger = options.logger ?? console;
@@ -1053,21 +1076,18 @@ function noop(): void {
 	// See the call sites: nothing to do, on purpose, in both places.
 }
 
-export async function run(
-	command: Command,
-	options: RunOptions,
-): Promise<void> {
-	switch (command.kind) {
-		case 'dashboard': {
-			return runCollection(options, dashboardMode);
-		}
+/*
+The two entry points that collect, one per command, and each named for the
+command it runs. They differ by no more than the mode they hand the skeleton —
+which is the whole reason a third collecting command is composition rather than
+a third copy of the flow.
 
-		case 'collect': {
-			return runCollection(options, collectMode);
-		}
+Neither is told which command it is: the command decided that, one module up.
+*/
+export async function runCollect(options: RunOptions): Promise<void> {
+	return runCollection(options, collectMode);
+}
 
-		case 'permissions': {
-			await runPermissions(options, {announceGranted: true});
-		}
-	}
+export async function runDashboard(options: RunOptions): Promise<void> {
+	return runCollection(options, dashboardMode);
 }

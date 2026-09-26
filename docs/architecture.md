@@ -59,8 +59,15 @@ server.
 `main.tsx` is the composition root and the only place a `Pusher` is built. It owns the Local
 Store's lifetime and the Pusher's — and, through it, the `MongoClient`'s — and closes both on
 every path, because a client left open keeps the process alive after the work has finished.
-`cli.tsx` is only the entry point above it: parses argv and reports a failure's message rather
-than its stack.
+**Each command has its own entry point.** `runCollect` and `runDashboard` take the collection
+type, which is one type because their field sets coincide; `runPermissions` takes a narrow type
+holding the permission source and a logger — the two things that command reads — which the
+collection type satisfies structurally, so one object can be handed to either. `cli.tsx` is the entry point
+above them all: it parses argv, dispatches to the one the command names, and reports a failure's
+message rather than its stack. The dispatch is the whole of the pairing between a command and
+the entry point that runs it, and it lives there rather than here so the pairing is stated once
+— which is why the composition root imports no command type at all, and why the `permissions`
+command is the one that announces a grant: it is the one that was asked.
 
 `main.tsx` supplies the Collectors too, and the default factory is its own rather than the entry
 point's, along with what that factory reaches for — the helper stream it builds, the grant it
