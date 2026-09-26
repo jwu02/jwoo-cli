@@ -18,10 +18,10 @@ the two must not read alike.
 */
 
 import {Box, Text} from 'ink';
-import {clockTime} from './format.js';
-import {type Totals} from './local-store.js';
+import {clockTime} from '../format.js';
+import {type Totals} from '../store/local-store.js';
+import {type LiveTelemetry} from '../telemetry.js';
 import {TotalsView} from './totals-view.js';
-import {type LiveTelemetry} from './telemetry.js';
 
 export function LiveView({
 	telemetry,

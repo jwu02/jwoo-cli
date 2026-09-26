@@ -9,9 +9,9 @@ is the boundary the value actually crosses.
 */
 
 import test from 'ava';
+import {TelemetryState} from '../state.js';
 import {MouseCollector} from './mouse.js';
 import {type MouseButton} from './raw-event.js';
-import {TelemetryState} from './state.js';
 
 type Harness = {
 	readonly state: TelemetryState;

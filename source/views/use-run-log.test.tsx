@@ -1,7 +1,7 @@
 import test from 'ava';
 import {Text} from 'ink';
 import {render} from 'ink-testing-library';
-import {type RunLogEntry, type RunLogSource} from './run-log.js';
+import {type RunLogEntry, type RunLogSource} from '../run-log.js';
 import {useRunLog} from './use-run-log.js';
 
 /*

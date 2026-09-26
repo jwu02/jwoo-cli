@@ -1,8 +1,8 @@
 import test from 'ava';
 import {render} from 'ink-testing-library';
-import {type Totals} from './local-store.js';
+import {type Totals} from '../store/local-store.js';
+import {type LiveTelemetry} from '../telemetry.js';
 import {LiveView} from './live-view.js';
-import {type LiveTelemetry} from './telemetry.js';
 
 /*
 The view is presentational: it takes a reading, the run's start and a zone, and

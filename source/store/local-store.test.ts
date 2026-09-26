@@ -15,6 +15,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import test, {type ExecutionContext} from 'ava';
+import {type Snapshot} from '../state.js';
 import {type Config} from './config.js';
 import {instantFromLocalFields, type LocalFields} from './local-time.js';
 import {
@@ -25,7 +26,6 @@ import {
 	type TimeSeriesPoint,
 } from './local-store.js';
 import {type Range} from './ranges.js';
-import {type Snapshot} from './state.js';
 
 const ZONE = 'UTC';
 

@@ -24,8 +24,8 @@ counts, and the same sentence twice would read as two entries.
 */
 
 import {Box, Text} from 'ink';
-import {CLOCK_WIDTH, clockTime} from './format.js';
-import {type RunLogEntry} from './run-log.js';
+import {CLOCK_WIDTH, clockTime} from '../format.js';
+import {type RunLogEntry} from '../run-log.js';
 
 export function DiagnosticsView({
 	entries,

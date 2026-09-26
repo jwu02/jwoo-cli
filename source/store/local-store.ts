@@ -21,9 +21,9 @@ history view asks this file the same three questions it used to ask MongoDB, and
 import {mkdirSync} from 'node:fs';
 import {dirname} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {type Snapshot} from '../state.js';
 import {type Config} from './config.js';
 import {bucketBoundaries, type Range} from './ranges.js';
-import {type Snapshot} from './state.js';
 
 /*
 A row as the driver hands it back.

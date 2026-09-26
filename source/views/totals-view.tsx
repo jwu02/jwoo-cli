@@ -11,8 +11,8 @@ than descriptions, and neither is abbreviated to fit the label column.
 */
 
 import {Box, Text} from 'ink';
-import {COUNT_FORMAT, METRES_FORMAT} from './format.js';
-import {type Totals} from './local-store.js';
+import {COUNT_FORMAT, METRES_FORMAT} from '../format.js';
+import {type Totals} from '../store/local-store.js';
 
 // Wide enough for "Mouse Distance", the longest label, with a gap after it.
 const LABEL_WIDTH = 16;

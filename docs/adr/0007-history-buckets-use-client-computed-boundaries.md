@@ -67,15 +67,15 @@ unit and then two, because on a fall-back day `01:00` is ambiguous and the first
 back on `from`. On `Europe/London`'s fall-back day this yields a 24-bucket list for a 25-hour day
 with one bucket two hours wide — a bar that is one column wider than its neighbours, rather than
 an hour of data that vanishes. On spring-forward the nonexistent local hour is skipped and the
-list is one short. Both are asserted in `source/ranges.test.ts`.
+list is one short. Both are asserted in `source/store/ranges.test.ts`.
 
 ## Consequences
 
 - A client bug in the stepping degrades to a **wrongly-shaped bar, not lost data**, because the
   series still sums to the totals. `source/history.test.ts` asserts that sum against the totals
   query rather than against a fixture.
-- A boundary is defined in one place. `source/ranges.ts` owns both where a range starts and how
-  it steps, and nothing on the server encodes a bucket boundary, so moving one needs no deploy.
+- A boundary is defined in one place. `source/store/ranges.ts` owns both where a range starts and
+  how it steps, and nothing on the server encodes a bucket boundary, so moving one needs no deploy.
   Adding a third Range is **not** local, though — the view labels it and `app.tsx` binds a key
   to it, and neither reads that off `ranges.ts`.
 - Anything landing outside `boundaries[0..last]` is returned under the sentinel `_id`

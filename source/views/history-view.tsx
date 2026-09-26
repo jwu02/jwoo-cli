@@ -18,10 +18,10 @@ orders by count where Key Counts order by label, and it draws no keyboard.
 */
 
 import {Box, Text} from 'ink';
-import {COUNT_FORMAT, twoDigits} from './format.js';
-import {localFields, weekdayOf} from './local-time.js';
-import {type HistoryData, type LoadResult} from './local-store.js';
-import {bucketUnit, type Range} from './ranges.js';
+import {COUNT_FORMAT, twoDigits} from '../format.js';
+import {localFields, weekdayOf} from '../store/local-time.js';
+import {type HistoryData, type LoadResult} from '../store/local-store.js';
+import {bucketUnit, type Range} from '../store/ranges.js';
 import {TotalsView} from './totals-view.js';
 
 /*

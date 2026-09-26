@@ -26,14 +26,14 @@ the views are presentational.
 
 import {Box, Text, useApp, useInput} from 'ink';
 import {useMemo, useState} from 'react';
+import {type HistorySource} from '../store/local-store.js';
+import {type Range} from '../store/ranges.js';
+import {type RunLogSource} from '../run-log.js';
+import {type TelemetrySource} from '../telemetry.js';
 import {DiagnosticsView} from './diagnostics-view.js';
 import {HistoryView} from './history-view.js';
-import {type HistorySource} from './local-store.js';
 import {LiveView} from './live-view.js';
-import {type Range} from './ranges.js';
-import {type RunLogSource} from './run-log.js';
 import {RunLogView} from './run-log-view.js';
-import {type TelemetrySource} from './telemetry.js';
 import {useRunLog} from './use-run-log.js';
 import {useTelemetry} from './use-telemetry.js';
 import {useWindowHeight} from './use-window.js';

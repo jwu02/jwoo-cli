@@ -26,8 +26,8 @@ view draws them with the same code — a second declaration would be a second
 spelling of Clicks, Mouse Distance and Press Total.
 */
 
-import {type Totals} from './local-store.js';
-import {type PermissionReport} from './permissions.js';
+import {type Totals} from './store/local-store.js';
+import {type PermissionReport} from './capture/permissions.js';
 import {type FlushAttempt} from './session.js';
 import {type Snapshot, type TelemetryState} from './state.js';
 

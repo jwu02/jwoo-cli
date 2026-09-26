@@ -11,7 +11,7 @@ The locale is pinned rather than taken from the machine, so the tests assert the
 same digits everywhere.
 */
 
-import {localFields} from './local-time.js';
+import {localFields} from './store/local-time.js';
 
 export const COUNT_FORMAT = new Intl.NumberFormat('en-GB');
 

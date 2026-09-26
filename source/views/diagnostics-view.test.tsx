@@ -1,7 +1,7 @@
 import test from 'ava';
 import {render} from 'ink-testing-library';
+import {type RunLogEntry} from '../run-log.js';
 import {DiagnosticsView} from './diagnostics-view.js';
-import {type RunLogEntry} from './run-log.js';
 
 /*
 The diagnostics view is presentational, as the block is: it takes the entries and

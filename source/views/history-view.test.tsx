@@ -1,12 +1,12 @@
 import test from 'ava';
 import {render} from 'ink-testing-library';
-import {HistoryView} from './history-view.js';
 import {
 	type HistoryData,
 	type LoadResult,
 	type TimeSeriesPoint,
-} from './local-store.js';
-import {type Range} from './ranges.js';
+} from '../store/local-store.js';
+import {type Range} from '../store/ranges.js';
+import {HistoryView} from './history-view.js';
 
 /*
 The view is presentational: it takes what a read answered with and draws it.

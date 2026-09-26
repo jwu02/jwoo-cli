@@ -26,7 +26,7 @@ switch kept there was reached by no test at all.
 
 import process from 'node:process';
 import {type Command} from './args.js';
-import {type Config, loadConfig} from './config.js';
+import {type Config, loadConfig} from './store/config.js';
 import {
 	defaultHelperStderr,
 	defaultProblemReporter,
@@ -34,23 +34,26 @@ import {
 	requestInputMonitoring as askForInputMonitoring,
 	type StreamProblem,
 	type StreamSinks,
-} from './helper.js';
+} from './capture/helper.js';
 import {
 	defaultReadWarningReporter,
 	LocalStore,
 	type HistorySource,
 	type ReadWarningReporter,
-} from './local-store.js';
-import {KeyboardCollector} from './keyboard.js';
-import {MouseCollector} from './mouse.js';
-import {type PermissionReport, type PermissionSource} from './permissions.js';
+} from './store/local-store.js';
+import {KeyboardCollector} from './capture/keyboard.js';
+import {MouseCollector} from './capture/mouse.js';
+import {
+	type PermissionReport,
+	type PermissionSource,
+} from './capture/permissions.js';
 /*
 The class is this module's name for the real Push; the type it is held as is
 `session.ts`'s slice of it, which a stand-in can satisfy — the same split
 `EventStream as HelperStream` above makes.
 */
-import {type PushBacklog, Pusher as MongoPusher} from './push.js';
-import {type RawEvent} from './raw-event.js';
+import {type PushBacklog, Pusher as MongoPusher} from './store/push.js';
+import {type RawEvent} from './capture/raw-event.js';
 import {
 	collectionEntry,
 	flushEntry,
@@ -826,7 +829,7 @@ async function runDashboard(options: RunOptions): Promise<void> {
 		*/
 		let render = options.renderApp;
 		if (render === undefined) {
-			({renderApp: render} = await import('./tui.js'));
+			({renderApp: render} = await import('./views/tui.js'));
 		}
 
 		/*

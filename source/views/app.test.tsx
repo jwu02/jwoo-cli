@@ -1,14 +1,14 @@
 import test, {type ExecutionContext} from 'ava';
 import {render} from 'ink-testing-library';
-import App from './app.js';
 import {
 	type HistoryData,
 	type HistorySource,
 	type LoadResult,
-} from './local-store.js';
-import {type Range} from './ranges.js';
-import {type RunLogEntry, type RunLogSource} from './run-log.js';
-import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
+} from '../store/local-store.js';
+import {type Range} from '../store/ranges.js';
+import {type RunLogEntry, type RunLogSource} from '../run-log.js';
+import {type LiveTelemetry, type TelemetrySource} from '../telemetry.js';
+import App from './app.js';
 
 /*
 Serial because each case mounts a real Ink root onto a shared scheduler, and

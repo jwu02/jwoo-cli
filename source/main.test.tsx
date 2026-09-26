@@ -1,6 +1,6 @@
 import process from 'node:process';
 import test from 'ava';
-import {type Config} from './config.js';
+import {type Config} from './store/config.js';
 import {
 	type Era,
 	type HistoryData,
@@ -8,7 +8,7 @@ import {
 	type ReadWarning,
 	type ReadWarningReporter,
 	type Totals,
-} from './local-store.js';
+} from './store/local-store.js';
 import {
 	type CollectorFactory,
 	type DashboardView,
@@ -17,11 +17,18 @@ import {
 	type RunStore,
 	run,
 } from './main.js';
-import {type StreamProblem, type StreamSinks} from './helper.js';
-import {KeyboardCollector} from './keyboard.js';
-import {type PermissionReport, type PermissionSource} from './permissions.js';
-import {type PushBacklog} from './push.js';
-import {type HelperError, keyEventAt, type RawEvent} from './raw-event.js';
+import {type StreamProblem, type StreamSinks} from './capture/helper.js';
+import {KeyboardCollector} from './capture/keyboard.js';
+import {
+	type PermissionReport,
+	type PermissionSource,
+} from './capture/permissions.js';
+import {type PushBacklog} from './store/push.js';
+import {
+	type HelperError,
+	keyEventAt,
+	type RawEvent,
+} from './capture/raw-event.js';
 import {
 	InProcessRunLogSource,
 	type RunLogEntry,

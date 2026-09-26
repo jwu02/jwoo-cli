@@ -17,6 +17,7 @@ pure function over whole-stdout strings, it needs no process at all.
 */
 
 import {execFileSync} from 'node:child_process';
+import {existsSync} from 'node:fs';
 import {mkdtemp, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -38,8 +39,18 @@ test('the helper path is the committed binary beside the source', t => {
 	without the grant is a path nobody exercises. Every caller — the stream, the
 	one-shot runner, `permissions.ts` — takes it from here, which is what lets
 	one test catch a wrong `../` for all of them.
+
+	The suffix check alone cannot do that, and this module's own move into
+	`capture/` is exactly the change that tests it: adding or dropping a level
+	only inserts text *before* `helper/bin/eventtap`, so a path one `../` short
+	still ends with it. A wrong count is caught, but further down and by
+	accident — the `--preflight` spawn fails to start a process and says
+	nothing about the path. Resolving it here fails at the line that claims to
+	check it, with the path in hand. The binary is committed, so a correct path
+	always exists.
 	*/
 	t.true(HELPER_PATH.endsWith('helper/bin/eventtap'));
+	t.true(existsSync(HELPER_PATH));
 });
 
 /*

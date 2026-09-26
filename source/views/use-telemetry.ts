@@ -23,7 +23,7 @@ the seam doing its job.
 */
 
 import {useEffect, useState} from 'react';
-import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
+import {type LiveTelemetry, type TelemetrySource} from '../telemetry.js';
 
 /*
 A second: fast enough that a Flush landing mid-interval shows up while the user

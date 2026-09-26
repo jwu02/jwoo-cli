@@ -26,7 +26,7 @@ import for the same reason.
 import process from 'node:process';
 import {parseArguments} from './args.js';
 import {run} from './main.js';
-import {HelperPermissionSource} from './permissions.js';
+import {HelperPermissionSource} from './capture/permissions.js';
 
 try {
 	await run(parseArguments(), {permissions: new HelperPermissionSource()});

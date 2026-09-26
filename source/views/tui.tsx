@@ -9,8 +9,8 @@ which is what closes the store the frame was reading.
 */
 
 import {render} from 'ink';
+import {type DashboardView} from '../main.js';
 import App from './app.js';
-import {type DashboardView} from './main.js';
 
 export async function renderApp({
 	history,

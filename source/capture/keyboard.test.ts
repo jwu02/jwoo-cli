@@ -10,9 +10,9 @@ came from.
 */
 
 import test from 'ava';
+import {TelemetryState} from '../state.js';
 import {KeyboardCollector} from './keyboard.js';
 import {keyEventAt, type KeyEvent, type RawEvent} from './raw-event.js';
-import {TelemetryState} from './state.js';
 
 /*
 The flag bits, as measured against the live helper. `BARE` carries

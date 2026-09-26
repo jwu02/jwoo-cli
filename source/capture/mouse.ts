@@ -10,8 +10,8 @@ that turns pointer travel into Mouse Distance rather than two that could
 disagree (CONTEXT.md).
 */
 
+import {type TelemetryState} from '../state.js';
 import {type MouseButton, type RawEvent} from './raw-event.js';
-import {type TelemetryState} from './state.js';
 
 /*
 No DPI here, and its absence is deliberate rather than an omission: the

@@ -1,7 +1,7 @@
 import test from 'ava';
 import {Text} from 'ink';
 import {render} from 'ink-testing-library';
-import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
+import {type LiveTelemetry, type TelemetrySource} from '../telemetry.js';
 import {useTelemetry} from './use-telemetry.js';
 
 /*

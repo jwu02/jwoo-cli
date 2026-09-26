@@ -1,5 +1,8 @@
 import test from 'ava';
-import {type DisabledCollector, type DisabledReport} from './permissions.js';
+import {
+	type DisabledCollector,
+	type DisabledReport,
+} from './capture/permissions.js';
 import {
 	collectionEntry,
 	flushEntry,

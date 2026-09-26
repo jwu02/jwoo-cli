@@ -25,7 +25,7 @@ option are, and the only reason this hook takes options at all.
 */
 
 import {useEffect, useState} from 'react';
-import {type RunLogEntry, type RunLogSource} from './run-log.js';
+import {type RunLogEntry, type RunLogSource} from '../run-log.js';
 
 /*
 A second: fast enough that a Flush landing mid-interval shows up while the user

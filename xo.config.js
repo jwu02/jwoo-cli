@@ -34,10 +34,10 @@ export default [
 		checking.
 		*/
 		files: [
-			'source/keyboard.test.ts',
-			'source/key-character.test.ts',
-			'source/key-labels.test.ts',
-			'source/mouse.test.ts',
+			'source/capture/keyboard.test.ts',
+			'source/capture/key-character.test.ts',
+			'source/capture/key-labels.test.ts',
+			'source/capture/mouse.test.ts',
 		],
 		rules: {
 			'no-bitwise': 'off',
@@ -56,7 +56,7 @@ export default [
 		naming rule is relaxed here: there is no bit arithmetic in this file, and
 		adding it to that list would say there was.
 		*/
-		files: ['source/local-store.test.ts'],
+		files: ['source/store/local-store.test.ts'],
 		rules: {
 			'@typescript-eslint/naming-convention': 'off',
 		},
@@ -67,7 +67,7 @@ export default [
 		themselves, so this test builds eras holding `A` and `Return` — the wire
 		format the website reads, spelled the way it is on the wire (ADR-0004).
 		*/
-		files: ['source/push.test.ts'],
+		files: ['source/store/push.test.ts'],
 		rules: {
 			'@typescript-eslint/naming-convention': 'off',
 		},

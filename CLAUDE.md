@@ -54,6 +54,33 @@ it. `config.ts` is the only place any environment variable is read.
 
 ## Architecture
 
+### Directory layout
+
+`source/` is four groups, drawn from the import graph rather than from a generic layering.
+`capture/` is the helper, the wire format, the Key Label table and the Collectors. `store/` is
+the Local Store, the Pusher, the Range arithmetic and config. `views/` is the Ink layer. What is
+left at the root is the run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`,
+`run-log.ts`, `state.ts` and `format.ts`.
+
+Those eight are the reason the split is three and not four. `state.ts` is the accumulator the
+Collectors write and both the store and the Session read; `telemetry.ts` and `run-log.ts` are
+seams that read across all three groups; `format.ts` is shared by five views and by `run-log.ts`.
+Filing any of them under a group would move a boundary edge rather than remove it — and for
+`format.ts` it would cost more than that, since `views/` is defined by what it imports (see
+_React layering_).
+
+Two constraints hold the layout in place. `cli.tsx` stays at the root because `tsconfig.json`
+sets `rootDir: "source"` and `dist/` mirrors that tree, so moving it would move `dist/cli.js` and
+with it the `bin` entry and every documented run command. And `helper.ts` finds the Swift binary
+by `import.meta.url` arithmetic rather than from the working directory: `capture/` puts it two
+levels under the repo root, so the URL climbs two, and `helper.test.ts` asserts the path
+_resolves_ as well as that it ends a certain way — the suffix check alone cannot fail on a wrong
+number of `../`, because dropping a level only inserts text before the suffix, and a wrong count
+would otherwise surface only as the `--preflight` spawn failing to start.
+
+Tests sit beside their subject and moved with it; ava's default globs find them where they land,
+and it reads the directory as the test name's prefix.
+
 ### Seams, and no database server in the test suite
 
 `push.ts` is the one seam with MongoDB behind it, and it is a write seam: it declares its own
@@ -288,13 +315,14 @@ that no timezone _name_ ever crosses the wire.
 
 ### React layering
 
-The TUI is Ink 7 on React 19, and it reaches no further than these modules: `tui.tsx`, `app.tsx`,
-`history-view.tsx`, `live-view.tsx`, `totals-view.tsx`, `run-log-view.tsx`,
-`diagnostics-view.tsx`, `use-telemetry.ts`, `use-run-log.ts` and
-`use-window.ts` are the only ones that import `ink` or `react` — most of them `.tsx`, the hooks
-`.ts` because they hold no markup. Everything else is plain TypeScript, which is what ADR-0001
-requires of the Collector so that the move to a separate process is a different entry point
-rather than a rewrite. Tests render through `ink-testing-library`.
+The TUI is Ink 7 on React 19, and it reaches no further than `views/`. The rule is the property
+rather than a list: every non-test file under `source/views/` imports `ink` or `react`, and no
+file outside it imports either — most of them `.tsx`, the hooks `.ts` because they hold no
+markup. That is what makes ADR-0001's wall checkable instead of enumerated: a module added to
+`views/` that imports neither is in the wrong place, and a module elsewhere that imports either
+has broken the rule the headless `collect` path depends on. Everything else is plain TypeScript,
+which is what ADR-0001 requires of the Collector so that the move to a separate process is a
+different entry point rather than a rewrite. Tests render through `ink-testing-library`.
 
 **The frame is the window, and the window is the terminal's** (ADR-0011). `use-window.ts` is the
 only reader of `stdout.rows`, subscribed to the stream's `resize`; `app.tsx` gives the root box
@@ -367,7 +395,8 @@ entry in the website's `jwoo/lib/telemetry/key-layout.ts` vanishes from the heat
 error anywhere, so adding or renaming one requires a matching website change. Key Counts must
 stay flat numeric scalars and `createdAt` must stay a real BSON Date.
 
-`source/key-labels.ts` is the ported table and `key-labels.test.ts` is what holds it in place.
+`source/capture/key-labels.ts` is the ported table and `key-labels.test.ts` is what holds it in
+place.
 The label set is asserted there as a literal list, not derived from the table, so a rename has to
 be made in two places on purpose. It is the only guard: nothing here compiles or reads
 `key-layout.ts`, so a label this CLI emits that the website has not been taught is caught by

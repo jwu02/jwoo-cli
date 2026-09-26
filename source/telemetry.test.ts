@@ -1,5 +1,8 @@
 import test from 'ava';
-import {type PermissionReport, permissionReport} from './permissions.js';
+import {
+	type PermissionReport,
+	permissionReport,
+} from './capture/permissions.js';
 import {type FlushAttempt} from './session.js';
 import {TelemetryState} from './state.js';
 import {InProcessTelemetrySource, type LiveTelemetry} from './telemetry.js';

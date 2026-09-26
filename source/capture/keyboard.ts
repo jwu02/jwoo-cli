@@ -16,9 +16,9 @@ else, so Fn is now an ordinary `flagsChanged` event and one algorithm covers it
 along with every other modifier.
 */
 
+import {type TelemetryState} from '../state.js';
 import {labelForEvent, modifierBitFor} from './key-character.js';
 import {type KeyEvent, type RawEvent} from './raw-event.js';
-import {type TelemetryState} from './state.js';
 
 export type KeyboardCollectorOptions = {
 	readonly state: TelemetryState;

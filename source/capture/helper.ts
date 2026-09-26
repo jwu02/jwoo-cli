@@ -28,26 +28,26 @@ never before, because a helper process outlives the thing that spawned it if it
 is not stopped: the Session calls `stop()` on every path, and a stream that was
 never started has nothing to leak.
 
-The binary is committed beside the source and resolved from this module rather
-than from the working directory, so the CLI can be run from anywhere.
-`dist/helper.js` sits one level under the repo root, as `source/helper.ts`
-does.
+The binary is committed at the repo root and resolved from this module rather
+than from the working directory, so the CLI can be run from anywhere. The URL
+below climbs two levels because `dist/capture/helper.js` sits two under the
+repo root, as `source/capture/helper.ts` does.
 */
 
 import {execFile, spawn, type ChildProcessByStdio} from 'node:child_process';
 import {type Readable} from 'node:stream';
 import process from 'node:process';
 import {fileURLToPath} from 'node:url';
+import {type EventStream as StartStop} from '../session.js';
 import {
 	type HelperError,
 	type PreflightEvent,
 	type RawEvent,
 	parseEventLine,
 } from './raw-event.js';
-import {type EventStream as StartStop} from './session.js';
 
 export const HELPER_PATH = fileURLToPath(
-	new URL('../helper/bin/eventtap', import.meta.url),
+	new URL('../../helper/bin/eventtap', import.meta.url),
 );
 
 /*
