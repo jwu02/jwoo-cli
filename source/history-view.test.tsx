@@ -1,7 +1,7 @@
 import test from 'ava';
 import {render} from 'ink-testing-library';
-import {type HistoryData, type TimeSeriesPoint} from './history.js';
 import {HistoryView} from './history-view.js';
+import {type HistoryData, type TimeSeriesPoint} from './local-store.js';
 import {type Range} from './ranges.js';
 import {type LoadState} from './use-history.js';
 

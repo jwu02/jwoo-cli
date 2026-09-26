@@ -33,7 +33,7 @@ when the CLI exits (CONTEXT.md, Deliberately absent).
 
 import {COUNT_FORMAT, METRES_FORMAT} from './format.js';
 import {problemMessage, type StreamProblem} from './helper.js';
-import {readWarningMessage, type ReadWarning} from './history.js';
+import {readWarningMessage, type ReadWarning} from './local-store.js';
 import {type DisabledCollector, type DisabledReport} from './permissions.js';
 import {type FlushAttempt} from './session.js';
 

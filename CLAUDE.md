@@ -37,8 +37,10 @@ The helper is not part of `npm test`: `prettier` and `xo` do not read `.swift`, 
 neither checks nor covers it. Build it by hand after changing it and commit the binary with the
 source.
 
-No test reads outside this repo, and none may start: the `ava` step has to pass on a clone of
-this repo alone. The Key Label wire format was once checked by importing the website's
+No test reaches the network or another installation, and none may start a server: the `ava` step
+has to pass on a clone of this repo alone. Its scratch space is its own — the temp directory
+`local-store.test.ts` makes is a file this repo does not ship, and no other checkout can see it.
+The Key Label wire format was once checked by importing the website's
 `jwoo/lib/telemetry/key-layout.ts`, and that test is gone — the label set is pinned here
 instead, by hand, against the website's reader rather than against its module.
 
@@ -52,14 +54,20 @@ it. `config.ts` is the only place any environment variable is read.
 
 ## Architecture
 
-### Seams, and no database in the test suite
+### Seams, and no database server in the test suite
 
 `storage.ts` (write) and `history.ts` (read) are mirrored seams. Each declares its own narrow
 slice of the driver's types — `Collection`, `Database`, `AggregationCursor` — and nothing else
 in the codebase imports `mongodb`. Every test drives a hand-written in-memory fake; there is no
-test database and no test container. `telemetry.ts` and `run-log.ts` are the other two, and
+test **server** and no test container. `telemetry.ts` and `run-log.ts` are the other two, and
 neither has a database behind it at all — see _The live view reads a third seam_ and _The Run
 Log reads a fourth seam_ below.
+
+`local-store.ts` is the one module tested against real files, which is the exception ADR-0012's
+amendment to the gate carves out: the store _is_ the thing under test, and a fake of SQLite
+would be a fake of the one component whose whole job is to be durable. Its tests make a temp
+directory and hand it back, run in-process, and reach no network — so the `ava` step still
+passes on a clone of this repo alone.
 
 The narrow types are deliberately faithful about async-ness, and that is load-bearing.
 `Collection.replaceOne` returns a Promise because the driver's does, and `Collection.aggregate`

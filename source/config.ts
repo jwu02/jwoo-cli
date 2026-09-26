@@ -7,6 +7,8 @@ rejected. This throws instead: the entry point decides what a bad environment
 means, and the loader stays a pure function of its input.
 */
 
+import {homedir} from 'node:os';
+import {join} from 'node:path';
 import process from 'node:process';
 import {isValidTimeZone} from './local-time.js';
 
@@ -31,10 +33,23 @@ export type Config = {
 	is empty.
 	*/
 	readonly timeZone: string;
+	/*
+	Where the Local Store's SQLite file lives. The one path in this config, and
+	the only one the CLI writes to besides the terminal — see `LocalStore`.
+	*/
+	readonly localStorePath: string;
 };
 
 const ONE_YEAR_IN_SECONDS = 31_536_000;
 const THIRTY_DAYS_IN_SECONDS = 2_592_000;
+
+/*
+The store is macOS-only by ADR-0005, so the Application Support convention is
+spelled out rather than discovered. It is under the home directory rather than
+the current one because a Local Store is a machine's record, not a project's.
+*/
+const LOCAL_STORE_RELATIVE_PATH =
+	'Library/Application Support/activity-telemetry/telemetry.db';
 
 export type Environment = Record<string, string | undefined>;
 
@@ -81,7 +96,27 @@ export function loadConfig(env: Environment = process.env): Config {
 		collectionTtlSeconds: ONE_YEAR_IN_SECONDS,
 		heatmapTtlSeconds: THIRTY_DAYS_IN_SECONDS,
 		timeZone: resolveTimeZone(env),
+		localStorePath: resolveLocalStorePath(env),
 	};
+}
+
+/*
+An empty value is treated as unset rather than taken literally. The default is
+absolute by construction, and `LOCAL_STORE_PATH=` in a shell profile is far more
+likely to be a mistake than an intent to scatter `telemetry.db` into whatever
+directory the CLI happened to be started from.
+
+`homedir()` rather than `env['HOME']`, for the same reason `resolveTimeZone`
+falls back to `Intl`: the environment is the input to this function, not the
+authority on where the machine's home directory is, and a loader that believed a
+declared `HOME` would put the store somewhere the OS does not agree exists.
+*/
+function resolveLocalStorePath(env: Environment): string {
+	const declared = env['LOCAL_STORE_PATH'];
+
+	return declared === undefined || declared === ''
+		? join(homedir(), LOCAL_STORE_RELATIVE_PATH)
+		: declared;
 }
 
 /*

@@ -47,7 +47,8 @@
 		],
 		"nodeArguments": [
 			"--import",
-			"tsx"
+			"tsx",
+			"--disable-warning=ExperimentalWarning"
 		]
 	},
 	"prettier": "@vdemedes/prettier-config"

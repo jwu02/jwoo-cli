@@ -1,11 +1,8 @@
 import test, {type ExecutionContext} from 'ava';
 import {render} from 'ink-testing-library';
 import App from './app.js';
-import {
-	type HistoryData,
-	type HistorySource,
-	type LoadResult,
-} from './history.js';
+import {type HistorySource} from './history.js';
+import {type HistoryData, type LoadResult} from './local-store.js';
 import {type Range} from './ranges.js';
 import {type RunLogEntry, type RunLogSource} from './run-log.js';
 import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';

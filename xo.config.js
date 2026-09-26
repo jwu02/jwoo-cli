@@ -44,4 +44,21 @@ export default [
 			'@typescript-eslint/naming-convention': 'off',
 		},
 	},
+	{
+		/*
+		`naming-convention` wants camelCase, and this test writes two vocabularies
+		that are not JavaScript's: Key Labels, which are a wire format whose whole
+		point is that they are `A`, `Return` and `Left Cmd` verbatim (ADR-0004),
+		and the Local Store's own column names, which are `left_clicks` and
+		`pushed_at` in the schema the test asserts against.
+
+		Its own entry rather than a fifth `files` line above, because only the
+		naming rule is relaxed here: there is no bit arithmetic in this file, and
+		adding it to that list would say there was.
+		*/
+		files: ['source/local-store.test.ts'],
+		rules: {
+			'@typescript-eslint/naming-convention': 'off',
+		},
+	},
 ];

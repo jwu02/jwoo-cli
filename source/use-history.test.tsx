@@ -2,11 +2,8 @@ import test from 'ava';
 import {Text, useInput} from 'ink';
 import {render} from 'ink-testing-library';
 import {useState} from 'react';
-import {
-	type HistoryData,
-	type HistorySource,
-	type LoadResult,
-} from './history.js';
+import {type HistorySource} from './history.js';
+import {type HistoryData, type LoadResult} from './local-store.js';
 import {type Range} from './ranges.js';
 import {type LoadState, useHistory} from './use-history.js';
 

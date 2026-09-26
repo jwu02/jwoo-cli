@@ -152,6 +152,8 @@ const config: Config = {
 	collectionTtlSeconds: 31_536_000,
 	heatmapTtlSeconds: 2_592_000,
 	timeZone: 'UTC',
+	// Unused here: these tests drive the Mongo seam, which ADR-0012 retires.
+	localStorePath: '/tmp/jwoo-cli-test/telemetry.db',
 };
 
 function stateWithActivity() {

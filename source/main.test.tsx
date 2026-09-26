@@ -1,14 +1,14 @@
 import process from 'node:process';
 import test from 'ava';
 import {type Config} from './config.js';
+import {type HistorySource} from './history.js';
 import {
 	type HistoryData,
-	type HistorySource,
 	type LoadResult,
 	type ReadWarning,
 	type ReadWarningReporter,
 	type Totals,
-} from './history.js';
+} from './local-store.js';
 import {
 	type CollectorFactory,
 	type DashboardView,
@@ -45,6 +45,8 @@ const CONFIG: Config = {
 	collectionTtlSeconds: 1,
 	heatmapTtlSeconds: 1,
 	timeZone: 'Europe/London',
+	// Unused here: nothing opens the Local Store until ADR-0012's wiring lands.
+	localStorePath: '/tmp/jwoo-cli-test/telemetry.db',
 };
 
 /*

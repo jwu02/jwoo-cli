@@ -19,7 +19,7 @@ the two must not read alike.
 
 import {Box, Text} from 'ink';
 import {clockTime} from './format.js';
-import {type Totals} from './history.js';
+import {type Totals} from './local-store.js';
 import {TotalsView} from './totals-view.js';
 import {type LiveTelemetry} from './telemetry.js';
 

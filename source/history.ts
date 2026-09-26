@@ -1,5 +1,5 @@
 /*
-The history seam.
+The history seam, read from MongoDB.
 
 The mirror of `storage.ts` on the read side. Everything that knows about
 MongoDB lives behind `HistorySource`, so the view can be rendered from a fake
@@ -15,6 +15,11 @@ belongs on `toArray()`; declaring it async would let a reader that forgot the
 Reads happen against the live Atlas database rather than the website's
 `/api/telemetry`, so the view works on first run and does not depend on the
 website's deploy state.
+
+ADR-0012 deletes this module. The Local Store is the source of truth from now
+on, and the vocabulary below — what a read answers with, and how it reports
+itself — has already moved to `local-store.ts`, which is where it is going. What
+is left here is the Mongo implementation and nothing else.
 */
 
 import {MongoClient} from 'mongodb';
@@ -24,6 +29,15 @@ import {
 	totalsPipeline,
 } from './aggregation.js';
 import {type Config} from './config.js';
+import {
+	defaultReadWarningReporter,
+	type KeyRanking,
+	type LoadResult,
+	messageOf,
+	type ReadWarningReporter,
+	type TimeSeriesPoint,
+	type Totals,
+} from './local-store.js';
 import {bucketBoundaries, type Range} from './ranges.js';
 
 /*
@@ -55,132 +69,10 @@ function databaseOf(client: MongoClient, dbName: string): Database {
 	return client.db(dbName) as unknown as Database;
 }
 
-export type Totals = {
-	readonly leftClicks: number;
-	readonly rightClicks: number;
-	readonly movementMeters: number;
-	readonly pressTotal: number;
-};
-
-/*
-One Key Label and how often it was pressed. Ordered by count rather than by
-label, which is what makes it a ranking rather than Key Counts — see the
-CONTEXT.md entry.
-*/
-export type RankedKey = {
-	readonly label: string;
-	readonly count: number;
-};
-
-export type KeyRanking = readonly RankedKey[];
-
-export type TimeSeriesPoint = {
-	readonly bucket: string;
-	readonly leftClicks: number;
-	readonly rightClicks: number;
-	readonly movementMeters: number;
-	readonly keyPresses: number;
-};
-
-export type HistoryData = {
-	readonly range: Range;
-	/*
-	The zone the buckets were aligned to. Carried so the view cannot label
-	instants in a different zone than the one they were computed in.
-	*/
-	readonly timeZone: string;
-	readonly totals: Totals;
-	readonly keyRanking: KeyRanking;
-	readonly timeSeries: readonly TimeSeriesPoint[];
-};
-
-/*
-Typed failure as a value, as in `storage.ts` — but a union rather than
-`undefined`, and for a different reason. `flush`'s `undefined` encodes "retry
-me" and needs no detail; a read has three outcomes, and the failure comes back
-with the driver's own message so that the caller still holding the result can
-say what went wrong. It must not reject: a rejection raised inside an effect is
-an unhandled rejection, which ends the process by default, so the TUI would
-exit rather than show the error.
-*/
-export type LoadResult =
-	{ok: true; data: HistoryData} | {ok: false; message: string};
-
 export type HistorySource = {
 	load(range: Range, now: Date): Promise<LoadResult>;
 	close(): Promise<void>;
 };
-
-/*
-What a read reports about itself besides its answer.
-
-Two things happen to a read that still returns: it fails, and it succeeds
-having dropped a bucket the boundaries never named. They are one union rather
-than two callbacks or two sentences because *what each one means* has to be
-decided where it is raised — that a failed read is a failure and an ignored
-bucket is not is the reader's own statement about its own read, and neither the
-terminal nor the Run Log should have to guess it back out of prose. It is the
-rule ADR-0008 applies to the helper's events, applied to this seam.
-
-The buckets themselves travel rather than a count, because the ids are all this
-reader has: `$bucket`'s `default` label is not a boundary and no date outside
-the range is one either, so naming them is the whole of what went wrong. The
-terminal prints them; the sentence says how many.
-*/
-export type ReadWarning =
-	| {readonly kind: 'failed-read'; readonly error: unknown}
-	| {readonly kind: 'ignored-buckets'; readonly buckets: readonly unknown[]};
-
-export type ReadWarningReporter = (warning: ReadWarning) => void;
-
-/*
-Where a warning goes when nothing has said otherwise: stderr, which is what the
-read seam has always done and what it keeps doing. There is no view on a
-`collect` run to draw an entry in, so the terminal is where a headless run
-reports — and the dashboard supplies its own reporter instead, which is the
-whole of the difference between the two modes.
-
-The error travels as a second argument rather than inside the sentence, so the
-driver's own stack prints as the driver wrote it.
-*/
-export const defaultReadWarningReporter: ReadWarningReporter = warning => {
-	switch (warning.kind) {
-		case 'failed-read': {
-			console.warn('Failed to read telemetry history', warning.error);
-			break;
-		}
-
-		case 'ignored-buckets': {
-			console.warn(readWarningMessage(warning), warning.buckets);
-			break;
-		}
-	}
-};
-
-/*
-What a warning says, as one sentence.
-
-Spelled here because both ends of it are decided outside this module — the
-terminal reporter writes it and the Run Log draws it — and two spellings of
-"the read dropped a bucket" would be two things to keep in step. `helper.ts`
-holds `problemMessage` for the same reason.
-
-A failed read is the driver's own message, which is what the Run Log draws. The
-terminal puts "Failed to read telemetry history" in front of it, in the reporter
-rather than here: a line on stderr has no class column to say what failed, and
-the entry has one, so the preface is the terminal's and the message is shared.
-*/
-export function readWarningMessage(warning: ReadWarning): string {
-	switch (warning.kind) {
-		case 'failed-read': {
-			return messageOf(warning.error);
-		}
-
-		case 'ignored-buckets': {
-			return `Ignored ${warning.buckets.length} time series bucket(s) outside the range boundaries`;
-		}
-	}
-}
 
 export type MongoHistorySourceOptions = {
 	/*
@@ -352,13 +244,4 @@ function rankingOf(rows: unknown[]): KeyRanking {
 
 function compare(a: string, b: string): number {
 	return a < b ? -1 : a > b ? 1 : 0;
-}
-
-/*
-The driver's errors are worth showing — "connect ECONNREFUSED" tells the user
-more than "something went wrong" — so the message is passed through as-is
-rather than replaced with a generic one.
-*/
-function messageOf(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
 }

@@ -6,13 +6,15 @@ import {
 	type AggregationCursor,
 	type Collection,
 	type Database,
+	MongoHistorySource,
+} from './history.js';
+import {
 	defaultReadWarningReporter,
 	type HistoryData,
-	MongoHistorySource,
 	type ReadWarning,
 	type ReadWarningReporter,
 	type TimeSeriesPoint,
-} from './history.js';
+} from './local-store.js';
 import {type Range} from './ranges.js';
 
 /*
@@ -136,6 +138,8 @@ const config: Config = {
 	collectionTtlSeconds: 31_536_000,
 	heatmapTtlSeconds: 2_592_000,
 	timeZone: 'UTC',
+	// Unused here: these tests drive the Mongo read, which ADR-0012 retires.
+	localStorePath: '/tmp/jwoo-cli-test/telemetry.db',
 };
 
 // Local midday. 2026-09-21 is a Monday, 2026-09-23 a Wednesday.

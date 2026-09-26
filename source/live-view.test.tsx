@@ -1,6 +1,6 @@
 import test from 'ava';
 import {render} from 'ink-testing-library';
-import {type Totals} from './history.js';
+import {type Totals} from './local-store.js';
 import {LiveView} from './live-view.js';
 import {type LiveTelemetry} from './telemetry.js';
 

@@ -18,7 +18,8 @@ to this one.
 */
 
 import {useEffect, useState} from 'react';
-import {type HistoryData, type HistorySource} from './history.js';
+import {type HistorySource} from './history.js';
+import {type HistoryData} from './local-store.js';
 import {type Range} from './ranges.js';
 
 export type LoadState =

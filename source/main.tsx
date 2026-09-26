@@ -27,12 +27,8 @@ import {
 	type StreamProblem,
 	type StreamSinks,
 } from './helper.js';
-import {
-	MongoHistorySource,
-	type HistorySource,
-	type ReadWarning,
-	type ReadWarningReporter,
-} from './history.js';
+import {MongoHistorySource, type HistorySource} from './history.js';
+import {type ReadWarning, type ReadWarningReporter} from './local-store.js';
 import {KeyboardCollector} from './keyboard.js';
 import {MouseCollector} from './mouse.js';
 import {type PermissionReport, type PermissionSource} from './permissions.js';
@@ -311,7 +307,7 @@ export type RunOptions = CollectorFactoryOptions & {
 	reason. What the seam reports is settled when it is built, so a caller
 	building one of its own reports where it was told to; that is what lets a
 	test drive a TTL index the server would not create to an entry, or to the
-	terminal, without a database. There is no test database in this repo, and
+	terminal, without a database. There is no test **server** in this repo, and
 	the store builds a `MongoClient`.
 	*/
 	readonly createStore?: (logger: Pick<Console, 'warn'>) => TelemetryStore;

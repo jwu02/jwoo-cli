@@ -20,13 +20,13 @@ the same thing at all, so a view given only the numbers cannot tell them apart â
 and telling them apart is the whole of what a live view owes a user who has just
 granted a permission and wants to know whether it took.
 
-`Totals` is borrowed from `history.ts` rather than declared again here. The two
+`Totals` is borrowed from `local-store.ts` rather than declared again here. The two
 seams ask different questions and answer with the same four numbers, and the
 view draws them with the same code â€” a second declaration would be a second
 spelling of Clicks, Mouse Distance and Press Total.
 */
 
-import {type Totals} from './history.js';
+import {type Totals} from './local-store.js';
 import {type PermissionReport} from './permissions.js';
 import {type FlushAttempt} from './session.js';
 import {type Snapshot, type TelemetryState} from './state.js';
