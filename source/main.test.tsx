@@ -40,6 +40,7 @@ import {
 	type Collector,
 	type EventStream,
 	type Pusher,
+	type Shutdown,
 	type ShutdownReason,
 	type ShutdownSignal,
 } from './session.js';
@@ -896,27 +897,24 @@ const FAILING_STORE: RunStore = {
 };
 
 /*
-Countered by the success case above, which must *not* set it. A shell reads the
-exit code, so a lost final Flush has to reach it rather than only the log.
+A shell reads the exit code rather than the log, so a lost final Flush has to
+reach the value the entry point reads — `cli.tsx` is what turns it into a code,
+and this is the half of that a test can hold.
 */
-test('a failed final Flush exits non-zero, because the counters are lost', async t => {
+test('a failed final Flush resolves with a Shutdown that says the counters are lost', async t => {
 	const test_ = harness(granted());
 	test_.options.state?.addLeftClick();
 
-	const previous = process.exitCode;
-	try {
-		const running = runCollect({
-			...test_.options,
-			createStore: () => FAILING_STORE,
-		});
-		test_.shutdown.fire('SIGTERM');
-		await running;
+	const running = runCollect({
+		...test_.options,
+		createStore: () => FAILING_STORE,
+	});
+	test_.shutdown.fire('SIGTERM');
 
-		t.is(process.exitCode, 1);
-		t.regex(test_.logger.warnings.at(-1) ?? '', /lost|failed/v);
-	} finally {
-		process.exitCode = previous;
-	}
+	const {finalFlush} = await running;
+
+	t.false(finalFlush);
+	t.regex(test_.logger.warnings.at(-1) ?? '', /lost|failed/v);
 });
 
 test('collect names the signal it stopped on', async t => {
@@ -1083,6 +1081,12 @@ type Logged = {
 	`[eventtap]` line printed once the frame is up corrupts the drawing.
 	*/
 	readonly stderr: readonly string[];
+	/*
+	How the run ended, which is the other thing this hands back rather than
+	leaves behind: the entry point reads the exit code off it, so a test that
+	wants to know what a shell would see asks here.
+	*/
+	readonly shutdown: Shutdown;
 };
 
 async function logged(
@@ -1121,9 +1125,9 @@ async function logged(
 	});
 
 	test_.shutdown.fire('SIGINT');
-	await running;
+	const shutdown = await running;
 
-	return {entries: runLog?.read() ?? [], state, stderr};
+	return {entries: runLog?.read() ?? [], state, stderr, shutdown};
 }
 
 /*
@@ -1154,29 +1158,24 @@ coming back: the counters were never cleared, so the same Snapshot is retried on
 the next Flush Interval (ADR-0009).
 */
 test('a Flush that failed is an entry that will retry, with the counters still held', async t => {
-	/*
-	The counters never made it, so the run ends non-zero and sets the exit code
-	— which ava's worker reads when it exits. Left set, it would end this file
-	non-zero with every test in it passing.
-	*/
-	const previous = process.exitCode;
-	try {
-		const {entries, state} = await logged(
-			[keyEventAt('keyDown', A_KEY, BARE)],
-			FAILING_STORE,
-		);
+	const {entries, state, shutdown} = await logged(
+		[keyEventAt('keyDown', A_KEY, BARE)],
+		FAILING_STORE,
+	);
 
-		t.is(entries.length, 1);
-		t.is(entries[0]?.class, 'Flush');
-		t.true(entries[0]?.failed === true, 'which is what draws it red');
-		t.is(entries[0]?.summary, 'failed — will retry');
-		t.true(
-			state.hasActivity(),
-			'left whole, so the Flush is retried rather than lost',
-		);
-	} finally {
-		process.exitCode = previous;
-	}
+	t.is(entries.length, 1);
+	t.is(entries[0]?.class, 'Flush');
+	t.true(entries[0]?.failed === true, 'which is what draws it red');
+	t.is(entries[0]?.summary, 'failed — will retry');
+	t.true(
+		state.hasActivity(),
+		'left whole, so the Flush is retried rather than lost',
+	);
+	/*
+	The counters never made it, so the run did not end cleanly — and says so as
+	a value rather than by setting a process-wide code under the test runner.
+	*/
+	t.false(shutdown.finalFlush);
 });
 
 /*
@@ -1453,7 +1452,7 @@ would pass the first assertion and fail the second, and a `collect` run would
 have lost the tap's notes without anyone deciding it should (ADR-0010).
 */
 async function sinksFor(
-	entry: (options: RunOptions) => Promise<void>,
+	entry: (options: RunOptions) => Promise<unknown>,
 ): Promise<StreamSinks> {
 	const test_ = harness(granted());
 	const stream = new FakeStream();
@@ -1885,34 +1884,21 @@ makes that changes nothing. The eras are in the Local Store, the next run's
 startup Drain will carry them, and the exit code is the Flush's to set: a Push
 that has not happened costs the website an era and never the CLI one (ADR-0012).
 */
-test('a backlog that survives the run is logged without touching the exit code', async t => {
+test('a backlog that survives the run is logged, and is not a failed run', async t => {
 	const test_ = harness(granted());
 	test_.store.waiting.push(era(1), era(2));
 	/*
 	MongoDB is down, which is the only way a backlog survives a run: every Drain
 	fails, the eras stay in the Local Store, and the run ends anyway — with the
-	website's copies owed and the exit code the Flush's to set.
+	website's copies owed and nothing for the exit code to say about them.
 	*/
 	test_.pusher.failsWith = new Error('connect ECONNREFUSED 127.0.0.1');
-	/*
-	The exit code is process-wide, and ava's worker reads it when it exits: left
-	set, it would end this file non-zero with every test in it passing.
-	*/
-	const previous = process.exitCode;
+	test_.shutdown.fire('SIGTERM');
 
-	try {
-		test_.shutdown.fire('SIGTERM');
-		await runCollect(test_.options);
+	const {finalFlush} = await runCollect(test_.options);
 
-		t.is(
-			process.exitCode,
-			previous,
-			'a Push the CLI owes nobody costs it nothing',
-		);
-		t.is(test_.logger.lines.at(-1), '2 eras await Push.');
-	} finally {
-		process.exitCode = previous;
-	}
+	t.true(finalFlush, 'a Push the CLI owes nobody costs it nothing');
+	t.is(test_.logger.lines.at(-1), '2 eras await Push.');
 });
 
 /*

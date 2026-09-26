@@ -5,7 +5,10 @@
 > asks for rather than the store's; and the Run Log class an entry is filed under is `Push`,
 > not `Storage` (issue #32) — `pushWarningEntry` for that warning, and `pushEntry` for each
 > Drain attempt beside it. What this ADR decides — that a seam's byproducts become entries
-> rather than lines of stderr while a frame is up — is unchanged.
+> rather than lines of stderr while a frame is up — is unchanged. The bullet below that puts
+> the non-zero exit code beside `reportShutdown`'s message is the one part of it that has
+> moved (issue #37): the code is set in `cli.tsx` now, from the `Shutdown` the run resolves
+> with, and only the message is written here.
 
 Ink draws by writing the whole frame over the one before it, positioned from its own idea of
 the layout. A line written to stderr between two frames lands wherever the terminal's cursor

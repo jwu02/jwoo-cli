@@ -8,6 +8,14 @@ which entry point that command runs, and what a failure prints. A `ConfigError`
 or a `PreflightError` is reported rather than thrown: its message is the useful
 part, and a stack trace is not.
 
+How a run ended becomes an exit code here and nowhere else, on both paths and
+for the same reason: the code is process-wide, and a shell reads it rather than
+the log. A run that threw is one; a run that finished with its counters still in
+Telemetry State is another, and that one arrives as the Shutdown the collecting
+entry points resolve with rather than as a value somebody further in set behind
+their back. A command line that does not parse is neither: `parseArguments`
+exits on that one itself, before there is a run to report on.
+
 The dispatch is a pairing of command with entry point and nothing else, and it
 is here rather than in the composition root because a pairing stated twice can
 drift: the entry points take the command they are, from their names, and none of
@@ -33,6 +41,7 @@ import process from 'node:process';
 import {parseArguments} from './args.js';
 import {runCollect, runDashboard, runPermissions} from './main.js';
 import {HelperPermissionSource} from './capture/permissions.js';
+import {type Shutdown} from './session.js';
 
 try {
 	/*
@@ -50,12 +59,12 @@ try {
 	*/
 	switch (command.kind) {
 		case 'dashboard': {
-			await runDashboard({permissions});
+			exitCodeFor(await runDashboard({permissions}));
 			break;
 		}
 
 		case 'collect': {
-			await runCollect({permissions});
+			exitCodeFor(await runCollect({permissions}));
 			break;
 		}
 
@@ -69,4 +78,19 @@ try {
 		`${error instanceof Error ? error.message : String(error)}\n`,
 	);
 	process.exitCode = 1;
+}
+
+/*
+What the run's own report cannot say: a shell reads an exit code, not the log.
+
+A final Flush that failed means the counters were still in Telemetry State when
+the store closed, so the run did not end cleanly and this is how it says so. A
+Push Backlog that survived the run is not this — the eras are in the Local Store
+and what the CLI owes the website is not an exit code (ADR-0012) — which is why
+that sentence is the one report that reads and decides nothing.
+*/
+function exitCodeFor({finalFlush}: Shutdown): void {
+	if (!finalFlush) {
+		process.exitCode = 1;
+	}
 }

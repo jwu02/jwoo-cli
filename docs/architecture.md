@@ -62,12 +62,16 @@ every path, because a client left open keeps the process alive after the work ha
 **Each command has its own entry point.** `runCollect` and `runDashboard` take the collection
 type, which is one type because their field sets coincide; `runPermissions` takes a narrow type
 holding the permission source and a logger — the two things that command reads — which the
-collection type satisfies structurally, so one object can be handed to either. `cli.tsx` is the entry point
-above them all: it parses argv, dispatches to the one the command names, and reports a failure's
-message rather than its stack. The dispatch is the whole of the pairing between a command and
-the entry point that runs it, and it lives there rather than here so the pairing is stated once
-— which is why the composition root imports no command type at all, and why the `permissions`
-command is the one that announces a grant: it is the one that was asked.
+collection type satisfies structurally, so one object can be handed to either. The two that
+collect resolve with the `Shutdown`, which is how the run ended rather than only that it did;
+`runPermissions` answers with the `PermissionReport` it was asked for, because it has no run to
+report on. `cli.tsx` is the entry point above them all: it parses argv, dispatches to the one
+the command names, turns how that run ended into the process exit code — non-zero when the
+final Flush failed, and the only place that code is set — and reports a failure's message
+rather than its stack. The dispatch is the whole of the pairing between a command and the entry
+point that runs it, and it lives there rather than here so the pairing is stated once — which is
+why the composition root imports no command type at all, and why the `permissions` command is
+the one that announces a grant: it is the one that was asked.
 
 `main.tsx` supplies the Collectors too, and the default factory is its own rather than the entry
 point's, along with what that factory reaches for — the helper stream it builds, the grant it
@@ -172,8 +176,10 @@ final Flush cannot snapshot the same uncleared counters and write them twice. Th
 `stop()` owns: the Drain already in flight waited out, then the final Flush, then the awaited
 last Drain, then the backlog counted while the store can still answer it, then a synchronous
 store close and the Mongo client's. `Shutdown.finalFlush` reports whether the counters actually
-made it, and `main.tsx` sets a non-zero exit code when they did not — a shell reads the exit
-code, not the log.
+made it, and the run resolves with that value rather than acting on it: `cli.tsx` sets a
+non-zero exit code when they did not, because a shell reads the exit code and not the log, and
+because a process-wide value written from inside a run would end any caller that was not the
+CLI — a test runner, say — non-zero for a Flush the caller was still asserting on.
 
 `snapshot()` and `clear()` are separate methods on purpose: Telemetry State is cleared only after
 a successful Flush, which is what makes retrying the same interval possible.
@@ -206,9 +212,10 @@ it. So the helper's stderr chatter is dropped rather than passed through — `Ev
 `onHelperStderr` sink, the dashboard hands it one that does nothing, and `collect` keeps
 `defaultHelperStderr` — and the Push seam's warnings and Drain attempts become entries
 (`pushWarningEntry`, `pushEntry`). The preflight is unaffected, being written before the frame
-mounts; so is the end of a run — `reportShutdown`'s lost-final-Flush message and the non-zero
-exit code beside it are written after the frame is down, the first moment the terminal can be
-written to again.
+mounts; so is the end of a run — `reportShutdown`'s lost-final-Flush message is written after
+the frame is down, the first moment the terminal can be written to again. The exit code that
+says the same thing is not written at all: it is read off the `Shutdown` the run resolves with,
+one module up in `cli.tsx`.
 
 **A failed Flush is reported once.** Neither the Session nor the store warns about one; the
 `onFlush` attempt is the report, and the composition root decides what it is worth. The Session

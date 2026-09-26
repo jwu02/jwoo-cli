@@ -36,7 +36,6 @@ collection, and the entry point is a module that runs the CLI on import — so a
 switch kept there was reached by no test at all.
 */
 
-import process from 'node:process';
 import {COUNT_FORMAT} from './format.js';
 import {type Config, loadConfig} from './store/config.js';
 import {
@@ -936,9 +935,11 @@ function dashboardMode({
 The end of a run, reported the same way whichever command was running.
 
 A final Flush that failed means the counters were still in Telemetry State when
-the store closed, so they are gone and the run did not end cleanly. Said
-plainly, and as a non-zero exit code, because a shell reads the exit code and
-not the log.
+the store closed, so they are gone and the run did not end cleanly. Said plainly
+here — and said again as an exit code by `cli.tsx`, which reads it off the
+Shutdown this is handed rather than off a process-wide value set in here: a
+shell reads the exit code and not the log, and which code it reads is the entry
+point's decision rather than one the report can make for it.
 
 A Push Backlog that survived the run is said after that, and it is the one thing
 here that decides nothing: the eras are in the Local Store, the next run's
@@ -959,7 +960,6 @@ function reportShutdown(
 		logger.warn(
 			'The final Flush failed; the counters since the last Flush were lost.',
 		);
-		process.exitCode = 1;
 	}
 
 	// Nothing is waiting, and a line saying so would be a line about nothing.
@@ -1023,13 +1023,18 @@ fail-fast rule, and the first thing any run does. Nothing is drawn until it has
 opened, which is what keeps a store that cannot be opened quiet as well as early.
 Both lifetimes are closed on every path, including the ones a run never reached.
 
+How the run ended is resolved with rather than set as a process-wide value: the
+entry point is what turns a Shutdown into an exit code, and it is the only place
+that can — a `runCollect` called from a test would otherwise end the test runner
+non-zero for a Flush the test was asserting on.
+
 Nothing here says which command is running. What differs between the two is the
 mode, and the mode is the only thing this function is told about.
 */
 async function runCollection<Carried>(
 	options: RunOptions,
 	createMode: RunModeFactory<Carried>,
-): Promise<void> {
+): Promise<Shutdown> {
 	const logger = options.logger ?? console;
 	const config = options.config ?? loadConfig();
 	/*
@@ -1055,7 +1060,10 @@ async function runCollection<Carried>(
 			hooks: setup.session,
 		});
 
-		reportShutdown(await mode.complete(session, deps, setup.carried), logger);
+		const shutdown = await mode.complete(session, deps, setup.carried);
+		reportShutdown(shutdown, logger);
+
+		return shutdown;
 	} finally {
 		/*
 		On every path, and not only the happy one: the Session closes both at the
@@ -1083,11 +1091,16 @@ which is the whole reason a third collecting command is composition rather than
 a third copy of the flow.
 
 Neither is told which command it is: the command decided that, one module up.
+
+Both resolve with the Shutdown, which is how the run ended rather than only that
+it did, and the two commands end identically: `cli.tsx` reads the final Flush
+out of it either way. `permissions` keeps its own return type, because it answers
+a question and never has a run to report.
 */
-export async function runCollect(options: RunOptions): Promise<void> {
+export async function runCollect(options: RunOptions): Promise<Shutdown> {
 	return runCollection(options, collectMode);
 }
 
-export async function runDashboard(options: RunOptions): Promise<void> {
+export async function runDashboard(options: RunOptions): Promise<Shutdown> {
 	return runCollection(options, dashboardMode);
 }
