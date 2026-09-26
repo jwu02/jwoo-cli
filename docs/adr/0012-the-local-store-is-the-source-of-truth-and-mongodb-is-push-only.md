@@ -52,9 +52,11 @@ store.
 After each successful local Flush, and once at startup, the Pusher drains the backlog: oldest
 era first, stopping at the first failure, so the backlog stays a tail rather than a scatter of
 holes. It is single-flight and never awaited by the Flush path — a hanging Atlas must not
-delay the next local write, which is the write that matters. On the way out, `stop()` awaits
-the final Flush, makes one last drain attempt and awaits it, then closes the store and the
-Mongo client, in that order: the drain reads the store, so the store closes after it.
+delay the next local write, which is the write that matters. On the way out, `stop()` makes
+the final Flush, then one last drain attempt and awaits it, then closes the store and the
+Mongo client, in that order: the drain reads the store, so the store closes after it. The
+Flush is a synchronous write, so it is taken rather than awaited — the ordering is the whole
+of it, and there is nothing to wait for on either side of it.
 
 The Pusher reports attempts the way the Session reports Flush attempts — through a callback,
 with the composition root deciding where the news belongs. A failed drain is one red Run Log

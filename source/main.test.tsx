@@ -74,9 +74,8 @@ to be an interval's rather than the last one's, so that the retry lands and the
 run ends cleanly — which is the only shape in which "one failure, one report"
 can be counted.
 
-Async on purpose, as `session.test.ts`'s is: the machinery that waits on a Flush
-is still here, and a store that answered synchronously could not show a Flush
-caught in flight.
+Synchronous, as `session.test.ts`'s is and for the same reason: the real store
+carries no promise, and the write face the Session reaches for has none either.
 
 `close` is idempotent, as the Local Store's is. Two things close it on the way
 out of a run — the Session, and the composition root on the paths a run never
@@ -124,7 +123,7 @@ class FakeStore implements RunStore {
 		return this.readResult;
 	}
 
-	async flush(snapshot: never): Promise<Date | undefined> {
+	flush(snapshot: never): Date | undefined {
 		if (this.#failures > 0) {
 			this.#failures -= 1;
 			return undefined;
@@ -146,7 +145,7 @@ class FakeStore implements RunStore {
 		// Nothing is in the backlog, so nothing is ever acknowledged.
 	}
 
-	async close(): Promise<void> {
+	close(): void {
 		if (this.closed === 0) {
 			this.closed += 1;
 		}
@@ -834,7 +833,7 @@ Session sees one: a Flush that writes nothing and leaves Telemetry State alone
 to be retried.
 */
 const FAILING_STORE: RunStore = {
-	async flush(): Promise<Date | undefined> {
+	flush(): Date | undefined {
 		return undefined;
 	},
 	/*
@@ -850,7 +849,7 @@ const FAILING_STORE: RunStore = {
 	markPushed() {
 		// Nothing is in the backlog, so nothing is ever acknowledged.
 	},
-	async close(): Promise<void> {
+	close() {
 		// Nothing to release.
 	},
 };

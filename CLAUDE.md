@@ -166,12 +166,14 @@ the user who has just granted the permission is the one who cannot tell them apa
 `await`ing it is a complete shutdown, not the start of one. The signal listeners are released
 _after_ the run rather than inside the handler, so a second Ctrl-C cannot cut a Flush short.
 
-**A Flush in flight blocks the final one.** Telemetry State is cleared only after a successful
-write, so a Flush still waiting on the database has not cleared it — and a final Flush started
-alongside would snapshot the same counters and insert them twice. `stop()` awaits the in-flight
-Flush first. `Shutdown.finalFlush` then reports whether the counters actually made it, and
-`main.tsx` sets a non-zero exit code when they did not, because a shell reads the exit code and
-not the log.
+**The Flush write is honest-sync, and there is no in-flight Flush to wait for.** `FlushStore`
+carries no Promise on either method, because `node:sqlite` has none: an interval's Flush has
+already landed or already failed by the time anything can ask the run to end, so a final Flush
+cannot snapshot the same uncleared counters and write them twice. Nothing has to be awaited
+before it — the ordering `stop()` does own is the final Flush, then the awaited last Drain, then
+a synchronous store close and the Mongo client's. `Shutdown.finalFlush` reports whether the
+counters actually made it, and `main.tsx` sets a non-zero exit code when they did not, because a
+shell reads the exit code and not the log.
 
 The shutdown source is injectable. `processSignal` is the real one and the only place
 `process.on` is called; a test raises a signal through a fake, because a real SIGTERM inside the

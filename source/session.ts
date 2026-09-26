@@ -53,15 +53,17 @@ above is: the Session's job is owning a lifetime, and a module names only what i
 uses. A fake can stand in without a SQLite file behind it — which is the rule
 ADR-0012 leaves in place, a fake for every seam above the store.
 
-The Promise arms are the async shape this cutover was made with and not a
-pretence about the store: `node:sqlite` has no promise in it, and the store
-answers synchronously. They stay until the Flush's write path is made
-honest-sync through here, which is its own piece of work; until then the
-Session's call sites do not have to know which kind of store they were handed.
+No Promise anywhere on it. `node:sqlite` has no promise in it and the store
+answers synchronously (ADR-0012), so saying otherwise here would be a pretence
+the Session's whole write path then had to keep up — waiting on a write that
+had already finished, and carrying machinery for an in-flight Flush that could
+never exist. The async-ness rule is the same one the Pusher below is exempt
+from, for the reason it is exempt: a round trip to a server really does take
+time.
 */
 export type FlushStore = {
-	flush(snapshot: Snapshot): Date | undefined | Promise<Date | undefined>;
-	close(): void | Promise<void>;
+	flush(snapshot: Snapshot): Date | undefined;
+	close(): void;
 };
 
 /*
@@ -142,9 +144,9 @@ const SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
 The default source, and the only place a process signal is read.
 
 A listener on either signal replaces Node's default disposition, so the process
-survives long enough to Flush and exits when the event loop empties. Installing
-a second listener after the first is ignored, which is deliberate: a second
-Ctrl-C while a Flush is in flight must not cut it short.
+survives long enough to Flush and exits when the event loop empties. While it is
+installed, a second Ctrl-C is ignored: it lands on the same listener, whose run
+has already been released, so the first signal is the one that ends the run.
 */
 export const processSignal: ShutdownSignal = {
 	onShutdown(listener) {
@@ -233,20 +235,12 @@ export class CollectionSession {
 	*/
 	#endRun: (() => void) | undefined;
 	/*
-	The Flush in flight, if any. Telemetry State is cleared only after a
-	successful write, so a Flush that is still waiting on the database has *not*
-	cleared it — and a final Flush started alongside it would snapshot the same
-	counters and insert them a second time. The final Flush therefore waits for
-	this one, and then finds either cleared state or the retry it owes.
-	*/
-	#inFlight: Promise<unknown> | undefined;
-	/*
 	The Drain in flight, if any.
 
-	Held for the same reason `#inFlight` is, one step further out: the last Drain
-	on the way out has to be a fresh pass over the backlog, and a pass that merely
-	joined a Drain already running would never look at the era the final Flush had
-	just written. `stop()` waits this one out first, and then asks for another.
+	Held because the last Drain on the way out has to be a fresh pass over the
+	backlog, and a pass that merely joined a Drain already running would never
+	look at the era the final Flush had just written. `stop()` waits this one out
+	first, and then asks for another.
 	*/
 	#drainInFlight: Promise<void> | undefined;
 	#finalFlush = false;
@@ -311,20 +305,28 @@ export class CollectionSession {
 
 	#scheduleFlush(): void {
 		this.#timer = setTimeout(() => {
-			this.#inFlight = this.#flushAndReschedule();
+			this.#flushAndReschedule();
 		}, this.#intervalMs);
 	}
 
 	/*
-	Rescheduled after the Flush rather than on a `setInterval`, so a slow Flush
-	— a database that has gone away, say — cannot overlap with the next one.
+	Rescheduled after the Flush rather than on a `setInterval`, so the next
+	interval is counted from the end of the last write rather than from its
+	start. Two Flushes cannot overlap whatever this does: the write is
+	synchronous.
+
+	Both `#ended` checks earn their place. The first drops a callback that was
+	already queued when `stop()` cleared the timer; the second drops the
+	reschedule when the run ended while the Flush was being taken, which only the
+	Flush's own observer can bring about — the call above cannot be interrupted,
+	so nothing else can happen in between.
 	*/
-	async #flushAndReschedule(): Promise<void> {
+	#flushAndReschedule(): void {
 		if (this.#ended) {
 			return;
 		}
 
-		await this.#flush();
+		this.#flush();
 
 		if (!this.#ended) {
 			this.#scheduleFlush();
@@ -341,8 +343,12 @@ export class CollectionSession {
 	written here as well would be a second report of one failure, in a place
 	that cannot know whether there is a frame on screen to draw it in
 	(ADR-0010).
+
+	It answers with a plain boolean rather than a promise, as the store does: a
+	Flush that has returned has landed or it has failed, and there is no third
+	state for a caller to wait in.
 	*/
-	async #flush(): Promise<boolean> {
+	#flush(): boolean {
 		if (!this.#state.hasActivity()) {
 			// Nothing to write is not a failure. The final Flush reports on
 			// counters left behind, and there are none.
@@ -350,7 +356,7 @@ export class CollectionSession {
 		}
 
 		const snapshot: Snapshot = this.#state.snapshot();
-		const result = await this.#store.flush(snapshot);
+		const result = this.#store.flush(snapshot);
 		const isWritten = result !== undefined;
 
 		if (isWritten) {
@@ -437,11 +443,18 @@ export class CollectionSession {
 	outcome on a second call, which is why the signal is missing from it: after
 	a SIGTERM, only `run()` can say which signal it was.
 
-	The order on the way out is the whole of it: the Flush in flight, the Drain in
-	flight, the final Flush, one last Drain attempt — awaited, because it is the
-	last — then the store and then the Mongo client. The store closes after the
-	Drain because the Drain reads it, and the client after the store because that
-	is the order they were opened in (ADR-0012).
+	The order on the way out is the whole of it: the Drain in flight, the final
+	Flush, one last Drain attempt — awaited, because it is the last — then the
+	store and then the Mongo client. The store closes after the Drain because the
+	Drain reads it, and the client after the store because that is the order they
+	were opened in (ADR-0012).
+
+	There is no in-flight Flush to wait for on the way in, and that is not an
+	omission: a Flush is a synchronous write, so an interval's has already landed
+	— or already failed — by the time anything can ask the run to end, and an
+	interval that was mid-write could not have been interrupted in the first
+	place. The final Flush below therefore cannot double-count what an interval
+	wrote, which is the bug the wait used to be here for.
 	*/
 	async stop(): Promise<Shutdown> {
 		if (this.#ended) {
@@ -474,16 +487,6 @@ export class CollectionSession {
 		}
 
 		/*
-		Whatever the interval was already writing has to land first, or the Flush
-		below snapshots the same uncleared Telemetry State and writes it twice.
-
-		Swallowed rather than awaited bare: a rejected Flush is already warned
-		about, and letting it out here would replace the error that actually
-		brought the run down — a Collector that could not start — with its own.
-		*/
-		await this.#inFlight?.catch(() => undefined);
-
-		/*
 		The Drain in flight is waited out before the final Flush, so that the Drain
 		the final Flush asks for is a fresh pass rather than a join. A pass that
 		merely joined the one already running would have read the backlog before the
@@ -496,7 +499,7 @@ export class CollectionSession {
 			await this.#drainInFlight;
 		}
 
-		this.#finalFlush = await this.#flush();
+		this.#finalFlush = this.#flush();
 
 		/*
 		One last Drain, awaited, before the store closes — the store closes after
@@ -512,7 +515,7 @@ export class CollectionSession {
 		*/
 		if (!this.#closed) {
 			this.#closed = true;
-			await this.#store.close();
+			this.#store.close();
 		}
 
 		/*

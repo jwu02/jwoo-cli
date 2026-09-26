@@ -455,12 +455,18 @@ is the whole of ADR-0012's fail-fast rule, and this is the first thing either
 command does. The Pusher is built over the store because the store *is* the Push
 Backlog; a Pusher that could not be built closes the store it was handed, so a
 bad `MONGO_URI` does not leave an open file behind on the way out.
+
+Synchronous, because opening the store is: the file is opened and its statements
+prepared on this thread, and the close on the failure path is the same call the
+Session makes on the way out. There is nothing here for a caller to wait on, and
+a promise in front of it would only be something to `await` before the run can
+begin.
 */
-async function openRun(
+function openRun(
 	options: RunOptions,
 	config: Config,
 	{logger, onReadWarning}: RunSinks,
-): Promise<RunDeps> {
+): RunDeps {
 	const store = (
 		options.createStore ??
 		((onWarning: ReadWarningReporter) => new LocalStore(config, {onWarning}))
@@ -480,7 +486,7 @@ async function openRun(
 
 		return {store, pusher: buildPusher(store, logger)};
 	} catch (error) {
-		await store.close();
+		store.close();
 		throw error;
 	}
 }
@@ -494,7 +500,7 @@ a run, and this closes them on the paths a run never reached — a preflight tha
 threw, a Collector that would not start. Whichever gets there first does it.
 */
 async function closeRun({store, pusher}: RunDeps): Promise<void> {
-	await store.close();
+	store.close();
 	await pusher.close();
 }
 
@@ -654,7 +660,7 @@ async function runCollect(options: RunOptions): Promise<void> {
 	same way, and are unreachable here: `collect` draws no history, so nothing
 	asks the store a question — the default is what a run that never reads keeps.
 	*/
-	const deps = await openRun(options, config, {
+	const deps = openRun(options, config, {
 		logger: console,
 		onReadWarning: defaultReadWarningReporter,
 	});
@@ -767,7 +773,7 @@ async function runDashboard(options: RunOptions): Promise<void> {
 	*by* the store's construction: the seam reports a failed read as it answers
 	one, so where its reports go has to be known by the time it is built.
 	*/
-	const deps = await openRun(options, config, {
+	const deps = openRun(options, config, {
 		logger: pushLoggerFor(runLog),
 		onReadWarning(warning) {
 			runLog.append(historyEntry(warning, new Date()));

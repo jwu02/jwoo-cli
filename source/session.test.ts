@@ -38,32 +38,26 @@ class FakeShutdownSignal implements ShutdownSignal {
 }
 
 /*
-The Local Store, standing in. Async on purpose: the store answers synchronously,
-and the machinery that waits on a Flush is what these tests are here to hold in
-place until it is contracted away. A fake that answered synchronously could not
-show a Flush caught in flight at all.
+The Local Store, standing in. Synchronous, because the real one is: `node:sqlite`
+carries no promise, and a fake that answered with one would let the Session go on
+waiting for a write that had already finished.
+
+It holds no way to catch a Flush mid-write, and that is the point rather than a
+gap — a synchronous call cannot be interrupted, so there is no such state for a
+test to put one in.
 */
 class FakeStore implements FlushStore {
 	#failures: number;
-	readonly #hold: (() => Promise<void>) | undefined;
 	readonly trace: string[];
 	readonly snapshots: Array<Record<string, unknown>> = [];
 	closed = 0;
-	/*
-	Counted on entry rather than on completion, so a test can tell that a Flush
-	has *begun* and is blocked — which is the state the duplicate-write bug needs.
-	*/
-	started = 0;
 
-	constructor(failures = 0, hold?: () => Promise<void>, trace: string[] = []) {
+	constructor(failures = 0, trace: string[] = []) {
 		this.#failures = failures;
-		this.#hold = hold;
 		this.trace = trace;
 	}
 
-	async flush(snapshot: never): Promise<Date | undefined> {
-		this.started += 1;
-		await this.#hold?.();
+	flush(snapshot: never): Date | undefined {
 		this.snapshots.push(snapshot);
 
 		if (this.#failures > 0) {
@@ -76,7 +70,7 @@ class FakeStore implements FlushStore {
 		return new Date();
 	}
 
-	async close(): Promise<void> {
+	close(): void {
 		this.closed += 1;
 		this.trace.push('store:close');
 	}
@@ -325,40 +319,6 @@ test('a failed Flush keeps Telemetry State for the next attempt', async t => {
 	t.is(store.snapshots.length, 2);
 	t.is(store.snapshots[1]?.['keysPressed'], 1);
 	t.is(state.snapshot().keysPressed, 0);
-});
-
-/*
-The duplicate-write bug this test pins. Telemetry State is cleared only after a
-successful write, so a Flush still waiting on the database has not cleared it —
-and a final Flush started alongside it would snapshot the same counters and
-insert them a second time, double-counting them in the heatmap. The final Flush
-waits for the one in flight.
-*/
-test('a Flush still in flight is not written twice by the final Flush', async t => {
-	let release: (() => void) | undefined;
-	const gate = new Promise<void>(resolve => {
-		release = () => {
-			resolve();
-		};
-	});
-	const store = new FakeStore(0, async () => gate);
-	const {session, signal, state} = build({
-		store,
-		flushIntervalSeconds: 0.005,
-	});
-	state.addKeyPress('A');
-
-	const running = session.run();
-	await until(() => store.started === 1, {what: 'the interval Flush to start'});
-
-	// The signal lands while that Flush is still blocked on the store.
-	signal.fire('SIGINT');
-	release?.();
-	const shutdown = await running;
-
-	t.is(store.snapshots.length, 1, 'the counters were written once');
-	t.is(store.snapshots[0]?.['keysPressed'], 1);
-	t.true(shutdown.finalFlush, 'the in-flight Flush cleared the state');
 });
 
 /*
@@ -617,7 +577,7 @@ test('a Drain is asked for after a Flush that landed, and not after one that fai
 	const trace: string[] = [];
 	// Set up to fail exactly one Flush, so the retry is an interval's rather
 	// than the shutdown's.
-	const store = new FakeStore(1, undefined, trace);
+	const store = new FakeStore(1, trace);
 	const pusher = new FakePusher(trace);
 	const {session, signal, state} = build({
 		store,
@@ -654,7 +614,7 @@ store after the Drain because the Drain reads it.
 */
 test('the last Drain is awaited before the store and the client close', async t => {
 	const trace: string[] = [];
-	const store = new FakeStore(0, undefined, trace);
+	const store = new FakeStore(0, trace);
 	const pusher = new FakePusher(trace);
 	const {session, signal, state} = build({store, pusher});
 	state.addLeftClick();
@@ -719,7 +679,7 @@ process rather than the run.
 */
 test('a Drain that rejects does not bring the run down', async t => {
 	const trace: string[] = [];
-	const store = new FakeStore(0, undefined, trace);
+	const store = new FakeStore(0, trace);
 	const pusher = new FakePusher(trace);
 	pusher.failWith = new Error('the push seam is broken');
 
