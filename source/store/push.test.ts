@@ -169,6 +169,14 @@ class FakeBacklog implements PushBacklog {
 		return [...this.#eras];
 	}
 
+	/*
+	An era landing while a Drain is in flight, as one written by a final Flush
+	landing behind an interval's pass.
+	*/
+	add(candidate: Era): void {
+		this.#eras.push(candidate);
+	}
+
 	markPushed(stamp: Date, at: Date): void {
 		if (this.failMarksWith) {
 			throw this.failMarksWith;
@@ -418,6 +426,81 @@ test('a Drain asked for while one is running joins it', async t => {
 	t.is(telemetry.started, 1, 'the era was written once');
 	t.is(telemetry.documents.length, 1);
 	t.is(backlog.marks.length, 1);
+});
+
+/*
+`settle` is the last Drain a run makes. The hazard it exists for is a silent one:
+a pass asked for while another is in flight joins it, carries the backlog that
+pass read, and never looks at the era a final Flush wrote behind it — and an
+attempt report would say the Drain succeeded.
+*/
+test('settle waits out an in-flight Drain, and its fresh pass carries an era that arrived behind it', async t => {
+	const {pusher, backlog, database} = await build([era(AT_10)]);
+
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>(resolve => {
+		release = () => {
+			resolve();
+		};
+	});
+	const telemetry = database.collection('telemetry');
+	telemetry.hold = async () => gate;
+
+	const inFlight = pusher.drain();
+	await until(() => telemetry.started === 1, 'the first write to start');
+
+	// Written while the pass above is still in flight, as the final Flush writes.
+	backlog.add(era(AT_11));
+
+	const settled = pusher.settle();
+	release?.();
+	t.is(await settled, 0, 'the fresh pass carried it, so nothing is left');
+	await inFlight;
+
+	t.deepEqual(
+		backlog.marks.map(mark => mark.stamp),
+		[AT_10, AT_11],
+		'both eras went out, the second on the fresh pass',
+	);
+	t.is(telemetry.documents.length, 2);
+});
+
+test('settle answers what its fresh pass left unpushed', async t => {
+	const {pusher, backlog, database} = await build([era(AT_10), era(AT_11)]);
+	database.collection('telemetry').failWritesWith = new Error('boom');
+
+	t.is(await pusher.settle(), 2, 'the pass stopped at the first failure');
+
+	// And the count is the pass's own result, not what it started with.
+	database.collection('telemetry').failWritesWith = undefined;
+
+	t.is(await pusher.settle(), 0);
+	t.deepEqual(backlog.backlog(), []);
+});
+
+test('settle with nothing to carry reports no attempt and answers 0', async t => {
+	const {pusher, attempts} = await build();
+
+	t.is(await pusher.settle(), 0);
+	t.deepEqual(
+		attempts,
+		[],
+		'a pass with nothing to carry did not try anything',
+	);
+});
+
+/*
+The join rule is for Drains in flight, not for Drains that have finished: a
+`settle` that joined a pass already over would answer a count it never earned.
+*/
+test('settle runs a fresh pass when the last Drain has already finished', async t => {
+	const {pusher, backlog} = await build([era(AT_10)]);
+
+	await pusher.drain();
+	backlog.add(era(AT_11));
+
+	t.is(await pusher.settle(), 0, 'the era behind the finished pass went out');
+	t.is(backlog.marks.length, 2);
 });
 
 /*

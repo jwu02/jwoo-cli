@@ -454,6 +454,33 @@ export class Pusher {
 	}
 
 	/*
+	The last Drain a run makes, and what it leaves behind: waits out any Drain
+	already in flight, runs one fresh awaited pass over the Push Backlog, and
+	answers how many eras are still unpushed.
+
+	The wait is the whole point. A pass asked for while one is in flight would
+	join it and never look at the era a final Flush has just written — and a
+	Drain that carried the backlog it was built from looks like nothing at all
+	going wrong. Waiting out the in-flight pass and then asking for a fresh one
+	puts the final Flush's era in front of a pass that has not read the backlog
+	yet.
+
+	The pass itself is an ordinary Drain: the same attempt reporting, stopping at
+	the first failure, and silent when there is nothing to carry.
+
+	The count is read after that pass has had its say, because a pass
+	acknowledges the eras it carried: counting first would report ground the run
+	then made up. It is also a reading the store has to be open to answer —
+	`backlog()` on a closed one is a driver error rather than an answer — so this
+	is asked before the store closes, not after.
+	*/
+	async settle(): Promise<number> {
+		await this.#inFlight;
+		await this.drain();
+		return this.#backlog.backlog().length;
+	}
+
+	/*
 	Closes a client this Pusher owns, and nothing else. Closing twice is
 	survivable, because the Session closes on the way out of a run that may have
 	failed anywhere, and the composition root closes on paths the Session never
