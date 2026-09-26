@@ -1,5 +1,11 @@
 # The dashboard owns the terminal window
 
+> **Status note (2026-09-26).** ADR-0012 renamed two of the seams this ADR lists as
+> `use-window.ts`'s neighbours: `storage.ts` is `push.ts` now, and `history.ts` is gone — the
+> Local Store answers the read itself. The point the list makes is untouched: `use-window.ts` is
+> not a seam, because a window is a property of the stream being drawn into rather than of
+> something that could change behind it.
+
 Ink sizes its root to the terminal's **width** and leaves the height to the content
 (`rootNode.yogaNode.setWidth`, and nothing else). So a frame was exactly as tall as what it
 held: the dashboard drew five lines at the top of a fifty-line terminal, the keys line sat

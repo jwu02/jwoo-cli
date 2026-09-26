@@ -1,8 +1,10 @@
 # jwoo-cli
 
 Personal activity telemetry for a single user. A terminal dashboard observes mouse and keyboard
-input on the author's own machine, accumulates counts in memory, and periodically writes them to
-MongoDB Atlas, where a personal website renders them as a mouse and keyboard heatmap.
+input on the author's own machine, accumulates counts in memory, and periodically Flushes them
+to a Local Store on the same machine — SQLite, and the only source the dashboard's own history
+reads. A best-effort Push carries the same eras on to MongoDB Atlas, where a personal website
+renders them as a mouse and keyboard heatmap (ADR-0012).
 
 See `CONTEXT.md` for the vocabulary and `docs/adr/` for the decisions behind it.
 
@@ -33,35 +35,48 @@ $ cp .env.example .env
 `.env` is gitignored and loaded with Node's own `--env-file`, so there is no dotenv dependency.
 `ACTIVITY_DB_NAME`, `FLUSH_INTERVAL_SECONDS`, and `MOUSE_DPI` fall back to the values shown in
 `.env.example`. `TZ` is read for the history view's day and hour boundaries, falling back to the
-system zone.
+system zone. `LOCAL_STORE_PATH` moves the Local Store, which otherwise lives at
+`~/Library/Application Support/activity-telemetry/telemetry.db`.
 
 ## CLI
 
+Every run line carries `--disable-warning=ExperimentalWarning`: `node:sqlite` is experimental in
+Node and says so on stderr at import.
+
 ```console
 $ npm run build
-$ node --env-file=.env dist/cli.js              # the dashboard
-$ node --env-file=.env dist/cli.js collect      # collect, without the dashboard
-$ node --env-file=.env dist/cli.js permissions  # report the macOS grants
+$ node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js  # the dashboard
+$ node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js collect  # without the dashboard
+$ node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js permissions  # the macOS grants
 ```
 
-The dashboard collects while it is open, and shows two views of what it collects: Today and This
-week, read back from Atlas, and a live view of the run in progress. `t` and `w` switch the range,
-`l` the live view, `q` quits. It fills the terminal it was opened in — the frame is a screenful
-whenever it has less in it than that, with the keys on its last line — and gives the screen back
-when it exits, so the shell's own output is where it was.
+The dashboard collects while it is open, and shows three views of what it collects: Today and
+This week, read back from the Local Store, a live view of the run in progress, and the Run Log
+drawn whole. `t` and `w` switch the range, `l` the live view, `d` the diagnostics view, `q`
+quits. It fills the terminal it was opened in — the frame is a screenful whenever it has less in
+it than that, with the keys on its last line — and gives the screen back when it exits, so the
+shell's own output is where it was.
 
 `collect` is a subcommand rather than a key inside the dashboard, because collection is not
 something that only exists inside a rendered Ink tree (ADR-0001). It runs in the foreground and
 stops when it exits — there is no background process. `SIGINT` and `SIGTERM` both end with a
 final Flush, so quitting does not lose the counters accumulated since the last Flush Interval.
 
+A Flush writes the Local Store, and nothing else: the write is local, synchronous, and the only
+one the run is required to reach. Push is best-effort and happens afterwards, off the Flush
+path. An era that does not reach Atlas waits in the **Push Backlog** and is retried oldest-first
+on the next Drain — at startup and after each Flush — under the stamp it was written with, so a
+retry overwrites rather than duplicates. A Push that has not happened costs the website an era;
+it never costs the CLI one, and the exit code does not depend on it. A store that cannot be
+opened is the opposite case: it ends the run at startup, before anything is drawn, because a run
+that cannot record is a run that would collect into a retry that can never succeed (ADR-0012).
+
 The live view draws what the run has observed since it started — not since the last Flush, which
 would fall back to zero every five minutes. What it has written is not drawn there: the Run Log
 underneath it is the flush record, one line per attempt with the counts it wrote or that it
 failed, and `d` draws those entries whole. A machine whose Input Monitoring grant is missing
-draws as disabled rather than as
-zeroes, because nothing has arrived yet and nothing is being collected are the same numbers and
-not the same thing.
+draws as disabled rather than as zeroes, because nothing has arrived yet and nothing is being
+collected are the same numbers and not the same thing.
 
 A missing macOS permission degrades collection rather than stopping the CLI: the Collectors it
 affects are disabled and named, and everything else carries on. `permissions` reports the same

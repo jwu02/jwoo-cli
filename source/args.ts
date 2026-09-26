@@ -25,7 +25,7 @@ prints it twice.
 */
 export const HELP_TEXT = `
 	Usage
-	  $ jwoo-cli              the dashboard: history, read from Atlas
+	  $ jwoo-cli              the dashboard: history, live and diagnostics views
 	  $ jwoo-cli collect      collect input and Flush it, without the dashboard
 	  $ jwoo-cli permissions  report the macOS grants collection needs
 

@@ -5,9 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A terminal dashboard for personal activity telemetry. It observes mouse and keyboard input on
-the author's own machine, accumulates counts in memory, and flushes them to MongoDB Atlas, where
-a personal website (`jwoo`) renders them as a heatmap. This repo is a TypeScript port of a
-Python client (`activity-telemetry-client`).
+the author's own machine, accumulates counts in memory, and Flushes them to a Local Store on
+that machine — SQLite, and the only source the history view reads — while a best-effort Push
+carries the same eras on to MongoDB Atlas, where a personal website (`jwoo`) renders them as a
+heatmap. This repo is a TypeScript port of a Python client (`activity-telemetry-client`).
 
 `CONTEXT.md` is the authoritative glossary and `docs/adr/` records the decisions behind the
 design. Read both before naming anything or proposing a change.
@@ -21,21 +22,29 @@ misleading loader error when it is used. Prepend the pinned version:
 export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 ```
 
-| Command                                        | What it does                                                          |
-| ---------------------------------------------- | --------------------------------------------------------------------- |
-| `npm test`                                     | The whole gate: prettier `--check`, `xo`, `tsc --noEmit`, then `ava`. |
-| `npx ava source/state.test.ts`                 | One test file.                                                        |
-| `npx ava --match 'click counters'`             | One test by name.                                                     |
-| `npm run build`                                | `tsc --project tsconfig.build.json` → `dist/`, tests excluded.        |
-| `npm run dev`                                  | The same build, in watch mode.                                        |
-| `node --env-file=.env dist/cli.js`             | The dashboard, which collects while it is open. Needs `MONGO_URI`.    |
-| `node --env-file=.env dist/cli.js collect`     | Collect and Flush, with no TUI.                                       |
-| `node --env-file=.env dist/cli.js permissions` | Report the macOS grants and exit.                                     |
-| `./helper/build.sh`                            | Rebuild the native capture helper. Needs Xcode CLI tools.             |
+| Command                                                                              | What it does                                                          |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `npm test`                                                                           | The whole gate: prettier `--check`, `xo`, `tsc --noEmit`, then `ava`. |
+| `npx ava source/state.test.ts`                                                       | One test file.                                                        |
+| `npx ava --match 'click counters'`                                                   | One test by name.                                                     |
+| `npm run build`                                                                      | `tsc --project tsconfig.build.json` → `dist/`, tests excluded.        |
+| `npm run dev`                                                                        | The same build, in watch mode.                                        |
+| `node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js`             | The dashboard, which collects while it is open. Needs `MONGO_URI`.    |
+| `node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js collect`     | Collect and Flush, with no TUI.                                       |
+| `node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js permissions` | Report the macOS grants and exit.                                     |
+| `./helper/build.sh`                                                                  | Rebuild the native capture helper. Needs Xcode CLI tools.             |
 
-The helper is not part of `npm test`: `prettier` and `xo` do not read `.swift`, so the JS gate
-neither checks nor covers it. Build it by hand after changing it and commit the binary with the
-source.
+The flag is on every run line because `node:sqlite` is experimental in Node and says so on stderr
+the moment it is imported — and `main.tsx` imports the Local Store on every path, whichever
+subcommand asked. `npm test` needs it too, which is why it sits in `package.json`'s
+`ava.nodeArguments` beside `tsx`.
+
+The helper's _source_ is not part of `npm test`: `prettier` and `xo` do not read `.swift`, so
+nothing in the gate compiles or lints it. What the gate does exercise is the binary committed
+beside it — `helper.test.ts` spawns it for the `--self-check` pin, for `--preflight`, and to
+watch `stop()` kill it — but nothing compares that binary to `eventtap.swift`, so a rebuild left
+uncommitted passes the gate it should have failed. Build it by hand after changing it and commit
+the binary with the source.
 
 No test reaches the network or another installation, and none may start a server: the `ava` step
 has to pass on a clone of this repo alone. Its scratch space is its own — the temp directory
@@ -81,14 +90,42 @@ would otherwise surface only as the `--preflight` spawn failing to start.
 Tests sit beside their subject and moved with it; ava's default globs find them where they land,
 and it reads the directory as the test name's prefix.
 
+### The Local Store has two faces, and the Push is a seam over its backlog
+
+`store/local-store.ts` owns the SQLite file and answers through it twice. The **write face** —
+`flush(snapshot)`, returning the stamp it wrote under or `undefined` — is what the Session
+Flushes through; the **read face** is the one-method `HistorySource` the history view draws,
+`load(range, now)`. They are one object rather than two readers of it, and `main.tsx` names the
+whole of it once as `RunStore = FlushStore & PushBacklog & HistorySource`, which is what makes
+the view read back exactly what the Flush wrote.
+
+Both faces are synchronous, which is the repo's async-ness rule applied rather than a shortcut:
+`node:sqlite` has no promise in it, so `flush` returns its stamp and `load` returns a
+`LoadResult` directly, and the history view asks during render with no loading state to draw.
+The Push is the one seam here that really does wait, and it says so — `Pusher.drain()` is async
+because a round trip to Atlas is.
+
+**Opening the store is the one thing in a run that fails fast.** It happens in `main.tsx` before
+the preflight and before anything is drawn, because the Local Store is the only write a Flush is
+required to reach; the Pusher is built over that same store and is the opposite case, since a
+Push is best-effort and a run carries on when Atlas is merely unreachable (ADR-0012).
+
+**The Push is a Drain over the store's backlog, and never a wait on the Flush path.** The backlog
+is the store's own query — `pushed_at IS NULL ORDER BY stamp` — rather than a second structure
+kept in step with it, and a Drain walks it oldest era first, stopping at the first failure so it
+stays a tail rather than a scatter of holes. One Drain is fired as the run starts and one after
+each successful Flush, and neither is awaited: a hanging Atlas must not delay the next local
+write. What a Drain found reaches the Run Log through the same callback shape a Flush attempt
+does, with the composition root deciding where the news belongs.
+
 ### Seams, and no database server in the test suite
 
 `push.ts` is the one seam with MongoDB behind it, and it is a write seam: it declares its own
-narrow slice of the driver's types — `Collection`, `Database` — and nothing else in the codebase
-imports `mongodb`. Every test drives a hand-written in-memory fake; there is no test **server**
-and no test container. `telemetry.ts` and `run-log.ts` are two more seams, and neither has a
-database behind it at all — see _The live view reads its own seam_ and _The Run Log reads its
-own seam_ below.
+narrow slice of the driver's types — `Collection`, `Database` — and no module but `push.ts` and
+its own test imports `mongodb`. Every test drives a hand-written in-memory fake; there is no
+test **server** and no test container. `telemetry.ts` and `run-log.ts` are two more seams, and
+neither has a database behind it at all — see _The live view reads its own seam_ and _The Run Log
+reads its own seam_ below.
 
 `local-store.ts` is the one module tested against real files, which is the exception ADR-0012's
 amendment to the gate carves out: the store _is_ the thing under test, and a fake of SQLite
@@ -100,10 +137,11 @@ The narrow types are deliberately faithful about async-ness, and that is load-be
 `Collection.replaceOne` returns a Promise because the driver's does — a fake that lied about it
 would let a missing `await` pass every test while losing data against a real server.
 
-`main.tsx` is the composition root and the only place a `MongoClient` is built. It owns the
-client's lifetime and closes it on every path, because a client left open keeps the process
-alive after the work has finished. `cli.tsx` is only the entry point above it: it parses argv
-and reports a failure's message rather than its stack.
+`main.tsx` is the composition root and the only place a `Pusher` is built. It owns the Local
+Store's lifetime and the Pusher's — and, through it, the `MongoClient`'s — and closes both on
+every path, because a client left open keeps the process alive after the work has finished.
+`cli.tsx` is only the entry point above it: it parses argv and reports a failure's message rather
+than its stack.
 
 `main.tsx` supplies the Collectors too, and the default factory is its own rather than the
 entry point's, along with the things that factory reaches for — the helper stream it builds, the
@@ -194,13 +232,15 @@ the user who has just granted the permission is the one who cannot tell them apa
 _after_ the run rather than inside the handler, so a second Ctrl-C cannot cut a Flush short.
 
 **The Flush write is honest-sync, and there is no in-flight Flush to wait for.** `FlushStore`
-carries no Promise on either method, because `node:sqlite` has none: an interval's Flush has
-already landed or already failed by the time anything can ask the run to end, so a final Flush
-cannot snapshot the same uncleared counters and write them twice. Nothing has to be awaited
-before it — the ordering `stop()` does own is the final Flush, then the awaited last Drain, then
-a synchronous store close and the Mongo client's. `Shutdown.finalFlush` reports whether the
-counters actually made it, and `main.tsx` sets a non-zero exit code when they did not, because a
-shell reads the exit code and not the log.
+carries no Promise on any of its three methods, because `node:sqlite` has none: an interval's
+Flush has already landed or already failed by the time anything can ask the run to end, so a
+final Flush cannot snapshot the same uncleared counters and write them twice. Nothing has to be
+awaited _before_ it — the ordering `stop()` does own is the Drain already in flight waited out
+(a Drain that merely joined it would have read the backlog before the final era existed), then
+the final Flush, then the awaited last Drain, then the backlog counted while the store can still
+answer it, then a synchronous store close and the Mongo client's. `Shutdown.finalFlush` reports
+whether the counters actually made it, and `main.tsx` sets a non-zero exit code when they did
+not, because a shell reads the exit code and not the log.
 
 The shutdown source is injectable. `processSignal` is the real one and the only place
 `process.on` is called; a test raises a signal through a fake, because a real SIGTERM inside the

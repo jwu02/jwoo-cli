@@ -1,10 +1,10 @@
 /*
 What each subcommand does.
 
-The composition root, and the only place a `MongoClient` is built — inside the
-Pusher — and the only place the Local Store is opened. It owns both lifetimes and
-closes them on every path, because a client left open keeps the process alive
-after the work has finished.
+The composition root, and the only place the Pusher is built — which is what
+builds the `MongoClient` — and the only place the Local Store is opened. It owns
+both lifetimes and closes them on every path, because a client left open keeps
+the process alive after the work has finished.
 
 The Local Store is opened before the preflight and before anything is drawn, and
 that order is the whole of ADR-0012's fail-fast rule: it is the one write a Flush

@@ -18,7 +18,7 @@ TUI into a headless run (ADR-0001). `main.js` reaches `tui.js` through a dynamic
 import for the same reason.
 
   Usage
-    $ jwoo-cli            the dashboard: history, read from Atlas
+    $ jwoo-cli            the dashboard: history, live and diagnostics views
     $ jwoo-cli collect    collect input and Flush it, without the dashboard
     $ jwoo-cli permissions  report the macOS grants collection needs
 */
