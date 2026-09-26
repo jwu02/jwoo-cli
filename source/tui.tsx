@@ -4,8 +4,8 @@ The dashboard, mounted.
 Split out from `main.tsx` so that the only module which statically imports ink
 and react is one that a headless `collect` never loads (ADR-0001). Nothing here
 decides anything: it mounts the App, waits for it to be exited, and returns. The
-sources' lifetime is the caller's — `main.tsx` stops the session and closes the
-history source in a `finally`.
+sources' lifetime is the caller's — `main.tsx` stops the session in a `finally`,
+which is what closes the store the frame was reading.
 */
 
 import {render} from 'ink';

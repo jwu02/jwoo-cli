@@ -1,10 +1,16 @@
 /*
 The history view, drawn.
 
-Presentational only: it takes a `LoadState` and a `Range` and returns a frame.
-No effects, no source, nothing to await — every test of this module is a
-synchronous render of a fixed state, which is why the loading and the fetching
-live in `use-history.ts` instead.
+Presentational only: it takes what a read answered with and a `Range`, and
+returns a frame. No effects, no source, nothing to await — every test of this
+module is a synchronous render of a fixed answer, which is why the reading lives
+in `app.tsx` instead.
+
+The answer arrives whole, as the `LoadResult` the read face returns rather than
+as three states. There is no "nothing yet" to draw: a read of the Local Store is
+a field access away, so a frame is never on screen before its range has been
+answered (#30). "Nothing there" is still drawn, from data, and so is "could not
+ask", from the failure.
 
 The vocabulary is CONTEXT.md's. Press Total and Mouse Distance are terms, not
 descriptions, and the key list is a Key Ranking rather than a Heatmap: it
@@ -14,10 +20,9 @@ orders by count where Key Counts order by label, and it draws no keyboard.
 import {Box, Text} from 'ink';
 import {COUNT_FORMAT, twoDigits} from './format.js';
 import {localFields, weekdayOf} from './local-time.js';
-import {type HistoryData} from './local-store.js';
+import {type HistoryData, type LoadResult} from './local-store.js';
 import {bucketUnit, type Range} from './ranges.js';
 import {TotalsView} from './totals-view.js';
-import {type LoadState} from './use-history.js';
 
 /*
 How many Key Labels the list shows. A ranking is only useful at a glance, and
@@ -36,28 +41,32 @@ const SPARKLINE_LEVELS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-export function HistoryView({state, range}: {state: LoadState; range: Range}) {
+export function HistoryView({
+	result,
+	range,
+}: {
+	result: LoadResult;
+	range: Range;
+}) {
 	return (
 		<Box flexDirection="column">
 			<Text bold>
 				{rangeLabel(range)}
-				{state.status === 'ready' ? ` · ${state.data.timeZone}` : ''}
+				{result.ok ? ` · ${result.data.timeZone}` : ''}
 			</Text>
 
-			{state.status === 'loading' && <Text dimColor>Reading…</Text>}
 			{/*
 			A pointer rather than the driver's sentence, which the read seam routes
 			into the Run Log instead. A failed read is one fact about this run, and
 			the log is where this run's facts are: drawn here as well it would be
 			the same failure said twice, in the one place with no room for the rest
-			of the context. The state still carries the message — that is the
-			seam's return value and `use-history.ts` is untouched — and the frame
-			draws the pointer.
+			of the context. The result still carries the message — that is the
+			seam's return value — and the frame draws the pointer.
 			*/}
-			{state.status === 'error' && (
+			{!result.ok && (
 				<Text color="red">Could not read history — see the Run Log (d).</Text>
 			)}
-			{state.status === 'ready' && <Dashboard data={state.data} />}
+			{result.ok && <Dashboard data={result.data} />}
 		</Box>
 	);
 }

@@ -35,10 +35,10 @@ import {
 	type StreamProblem,
 	type StreamSinks,
 } from './helper.js';
-import {MongoHistorySource, type HistorySource} from './history.js';
 import {
+	defaultReadWarningReporter,
 	LocalStore,
-	type ReadWarning,
+	type HistorySource,
 	type ReadWarningReporter,
 } from './local-store.js';
 import {KeyboardCollector} from './keyboard.js';
@@ -306,15 +306,16 @@ export type DashboardView = {
 };
 
 /*
-The Local Store as this module opens it: the two faces a command wires, which
-are the write face the Session Flushes through and the Push Backlog the Pusher
-drains.
+The Local Store as this module opens it: the three faces a command wires, which
+are the write face the Session Flushes through, the Push Backlog the Pusher
+drains, and the read face the history view draws.
 
-Two faces rather than the class, so a test can hand over a stand-in without a
-SQLite file — the rule ADR-0012 leaves in place, a fake for every seam above the
-store. A third face joins them when the history view reads the store too.
+Faces rather than the class, so a test can hand over a stand-in without a SQLite
+file — the rule ADR-0012 leaves in place, a fake for every seam above the store.
+There is one store behind all three, which is the point of the file being the
+source of truth: the view reads back exactly what the Flush wrote.
 */
-export type RunStore = FlushStore & PushBacklog;
+export type RunStore = FlushStore & PushBacklog & HistorySource;
 
 /*
 What a run reaches the outside through, built once and closed on every path.
@@ -340,33 +341,30 @@ export type RunOptions = CollectorFactoryOptions & {
 	readonly shutdown?: ShutdownSignal;
 	readonly logger?: Logger;
 	/*
-	The Local Store, as the composition root opens it. The one implementation is
-	the file itself, so a caller supplying this is a test handing over a
-	stand-in — which is what lets an unopenable store, or a Flush that fails, be
-	driven without a SQLite file and without leaving one behind.
+	The Local Store, as the composition root opens it, built with the reporter
+	the read face's warnings go to. The one implementation is the file itself, so
+	a caller supplying this is a test handing over a stand-in — which is what
+	lets an unopenable store, a Flush that fails, or a read that fails be driven
+	without a SQLite file and without leaving one behind.
+
+	The reporter is handed over rather than reached for afterwards, the shape
+	`createStream` and `createPusher` both have: what a seam reports is settled
+	when it is built, so a caller building one of its own reports where it was
+	told to. A reader is the third face of the store, not a module beside it, so
+	there is no second seam to supply.
 	*/
-	readonly createStore?: () => RunStore;
+	readonly createStore?: (onWarning: ReadWarningReporter) => RunStore;
 	/*
 	The Push seam, built over the store's Push Backlog and with the logger its
-	warnings go to — the shape `createStore` used to have, and for the same
-	reason. A caller supplying this is a test: what a Drain carries is
-	`push.test.ts`'s, and what a test wants here is a Drain that does nothing
-	rather than one that reaches for Atlas.
+	warnings go to — the shape `createStore` has, and for the same reason. A
+	caller supplying this is a test: what a Drain carries is `push.test.ts`'s,
+	and what a test wants here is a Drain that does nothing rather than one that
+	reaches for Atlas.
 	*/
 	readonly createPusher?: (
 		backlog: PushBacklog,
 		logger: Pick<Console, 'warn'>,
 	) => Pusher;
-	/*
-	The read seam as the dashboard reaches for it, built with the reporter its
-	warnings go to — the shape `createStream` has, and for the same reason. What
-	the seam reports is settled when it is built, so a caller building one of
-	its own reports where it was told to; that is what lets a test drive the
-	routing without a database, and what the source the dashboard supplies is.
-	*/
-	readonly createHistorySource?: (
-		onWarning: ReadWarningReporter,
-	) => HistorySource;
 	readonly state?: TelemetryState;
 	/*
 	The Run Log the run appends to. An option for the reason `state` is one: a
@@ -437,6 +435,18 @@ function stateFor(options: RunOptions, config: Config): TelemetryState {
 }
 
 /*
+Where a mode's warnings go, as one value because it is one decision: the Push
+seam reports a TTL index it could not create through a logger, and the Local
+Store reports a failed read through a reporter. Both are the mode's to answer —
+an entry under a frame, a line on stderr without one — and neither is the
+store's business: it is handed them, as it is handed the file it opens.
+*/
+type RunSinks = {
+	readonly logger: Pick<Console, 'warn'>;
+	readonly onReadWarning: ReadWarningReporter;
+};
+
+/*
 Opens what a run reaches the outside through: the Local Store, and the Push over
 it.
 
@@ -449,9 +459,12 @@ bad `MONGO_URI` does not leave an open file behind on the way out.
 async function openRun(
 	options: RunOptions,
 	config: Config,
-	logger: Pick<Console, 'warn'>,
+	{logger, onReadWarning}: RunSinks,
 ): Promise<RunDeps> {
-	const store = (options.createStore ?? (() => new LocalStore(config)))();
+	const store = (
+		options.createStore ??
+		((onWarning: ReadWarningReporter) => new LocalStore(config, {onWarning}))
+	)(onReadWarning);
 
 	try {
 		/*
@@ -637,9 +650,14 @@ async function runCollect(options: RunOptions): Promise<void> {
 
 	The Push seam's warnings keep the terminal, which is where a headless run
 	reports: the run's own logger is for the run's own report, and a TTL index
-	the server would not create is the seam's.
+	the server would not create is the seam's. The read face's warnings go the
+	same way, and are unreachable here: `collect` draws no history, so nothing
+	asks the store a question — the default is what a run that never reads keeps.
 	*/
-	const deps = await openRun(options, config, console);
+	const deps = await openRun(options, config, {
+		logger: console,
+		onReadWarning: defaultReadWarningReporter,
+	});
 
 	try {
 		const report = await preflightWithLog(options, runLog);
@@ -714,9 +732,10 @@ The TUI, which collects while it is open. The alternative — a dashboard that
 draws counters nothing is counting into — is a view that is empty by
 construction, and `collect` is already the way to run without a dashboard.
 
-Both sources are built here and handed down rather than constructed inside a
-component: the load effect is keyed on the history source, so a new identity per
-render would reload forever.
+Every source the frame draws is built here and handed down rather than
+constructed inside a component, because they are lifetimes: the store is opened
+once and closed once, and a view that made its own would have nothing to close
+it with.
 
 `tui.js` is reached through a dynamic import rather than a static one, and that
 is load-bearing rather than tidy: it is the module that pulls in ink and react,
@@ -737,8 +756,23 @@ async function runDashboard(options: RunOptions): Promise<void> {
 	/*
 	Opened before the preflight and before the frame, and a store that will not
 	open ends the run on this line with nothing drawn (ADR-0012).
+
+	The read face's warnings become entries, as the helper's do and for the same
+	reason: the dashboard lands on the history view, and the sentence a failed
+	read carries is a fact about this run rather than about the range on screen.
+	The view draws a pointer and the log holds the whole of it — drawn in both
+	places it would be one failure said twice, one of them across the frame.
+
+	The reporter is settled here, before the store exists, because it is settled
+	*by* the store's construction: the seam reports a failed read as it answers
+	one, so where its reports go has to be known by the time it is built.
 	*/
-	const deps = await openRun(options, config, pushLoggerFor(runLog));
+	const deps = await openRun(options, config, {
+		logger: pushLoggerFor(runLog),
+		onReadWarning(warning) {
+			runLog.append(historyEntry(warning, new Date()));
+		},
+	});
 
 	try {
 		/*
@@ -780,21 +814,6 @@ async function runDashboard(options: RunOptions): Promise<void> {
 		});
 
 		/*
-		The read seam's warnings become entries, as the helper's do and for the same
-		reason: the dashboard lands on the history view, and the sentence a failed
-		read carries is a fact about this run rather than about the range on screen.
-		The view draws a pointer and the log holds the whole of it — drawn in both
-		places it would be one failure said twice, one of them across the frame.
-		*/
-		const reportReadWarning = (warning: ReadWarning): void => {
-			runLog.append(historyEntry(warning, new Date()));
-		};
-
-		const source =
-			options.createHistorySource?.(reportReadWarning) ??
-			new MongoHistorySource(config, undefined, {onWarning: reportReadWarning});
-
-		/*
 		A statement rather than `options.renderApp ?? (await import(...)).renderApp`,
 		which would import ink on every path — including the one where the caller
 		supplied a renderer precisely so that it would not.
@@ -829,7 +848,12 @@ async function runDashboard(options: RunOptions): Promise<void> {
 
 		try {
 			await render({
-				history: source,
+				/*
+				The store itself, and not a reader beside it: the history view reads
+				what the Flush wrote, and one object is what makes that the same file
+				rather than two that have to be kept in step (ADR-0012).
+				*/
+				history: deps.store,
 				telemetry,
 				runLog,
 				timeZone: config.timeZone,
@@ -841,9 +865,12 @@ async function runDashboard(options: RunOptions): Promise<void> {
 			Stopped rather than left to a signal: `q` arrives as input in a raw-mode
 			terminal and never generates one, so this is the only thing that knows the
 			view has gone.
+
+			Nothing closes the reader here any more. The store the view was reading is
+			the one `stop()` closes, after the final Flush has landed — which is the
+			order it has to be, since the Flush is what the view reads.
 			*/
 			await session.stop();
-			await source.close();
 		}
 
 		reportShutdown(await running, logger);

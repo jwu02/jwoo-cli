@@ -1,7 +1,6 @@
 import process from 'node:process';
 import test from 'ava';
 import {type Config} from './config.js';
-import {type HistorySource} from './history.js';
 import {
 	type Era,
 	type HistoryData,
@@ -82,14 +81,47 @@ caught in flight.
 `close` is idempotent, as the Local Store's is. Two things close it on the way
 out of a run — the Session, and the composition root on the paths a run never
 reached — and only one of them does the work.
+
+It is the read face too, and a field rather than a construction argument for it:
+the harness's store exists before the run that builds the real one, and the
+composition root hands the reporter over as it builds it.
 */
 class FakeStore implements RunStore {
 	#failures: number;
 	readonly snapshots: Array<Record<string, unknown>> = [];
+	/*
+	Where a read's warning goes. Silent until the composition root says
+	otherwise, because the default reporter writes to stderr and a test that is
+	not about the routing should not hear about it.
+	*/
+	onWarning: ReadWarningReporter = noop;
+	/*
+	What a read answers with, and the warnings it raises on the way. A store
+	whose read fails is this pair, which is what makes the seam's two ends —
+	the answer and the report — separately assertable.
+	*/
+	readResult: LoadResult = {ok: true, data: data()};
+	readWarnings: readonly ReadWarning[] = [];
+	reads = 0;
 	closed = 0;
 
 	constructor(failures = 0) {
 		this.#failures = failures;
+	}
+
+	/*
+	No arguments: which range was asked for is not what any test here is about —
+	a store handed the real one answers the same way — and naming them would be
+	pretending otherwise. The count is kept, because "the view asked" is.
+	*/
+	load(): LoadResult {
+		this.reads += 1;
+
+		for (const warning of this.readWarnings) {
+			this.onWarning(warning);
+		}
+
+		return this.readResult;
 	}
 
 	async flush(snapshot: never): Promise<Date | undefined> {
@@ -414,8 +446,13 @@ function harness(report: PermissionReport): Harness {
 			/*
 			The harness's store, opened here and not by the composition root — the
 			composition root's own opening of the real one is asserted below.
+
+			The reporter is taken and kept, because that is what the composition
+			root does with it and a store that dropped it would make the routing
+			untestable: the seam reports through what it was built with.
 			*/
-			createStore() {
+			createStore(onWarning: ReadWarningReporter) {
+				store.onWarning = onWarning;
 				return store;
 			},
 			/*
@@ -800,6 +837,13 @@ const FAILING_STORE: RunStore = {
 	async flush(): Promise<Date | undefined> {
 		return undefined;
 	},
+	/*
+	A store that writes nothing still reads: the two faces are one file, and a
+	read is not what this store is standing in for.
+	*/
+	load(): LoadResult {
+		return {ok: true, data: data()};
+	},
 	backlog(): readonly Era[] {
 		return [];
 	},
@@ -868,21 +912,8 @@ view.
 like from `main`'s side — the view comes down, and the composition root is what
 tells the run to stop.
 */
-function stubHistory(closed: number[] = []): HistorySource {
-	return {
-		async load(): Promise<LoadResult> {
-			return {ok: true, data: data()};
-		},
-		async close(): Promise<void> {
-			closed.push(1);
-		},
-	};
-}
-
 test('the dashboard renders through the supplied sources, and stops the run', async t => {
 	const test_ = harness(granted());
-	const closed: number[] = [];
-	const source = stubHistory(closed);
 	const rendered: DashboardView[] = [];
 	let atRender: Date | undefined;
 	test_.options.state?.addLeftClick();
@@ -894,7 +925,6 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 		{kind: 'dashboard'},
 		{
 			...test_.options,
-			createHistorySource: () => source,
 			async renderApp(view) {
 				atRender = new Date();
 				rendered.push(view);
@@ -902,10 +932,15 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 		},
 	);
 
+	/*
+	The view reads the store the Flush wrote, rather than a reader opened
+	beside it — which is the whole of ADR-0012's read side, and the one thing
+	this assertion can say about it.
+	*/
 	t.deepEqual(
 		rendered.map(view => view.history),
-		[source],
-		'the caller supplies the source, not Mongo',
+		[test_.store],
+		'the store is what the history view reads',
 	);
 	t.is(rendered[0]?.timeZone, 'Europe/London', 'the zone comes from Config');
 
@@ -922,8 +957,6 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 			startedAt <= atRender,
 		'the start is this run’s, and it precedes the frame',
 	);
-	t.deepEqual(closed, [1], 'closed even though rendering returned');
-
 	/*
 	The dashboard collects, and the view coming down is what ends the run — `q`
 	never generates a signal, so nothing else would.
@@ -931,7 +964,7 @@ test('the dashboard renders through the supplied sources, and stops the run', as
 	t.is(test_.collectors[0]?.started, 1);
 	t.is(test_.collectors[0]?.stopped, 1);
 	t.is(test_.store.snapshots.length, 1, 'the final Flush happened anyway');
-	t.is(test_.store.closed, 1);
+	t.is(test_.store.closed, 1, 'closed even though rendering returned');
 	t.deepEqual(test_.logger.lines, ['Stopped.']);
 });
 
@@ -949,7 +982,6 @@ test('a missing grant reaches the live view as a disabled reading', async t => {
 		{kind: 'dashboard'},
 		{
 			...test_.options,
-			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				readings.push(view.telemetry.read());
 			},
@@ -985,7 +1017,6 @@ test('a Flush is counted into the live totals', async t => {
 		{kind: 'dashboard'},
 		{
 			...test_.options,
-			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				telemetry = view.telemetry;
 			},
@@ -1043,7 +1074,6 @@ async function logged(
 			state,
 			createStream: () => stream,
 			requestInputMonitoring: noGrantRequest,
-			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				runLog = view.runLog;
 				/*
@@ -1181,7 +1211,6 @@ test('an unreadable line and a helper exit are entries too', async t => {
 				return stream;
 			},
 			requestInputMonitoring: noGrantRequest,
-			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				await view.ended;
 			},
@@ -1207,55 +1236,33 @@ test('an unreadable line and a helper exit are entries too', async t => {
 });
 
 /*
-The read seam's entries, and the other half of the change to the history view:
-a read that failed is one line in the log rather than a driver sentence drawn
-across the frame, and a bucket the boundaries never named is one too.
+The read seam's report, which has one thing in it now that the read is local: a
+read that failed is one line in the log rather than a driver sentence drawn
+across the frame.
 
-The source is the caller's own, reporting through the reporter it was handed
-the way the real one does — the arrangement the delivery tests above use for
-the helper's stream, and for the same reason: the real source opens a
-connection, and what has to be exercised is the routing rather than the read.
-*/
-function reportingHistory(
-	result: LoadResult,
-	...warnings: readonly ReadWarning[]
-): (onWarning: ReadWarningReporter) => HistorySource {
-	return onWarning => ({
-		async load(): Promise<LoadResult> {
-			for (const warning of warnings) {
-				onWarning(warning);
-			}
-
-			return result;
-		},
-		async close(): Promise<void> {
-			// Nothing to release: the stand-in holds no connection.
-		},
-	});
-}
-
-/*
-What the seam's warnings come to once a dashboard run has had them: the entries
-the view was handed, read back after the run so the final Flush has landed.
-
-`load` is driven from the renderer because that is what the view does on mount,
-and the source is the composition root's — so this is the only way a test can
-reach the reporter it gave that source.
+The store is the caller's own, reporting through the reporter the composition
+root handed it — the arrangement the delivery tests above use for the helper's
+stream, and for the same reason: the real store is a file, and what has to be
+exercised is the routing rather than the read. The report is raised from the
+renderer's own `load`, because that is what the view does during render and the
+store is the composition root's.
 */
 async function entriesFromRead(
-	createHistorySource: (onWarning: ReadWarningReporter) => HistorySource,
+	result: LoadResult,
+	...warnings: readonly ReadWarning[]
 ): Promise<readonly RunLogEntry[]> {
 	const test_ = harness(granted());
 	const runLog = new InProcessRunLogSource();
+	test_.store.readResult = result;
+	test_.store.readWarnings = warnings;
 
 	await run(
 		{kind: 'dashboard'},
 		{
 			...test_.options,
 			runLog,
-			createHistorySource,
 			async renderApp(view) {
-				await view.history.load('today', new Date());
+				view.history.load('today', new Date());
 			},
 		},
 	);
@@ -1265,13 +1272,8 @@ async function entriesFromRead(
 
 test('a failed history read is an entry carrying the driver’s message', async t => {
 	const entries = await entriesFromRead(
-		reportingHistory(
-			{ok: false, message: 'connect ECONNREFUSED'},
-			{
-				kind: 'failed-read',
-				error: new Error('connect ECONNREFUSED'),
-			},
-		),
+		{ok: false, message: 'connect ECONNREFUSED'},
+		{error: new Error('connect ECONNREFUSED')},
 	);
 
 	t.is(entries.length, 1);
@@ -1285,28 +1287,12 @@ test('a failed history read is an entry carrying the driver’s message', async 
 });
 
 /*
-A read that answered, with one bucket the boundaries never named. Nothing
-failed and the dashboard drew, so it is an entry rather than a failure — the
-point of it is that the reader drops the bucket loudly rather than in silence.
+A read that answered reports nothing, which is the half of the contract a
+quiet machine needs: an entry per successful read would fill the six-line block
+with news that nothing had gone wrong.
 */
-test('a read that ignored a bucket is an entry, and not a failure', async t => {
-	const entries = await entriesFromRead(
-		reportingHistory(
-			{ok: true, data: data()},
-			{
-				kind: 'ignored-buckets',
-				buckets: ['default'],
-			},
-		),
-	);
-
-	t.is(entries.length, 1);
-	t.is(entries[0]?.class, 'History');
-	t.is(entries[0]?.failed, undefined);
-	t.is(
-		entries[0]?.summary,
-		'Ignored 1 time series bucket(s) outside the range boundaries',
-	);
+test('a read that answered is not an entry', async t => {
+	t.deepEqual(await entriesFromRead({ok: true, data: data()}), []);
 });
 
 /*
@@ -1421,7 +1407,6 @@ test('a dashboard reports a failed Flush once, and writes nothing to stderr', as
 				config: {...CONFIG, flushIntervalSeconds: 0.005},
 				createStream: () => new FakeStream(),
 				requestInputMonitoring: noGrantRequest,
-				createHistorySource: () => stubHistory(),
 				async renderApp(view) {
 					await until(
 						() => runLog.read().some(entry => entry.failed === true),
@@ -1473,7 +1458,6 @@ async function sinksFor(kind: 'collect' | 'dashboard'): Promise<StreamSinks> {
 				return stream;
 			},
 			requestInputMonitoring: noGrantRequest,
-			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				await view.ended;
 			},
@@ -1529,7 +1513,6 @@ test('the write seam’s warning is an entry in dashboard mode, and not a line o
 		{
 			...test_.options,
 			runLog,
-			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				written = captureStderr(() => {
 					test_.pushLoggers[0]?.warn(
@@ -1613,7 +1596,6 @@ test('a missing grant is one entry on a run that never starts', async t => {
 			requestInputMonitoring() {
 				// Stubbed: the real one asks macOS, and nobody is at this keyboard.
 			},
-			createHistorySource: () => stubHistory(),
 			async renderApp(view) {
 				reading = view.telemetry.read();
 			},
@@ -1666,19 +1648,18 @@ test('collect records its Flush attempts as well', async t => {
 });
 
 /*
-A quit is not the only way out of the dashboard, and the source must be closed
-on the way out of all of them — a `MongoClient` left open holds the process.
+A quit is not the only way out of the dashboard, and the store must be closed on
+the way out of all of them — an open file holds the process, and it is the same
+file the view was reading.
 */
-test('the history source is closed even when rendering throws', async t => {
+test('the store is closed even when rendering throws', async t => {
 	const test_ = harness(granted());
-	const closed: number[] = [];
 
 	await t.throwsAsync(
 		run(
 			{kind: 'dashboard'},
 			{
 				...test_.options,
-				createHistorySource: () => stubHistory(closed),
 				async renderApp() {
 					throw new Error('no tty');
 				},
@@ -1687,8 +1668,7 @@ test('the history source is closed even when rendering throws', async t => {
 		{message: 'no tty'},
 	);
 
-	t.deepEqual(closed, [1]);
-	t.is(test_.store.closed, 1, 'and the run behind it was stopped');
+	t.is(test_.store.closed, 1, 'the store the view was reading, closed once');
 });
 
 /*
@@ -1714,7 +1694,6 @@ for (const kind of ['collect', 'dashboard'] as const) {
 							'Could not open the Local Store at /tmp/telemetry.db: file is not a database',
 						);
 					},
-					createHistorySource: () => stubHistory(),
 					async renderApp() {
 						rendered += 1;
 					},
@@ -1774,14 +1753,12 @@ spite of it.
 */
 test('a Collector that throws on start stops the dashboard and propagates', async t => {
 	const test_ = harness(granted());
-	const closed: number[] = [];
 
 	await t.throwsAsync(
 		run(
 			{kind: 'dashboard'},
 			{
 				...test_.options,
-				createHistorySource: () => stubHistory(closed),
 				collectors: () => ({
 					collectors: [
 						{
@@ -1806,7 +1783,11 @@ test('a Collector that throws on start stops the dashboard and propagates', asyn
 		{message: 'no tap'},
 	);
 
-	t.deepEqual(closed, [1]);
+	t.is(
+		test_.store.closed,
+		1,
+		'closed on the way out of a run that ended badly',
+	);
 });
 
 function data(): HistoryData {

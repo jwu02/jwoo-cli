@@ -3,9 +3,9 @@ import {bucketBoundaries, bucketUnit} from './ranges.js';
 
 /*
 The ranges are calendar-aligned in local time, and the boundaries this module
-produces are the *only* definition of a bucket — `history.ts` hands them to
-Mongo's `$bucket` verbatim. There is no second implementation for them to
-disagree with, which is why these tests are the ones that matter.
+produces are the *only* definition of a bucket — the Local Store groups its rows
+by them and nothing else. There is no second implementation for them to disagree
+with, which is why these tests are the ones that matter.
 
 Every case names its timezone rather than relying on the machine's, so the DST
 cases below are ordinary assertions that pass anywhere.

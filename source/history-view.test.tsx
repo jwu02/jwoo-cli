@@ -1,14 +1,17 @@
 import test from 'ava';
 import {render} from 'ink-testing-library';
 import {HistoryView} from './history-view.js';
-import {type HistoryData, type TimeSeriesPoint} from './local-store.js';
+import {
+	type HistoryData,
+	type LoadResult,
+	type TimeSeriesPoint,
+} from './local-store.js';
 import {type Range} from './ranges.js';
-import {type LoadState} from './use-history.js';
 
 /*
-The view is presentational: it takes a `LoadState` and draws it. There is no
-source to fake and nothing to await, so every test here is a synchronous render
-of a fixed state — which is the point of keeping the loading and the fetching
+The view is presentational: it takes what a read answered with and draws it.
+There is no source to fake and nothing to await, so every test here is a
+synchronous render of a fixed answer — which is the point of keeping the reading
 out of this module.
 */
 
@@ -45,14 +48,14 @@ function history(overrides: Partial<HistoryData> = {}): HistoryData {
 	};
 }
 
-function frameOf(state: LoadState, range: Range = 'today'): string {
-	const {lastFrame} = render(<HistoryView state={state} range={range} />);
+function frameOf(result: LoadResult, range: Range = 'today'): string {
+	const {lastFrame} = render(<HistoryView result={result} range={range} />);
 
 	return lastFrame() ?? '';
 }
 
 test('the totals are drawn in the glossary’s words', t => {
-	const frame = frameOf({status: 'ready', data: history()});
+	const frame = frameOf({ok: true, data: history()});
 
 	// Clicks rather than "left clicks" and "right clicks" separately; Press
 	// Total and Mouse Distance are CONTEXT.md terms, not descriptions.
@@ -62,15 +65,12 @@ test('the totals are drawn in the glossary’s words', t => {
 });
 
 test('the header names the range and the zone it was read in', t => {
-	t.regex(
-		frameOf({status: 'ready', data: history()}),
-		/Today · Europe\/London/v,
-	);
-	t.regex(frameOf({status: 'ready', data: history()}, 'week'), /This week/v);
+	t.regex(frameOf({ok: true, data: history()}), /Today · Europe\/London/v);
+	t.regex(frameOf({ok: true, data: history()}, 'week'), /This week/v);
 });
 
 test('key counts are ranked, and carry the count', t => {
-	const frame = frameOf({status: 'ready', data: history()});
+	const frame = frameOf({ok: true, data: history()});
 
 	// Order matters: the ranking is the point of the list.
 	t.true(
@@ -87,7 +87,7 @@ test('only the highest-ranked Key Labels are listed', t => {
 		count: 25 - index,
 	}));
 
-	const frame = frameOf({status: 'ready', data: history({keyRanking})});
+	const frame = frameOf({ok: true, data: history({keyRanking})});
 
 	t.regex(frame, /Key0\b/v);
 	t.regex(frame, /Key11\b/v);
@@ -107,7 +107,7 @@ test('the sparklines say which hours their glyphs stand for', t => {
 	);
 
 	const frame = frameOf({
-		status: 'ready',
+		ok: true,
 		data: history({timeZone: 'UTC', timeSeries}),
 	});
 
@@ -123,7 +123,7 @@ test('a week’s sparkline is labelled in days, not hours', t => {
 	];
 
 	const frame = frameOf({
-		status: 'ready',
+		ok: true,
 		data: history({range: 'week', timeZone: 'UTC', timeSeries}),
 	});
 
@@ -132,7 +132,7 @@ test('a week’s sparkline is labelled in days, not hours', t => {
 
 test('a range with nothing in it says so', t => {
 	const frame = frameOf({
-		status: 'ready',
+		ok: true,
 		data: history({
 			totals: {leftClicks: 0, rightClicks: 0, movementMeters: 0, pressTotal: 0},
 			keyRanking: [],
@@ -153,7 +153,7 @@ here as well it would be the same failure said twice, and the only thing on
 screen that has no room for the rest of the run's context.
 */
 test('a failure points at the Run Log rather than drawing the raw message', t => {
-	const frame = frameOf({status: 'error', message: 'connection reset'});
+	const frame = frameOf({ok: false, message: 'connection reset'});
 
 	t.regex(frame, /Could not read history — see the Run Log \(d\)\./v);
 	t.false(
@@ -163,21 +163,22 @@ test('a failure points at the Run Log rather than drawing the raw message', t =>
 });
 
 /*
-The pointer belongs to the error body and to nothing else: the other two states
-have their own thing to say, and a range that is still being read is not a
-range that failed to be read.
+The pointer belongs to the failure and to nothing else: a read that answered has
+its own thing to say, and a range nobody has touched is not a range that could
+not be read.
 */
 test('the pointer is drawn only when the read failed', t => {
-	t.false(frameOf({status: 'loading'}).includes('Run Log'));
-	t.false(frameOf({status: 'ready', data: history()}).includes('Run Log'));
-});
+	const empty = history({
+		totals: {leftClicks: 0, rightClicks: 0, movementMeters: 0, pressTotal: 0},
+		keyRanking: [],
+		timeSeries: [point('2026-09-21T10:00:00.000Z', 0)],
+	});
 
-test('loading says so rather than drawing an empty dashboard', t => {
-	const frame = frameOf({status: 'loading'});
-
-	t.regex(frame, /Reading/v);
-	// Zeroes would read as "you did nothing", which is a different claim.
-	t.false(frame.includes('Press Total'));
+	t.false(frameOf({ok: true, data: history()}).includes('Run Log'));
+	t.false(
+		frameOf({ok: true, data: empty}).includes('Run Log'),
+		'an empty range is not a failed one',
+	);
 });
 
 /*
@@ -187,7 +188,7 @@ is the first-run case, not an exotic one.
 */
 test('an all-zero range draws without dividing by its maximum', t => {
 	const frame = frameOf({
-		status: 'ready',
+		ok: true,
 		data: history({
 			keyRanking: [{label: 'A', count: 0}],
 			timeSeries: [point('2026-09-21T10:00:00.000Z', 0)],
@@ -198,7 +199,7 @@ test('an all-zero range draws without dividing by its maximum', t => {
 });
 
 test('the sparkline is drawn for each metric over the same buckets', t => {
-	const frame = frameOf({status: 'ready', data: history()});
+	const frame = frameOf({ok: true, data: history()});
 
 	t.regex(frame, /Keys\s+[▁▂▃▄▅▆▇█]{3}/v);
 	t.regex(frame, /Clicks\s+[▁▂▃▄▅▆▇█]{3}/v);

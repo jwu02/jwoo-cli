@@ -56,12 +56,12 @@ it. `config.ts` is the only place any environment variable is read.
 
 ### Seams, and no database server in the test suite
 
-`storage.ts` (write) and `history.ts` (read) are mirrored seams. Each declares its own narrow
-slice of the driver's types — `Collection`, `Database`, `AggregationCursor` — and nothing else
-in the codebase imports `mongodb`. Every test drives a hand-written in-memory fake; there is no
-test **server** and no test container. `telemetry.ts` and `run-log.ts` are the other two, and
-neither has a database behind it at all — see _The live view reads a third seam_ and _The Run
-Log reads a fourth seam_ below.
+`push.ts` is the one seam with MongoDB behind it, and it is a write seam: it declares its own
+narrow slice of the driver's types — `Collection`, `Database` — and nothing else in the codebase
+imports `mongodb`. Every test drives a hand-written in-memory fake; there is no test **server**
+and no test container. `telemetry.ts` and `run-log.ts` are two more seams, and neither has a
+database behind it at all — see _The live view reads its own seam_ and _The Run Log reads its
+own seam_ below.
 
 `local-store.ts` is the one module tested against real files, which is the exception ADR-0012's
 amendment to the gate carves out: the store _is_ the thing under test, and a fake of SQLite
@@ -70,9 +70,8 @@ directory and hand it back, run in-process, and reach no network — so the `ava
 passes on a clone of this repo alone.
 
 The narrow types are deliberately faithful about async-ness, and that is load-bearing.
-`Collection.replaceOne` returns a Promise because the driver's does, and `Collection.aggregate`
-is _synchronous_ because the driver's is — the `await` belongs on `toArray()`. A fake that lied
-about either would let a missing `await` pass every test while losing data against a real server.
+`Collection.replaceOne` returns a Promise because the driver's does — a fake that lied about it
+would let a missing `await` pass every test while losing data against a real server.
 
 `main.tsx` is the composition root and the only place a `MongoClient` is built. It owns the
 client's lifetime and closes it on every path, because a client left open keeps the process
@@ -141,9 +140,9 @@ Collectors — and contains no line parsing or JSON decoding; its report functio
 in the format module. A preflight line with no message is dropped like any other malformed line,
 so stdout that carries only such lines reports "printed no permission report".
 
-### The live view reads a third seam
+### The live view reads its own seam
 
-`telemetry.ts` sits beside `storage.ts` and `history.ts`: `TelemetrySource.read()` returns the
+`telemetry.ts` is a seam of its own beside the Local Store's: `TelemetrySource.read()` returns the
 counters for the run that is happening now. The in-process implementation reads Telemetry State,
 and the read is **synchronous** — there is nothing to await, and saying otherwise would be a
 pretence. Moving collection to a separate process makes it a socket and the read a promise, and
@@ -182,7 +181,7 @@ suite would take ava down with it.
 after a successful Flush, which is what makes retrying the same interval possible. A failed
 Flush returns `undefined` and leaves the state intact.
 
-### The Run Log reads a fourth seam
+### The Run Log reads its own seam
 
 `run-log.ts` sits beside the other three: `RunLogSource.read()` returns the entries of the run
 that is happening now, and the read is **synchronous** for the same reason `telemetry.ts`'s is.
@@ -223,15 +222,12 @@ under a frame, a line on stderr without one. The Session therefore takes no logg
 is what makes the old duplication unrepresentable rather than merely absent.
 
 **The read seam reports the same way** (#23), and for the same reason. A failed read is a fact
-about this run rather than about the range on screen, so `history.ts` raises a `ReadWarning` —
-a union of `failed-read` and `ignored-buckets`, so that _what a warning means_ is decided where
-it is raised rather than guessed back out of prose — and the composition root answers it with an
-entry; `readWarningMessage` is the one spelling of it, as `problemMessage` is. The seam's default
-reporter is the stderr warning it has always written, which is what a run with no view to draw an
-entry in keeps. So the history view draws one compact red pointer line where the driver's
+about this run rather than about the range on screen, so the Local Store raises a `ReadWarning`
+— one thing now, the failure, where it was once a union — and the composition root answers it
+with an entry; `messageOf` is the one spelling of it, as `problemMessage` is. The seam's
+default reporter is the stderr warning it has always written, which is what a run with no view to
+draw an entry in keeps. So the history view draws one compact red pointer line where the driver's
 sentence used to replace the dashboard: the sentence is in the log, whole, one `d` away.
-`LoadState` still carries the message, because the three-state machine is untouched — no view
-draws it.
 
 The block is drawn under the history and live views rather than inside one, because the dashboard
 lands on the history view and that view knows nothing about this run — a session whose every Flush
@@ -279,21 +275,20 @@ stepped in wall-clock space and re-resolved to instants with a two-pass offset l
 second pass in `instantFromLocalFields` is what stops a day bin that straddles a DST transition
 from landing an hour out. The transition cases are asserted in `ranges.test.ts`.
 
-`bucketBoundaries` returns N+1 ascending instants, and that list _is_ the bucket identity — it
-is handed to MongoDB's `$bucket` unchanged, and display bucket `i` is `[b[i], b[i+1])`. See
-ADR-0007 for why the website's `$dateTrunc`-plus-client-keys approach was not ported: it makes
-bucket identity an agreement between MongoDB's ICU and JavaScript's `Intl`, and this CLI cannot
-hold up its half of that agreement. **Do not "fix" the divergence by porting `generateBuckets`**,
-and note that no timezone _name_ ever crosses the wire.
-
-`aggregation.ts` builds pipelines as pure functions returning plain documents, so the pipeline
-is the output a test asserts against.
+`bucketBoundaries` returns N+1 ascending instants, and that list _is_ the bucket identity: display
+bucket `i` is `[b[i], b[i+1])`, and a row lands in one by it and nothing else. The `$bucket` that
+used to consume the list was Mongo query language and went with the Mongo read (ADR-0012); the
+grouping is JavaScript over rows in `local-store.ts` now, bounded by the same list. See ADR-0007
+for why the website's `$dateTrunc`-plus-client-keys approach was not ported: it makes bucket
+identity an agreement between MongoDB's ICU and JavaScript's `Intl`, and this CLI cannot hold up
+its half of that agreement. **Do not "fix" the divergence by porting `generateBuckets`**, and note
+that no timezone _name_ ever crosses the wire.
 
 ### React layering
 
 The TUI is Ink 7 on React 19, and it reaches no further than these modules: `tui.tsx`, `app.tsx`,
 `history-view.tsx`, `live-view.tsx`, `totals-view.tsx`, `run-log-view.tsx`,
-`diagnostics-view.tsx`, `use-history.ts`, `use-telemetry.ts`, `use-run-log.ts` and
+`diagnostics-view.tsx`, `use-telemetry.ts`, `use-run-log.ts` and
 `use-window.ts` are the only ones that import `ink` or `react` — most of them `.tsx`, the hooks
 `.ts` because they hold no markup. Everything else is plain TypeScript, which is what ADR-0001
 requires of the Collector so that the move to a separate process is a different entry point
@@ -316,9 +311,10 @@ them would be a bug rather than a difference of meaning.
 `tui.tsx` dynamically. That is a constraint to keep, not a coincidence: a module on the
 `collect` path that started importing ink statically would drag it into a headless run.
 
-`use-history.ts` holds the loading state machine — three states rather than a value plus a flag,
-because "nothing yet", "nothing there" and "could not ask" draw completely differently — while
-`history-view.tsx` is presentational and synchronous, tested by rendering a fixed `LoadState`.
+`history-view.tsx` is presentational and synchronous, tested by rendering a fixed answer. There
+is no loading hook and no loading state: the read is synchronous, so `app.tsx` asks the store
+during render and hands the view what came back — "nothing there" is drawn from data and "could
+not ask" from the failure, and "nothing yet" was a state only a read that took time could be in.
 `use-telemetry.ts` and `live-view.tsx` split the same way: the hook polls and holds nothing but
 the timer, and the view takes a reading plus the two facts outside it that it draws — the instant
 the run began, read in `main.tsx` where the run starts, and the zone that instant is spelled in,
@@ -343,14 +339,13 @@ failed assertion. `t.teardown(() => { unmount(); })` is the whole fix — and si
 block is under the history and live views and the diagnostics view polls the same entries, that
 is every test that mounts the dashboard, not only the ones that switch views.
 
-`HistorySource` must be referentially stable: `app.tsx` takes it as a prop and the load effect
-is keyed on it, so constructing one inside a component body reloads forever. That is why
-`main.tsx` builds it and passes it down. The same goes for `TelemetrySource`, which `App` hands
-to the live view.
+`HistorySource` arrives as a prop because it is a lifetime, not because a hook is keyed on it:
+it is the Local Store, which `main.tsx` opens and closes, and a view that built its own would
+have nothing to close it with. `TelemetrySource` is handed to the live view the same way.
 
-A failed read resolves to `{ok: false, message}` rather than rejecting. A rejection raised
-inside an effect is an unhandled rejection, which ends the process by default — the TUI would
-exit instead of drawing the error.
+A failed read comes back as `{ok: false, message}` rather than throwing. A throw raised during a
+render is an unhandled error, which ends the process by default — the TUI would exit instead of
+drawing the error.
 
 ## Vocabulary is a contract
 

@@ -8,15 +8,13 @@ import {useTelemetry} from './use-telemetry.js';
 The polling hook, tested through a component because that is the only way a hook
 runs.
 
-The source is mutable rather than deferred — unlike `use-history.ts`, there is
-no promise to hold open, so a test moves the counters and watches the frame
-catch up. That is also why these tests unmount: a component left mounted leaves
-an interval running, and ava times the run out waiting for the worker to exit
-rather than reporting anything about this hook.
+The source is mutable rather than deferred, so a test moves the counters and
+watches the frame catch up. That is also why these tests unmount: a component
+left mounted leaves an interval running, and ava times the run out waiting for
+the worker to exit rather than reporting anything about this hook.
 
-These run serially for the same reason as `use-history.test.tsx`: every `render`
-mounts a real Ink root onto a shared scheduler, and overlapping roots made the
-frame assertions flaky.
+These run serially because every `render` mounts a real Ink root onto a shared
+scheduler, and overlapping roots made the frame assertions flaky.
 */
 
 const TICK_MS = 5;

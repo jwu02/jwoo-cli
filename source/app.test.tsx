@@ -1,16 +1,18 @@
 import test, {type ExecutionContext} from 'ava';
 import {render} from 'ink-testing-library';
 import App from './app.js';
-import {type HistorySource} from './history.js';
-import {type HistoryData, type LoadResult} from './local-store.js';
+import {
+	type HistoryData,
+	type HistorySource,
+	type LoadResult,
+} from './local-store.js';
 import {type Range} from './ranges.js';
 import {type RunLogEntry, type RunLogSource} from './run-log.js';
 import {type LiveTelemetry, type TelemetrySource} from './telemetry.js';
 
 /*
-Serial for the same reason as `use-history.test.tsx`: each case mounts a real
-Ink root onto a shared scheduler, and overlapping roots made the frame
-assertions flaky.
+Serial because each case mounts a real Ink root onto a shared scheduler, and
+overlapping roots made the frame assertions flaky.
 */
 
 /*
@@ -42,16 +44,18 @@ function dataFor(range: Range): HistoryData {
 	};
 }
 
+/*
+The read face, standing in: synchronous, as the Local Store's is, and answering
+whatever range it is asked for. What a read *answers* is `history-view.test.tsx`'s
+to draw; what this records is which range the view asked for, which is the one
+thing the dashboard decides about a read.
+*/
 class StubHistorySource implements HistorySource {
 	readonly requests: Range[] = [];
 
-	async load(range: Range): Promise<LoadResult> {
+	load(range: Range): LoadResult {
 		this.requests.push(range);
 		return {ok: true, data: dataFor(range)};
-	}
-
-	async close(): Promise<void> {
-		// Nothing to release: the fake holds no connection.
 	}
 }
 
@@ -233,7 +237,8 @@ test.serial('l switches to the live view', async t => {
 
 	// The history's numbers are gone rather than drawn under a second heading.
 	t.false(frame.includes('1,111'));
-	// Nothing was re-read: the range did not change, only the view.
+	// Nothing was read: the history view was not up, and a range nobody is
+	// looking at is not a range that gets read.
 	t.deepEqual(source.requests, ['today']);
 });
 
@@ -382,7 +387,8 @@ test.serial('d opens the diagnostics view from the live view', async t => {
 		'with the entries the block was drawing',
 	);
 	t.false(frame.includes('since the CLI started'));
-	// Nothing was re-read: the range did not change, only the view.
+	// Nothing was read: the history view was not up, and a range nobody is
+	// looking at is not a range that gets read.
 	t.deepEqual(source.requests, ['today']);
 });
 
@@ -513,6 +519,27 @@ test.serial('a resize re-fits the frame', async t => {
 	t.is(lines.length, WINDOW_ROWS + 10);
 	t.regex(lines.at(-1) ?? '', /q quit/v);
 });
+
+/*
+The read is keyed to the range rather than to the frame. A resize re-renders
+`App` — the frame's height is the terminal's own report — and a read taken on
+every render would ask a store that cannot answer once per frame, which the Run
+Log would draw as one failure per resize rather than one per failure (ADR-0010,
+#30). Nothing but the range asks the store again.
+*/
+test.serial(
+	'a re-render for the window does not ask the store again',
+	async t => {
+		const source = new StubHistorySource();
+		const instance = mount(t, source);
+		await settle();
+
+		reportRows(instance.stdout, WINDOW_ROWS);
+		await settle();
+
+		t.deepEqual(source.requests, ['today']);
+	},
+);
 
 /*
 A run whose output is a pipe has no window to fill — there is no `rows` — and

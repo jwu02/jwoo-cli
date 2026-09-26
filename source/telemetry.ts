@@ -1,7 +1,7 @@
 /*
 The live view's seam: the counters for the run that is happening now.
 
-`history.ts` reads what has already been written, out of a database. This reads
+The Local Store's read face answers what has already been written. This answers
 what has not been, out of the accumulator in this process — and it is a separate
 source rather than a mode of that one, because they are answers to different
 questions. Today's totals and this run's totals share no numbers at all for the
@@ -32,10 +32,11 @@ import {type FlushAttempt} from './session.js';
 import {type Snapshot, type TelemetryState} from './state.js';
 
 /*
-Two states rather than totals plus an `enabled` flag, for the reason
-`use-history.ts` gives for its three: when there is no grant there are no
-counters worth drawing, and a view that drew zeroes beside a note would be
-showing two contradictory things at once.
+Two states rather than totals plus an `enabled` flag: a machine with no grant
+produces counters that are zero in exactly the way a machine nobody has touched
+does, and the user who has just granted the permission is the one who cannot
+tell them apart. So the reading says which of the two it is rather than leaving
+a view to infer it from an `enabled` bit beside the same zeroes.
 */
 export type LiveTelemetry =
 	| {

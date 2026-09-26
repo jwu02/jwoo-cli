@@ -13,9 +13,9 @@ and `close` return their answers directly, because there is nothing to await.
 Saying otherwise would be a pretence, and it would put a wait in a view that has
 nothing to wait for.
 
-The read vocabulary lives here rather than in `history.ts` because this is where
-it is going: ADR-0012 deletes the Mongo read, and the history view keeps reading
-the same three answers from the same seam.
+The read vocabulary lives here because this is the module that answers it: the
+history view asks this file the same three questions it used to ask MongoDB, and
+`HistorySource` below is the whole of that seam.
 */
 
 import {mkdirSync} from 'node:fs';
@@ -54,13 +54,12 @@ function stringAt(row: Row, column: string): string {
 }
 
 /*
-An error's own sentence, which is worth showing: "file is not a database" and
-"connect ECONNREFUSED" both tell the user more than "something went wrong".
+An error's own sentence, which is worth showing: "file is not a database" tells
+the user more than "something went wrong".
 
-Exported because the read seam has two ends and both spell it — this module
-answers a failed read with it, and `history.ts` answers one with it until
-ADR-0012 retires that module. One spelling, so the two ends cannot drift into
-saying the same failure two ways.
+Exported because a failed read is spelled in two places — the `message` this
+module answers with, and the Run Log entry built from the warning it raises —
+and one spelling is what stops the two drifting into saying one failure two ways.
 */
 export function messageOf(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -255,22 +254,34 @@ export type LoadResult =
 	{ok: true; data: HistoryData} | {ok: false; message: string};
 
 /*
-What a read reports about itself besides its answer.
+The read face, and the whole of what the history view asks for.
 
-Two things happen to a read that still returns: it fails, and — for the Mongo
-read this seam used to be — it succeeds having dropped a bucket the boundaries
-never named. They are one union rather than two callbacks or two sentences
-because *what each one means* has to be decided where it is raised. It is the
-rule ADR-0008 applies to the helper's events, applied to this seam.
+Declared here rather than in the view because this module is what answers it —
+the seam is one method wide, and `LocalStore` is its only implementation. It is
+deliberately not async: `node:sqlite` has no promise in it, and a signature that
+promised one would put a wait in a view that has nothing to wait for.
 
-`ignored-buckets` was `$bucket`'s sentinel, and the Mongo read in `history.ts` is
-its only raiser. Grouping rows in JavaScript, bounded by the same boundary list
-that defines the buckets, leaves no bucket for a stranger to land in — so the
-arm retires with that module (ADR-0012) and this store never constructs it.
+`close` is not part of it. A view reads this file and does not open it; the
+composition root owns that lifetime, as it does every other one.
 */
-export type ReadWarning =
-	| {readonly kind: 'failed-read'; readonly error: unknown}
-	| {readonly kind: 'ignored-buckets'; readonly buckets: readonly unknown[]};
+export type HistorySource = {
+	load(range: Range, now: Date): LoadResult;
+};
+
+/*
+What a read reports about itself besides its answer: it failed, and the driver's
+own error travels with it.
+
+One thing rather than the union this used to be, and one thing rather than a
+bare `unknown` a reader would have to guess the meaning of. `ignored-buckets` was
+the other arm, and it was `$bucket`'s sentinel: grouping rows in JavaScript,
+bounded by the same boundary list that defines the buckets, leaves no bucket for
+a stranger to land in — so it retired with the Mongo read (ADR-0012), and the tag
+that told the two apart went with it. A kind with one value is not a kind.
+*/
+export type ReadWarning = {
+	readonly error: unknown;
+};
 
 export type ReadWarningReporter = (warning: ReadWarning) => void;
 
@@ -285,43 +296,8 @@ The error travels as a second argument rather than inside the sentence, so the
 driver's own stack prints as the driver wrote it.
 */
 export const defaultReadWarningReporter: ReadWarningReporter = warning => {
-	switch (warning.kind) {
-		case 'failed-read': {
-			console.warn('Failed to read telemetry history', warning.error);
-			break;
-		}
-
-		case 'ignored-buckets': {
-			console.warn(readWarningMessage(warning), warning.buckets);
-			break;
-		}
-	}
+	console.warn('Failed to read telemetry history', warning.error);
 };
-
-/*
-What a warning says, as one sentence.
-
-Spelled here because both ends of it are decided outside this module — the
-terminal reporter writes it and the Run Log draws it — and two spellings of
-"the read dropped a bucket" would be two things to keep in step. `helper.ts`
-holds `problemMessage` for the same reason.
-
-A failed read is the driver's own message, which is what the Run Log draws. The
-terminal puts "Failed to read telemetry history" in front of it, in the reporter
-rather than here: a line on stderr has no class column to say what failed, and
-the entry has one, so the preface is the terminal's and the message is shared.
-*/
-export function readWarningMessage(warning: ReadWarning): string {
-	switch (warning.kind) {
-		case 'failed-read': {
-			return messageOf(warning.error);
-		}
-
-		case 'ignored-buckets': {
-			return `Ignored ${warning.buckets.length} time series bucket(s) outside the range boundaries`;
-		}
-	}
-}
 
 export type LocalStoreOptions = {
 	/*
@@ -339,7 +315,7 @@ export type LocalStoreOptions = {
 	readonly now?: () => number;
 };
 
-export class LocalStore {
+export class LocalStore implements HistorySource {
 	readonly #onWarning: ReadWarningReporter;
 	readonly #now: () => number;
 	readonly #timeZone: string;
@@ -653,9 +629,10 @@ export class LocalStore {
 	/*
 	The read face: the history view's three questions, answered from this file.
 
-	Synchronous, and it says so. This is the whole shape `HistorySource` will
-	have once ADR-0012's wiring lands; it is written to it now so that the
-	change is a swap rather than a rewrite.
+	The view calls this during render, which is what the synchronous signature
+	is for: there is nothing to wait on, so there is no loading state to draw and
+	no answer to hold in state until it arrives. `HistorySource` is the shape a
+	view reaches for, and this is the one implementation.
 
 	The failure comes back as a value rather than a throw, for the reason
 	`LoadResult` gives, and it is reported through the warning reporter on the
@@ -690,7 +667,7 @@ export class LocalStore {
 				},
 			};
 		} catch (error) {
-			this.#onWarning({kind: 'failed-read', error});
+			this.#onWarning({error});
 			return {ok: false, message: messageOf(error)};
 		}
 	}

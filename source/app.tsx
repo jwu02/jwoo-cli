@@ -3,7 +3,7 @@ The dashboard: the two views of the collection, the Run Log under them, and the
 keys that switch between them.
 
 History is the landing view because it is the one that works before anything has
-been collected — reading it needs the database and nothing else. The live view
+been collected — reading it needs the Local Store and nothing else. The live view
 is the second: what this run has seen so far, which is empty by definition for
 the first few seconds. Diagnostics is the third, and the only one reached on
 purpose rather than by naming what it shows: it is the Run Log's own entries
@@ -16,25 +16,24 @@ It is not under diagnostics, which is that same block drawn whole — the block
 beneath it would put one record on screen twice.
 
 All the sources arrive as props rather than being built here, and that is
-load-bearing rather than stylistic. Constructing one in the component body gives
-it a new identity on every render, and the load effect is keyed on it — so the
-view would reload forever. The composition root in `main.tsx` owns them.
+load-bearing rather than stylistic: they are the composition root's to open and
+to close, and a view that built one would own a lifetime it cannot release. The
+composition root in `main.tsx` owns them.
 
 The range lives here rather than in the view because switching it is input, and
 the views are presentational.
 */
 
 import {Box, Text, useApp, useInput} from 'ink';
-import {useState} from 'react';
+import {useMemo, useState} from 'react';
 import {DiagnosticsView} from './diagnostics-view.js';
 import {HistoryView} from './history-view.js';
-import {type HistorySource} from './history.js';
+import {type HistorySource} from './local-store.js';
 import {LiveView} from './live-view.js';
 import {type Range} from './ranges.js';
 import {type RunLogSource} from './run-log.js';
 import {RunLogView} from './run-log-view.js';
 import {type TelemetrySource} from './telemetry.js';
-import {useHistory} from './use-history.js';
 import {useRunLog} from './use-run-log.js';
 import {useTelemetry} from './use-telemetry.js';
 import {useWindowHeight} from './use-window.js';
@@ -69,8 +68,23 @@ export default function App({
 	const [range, setRange] = useState<Range>('today');
 	const [view, setView] = useState<View>('history');
 	const {exit} = useApp();
-	const state = useHistory(history, range);
 	const height = useWindowHeight();
+
+	/*
+	The read, keyed to the question rather than to the frame that draws it.
+
+	Not a loading state and not a cache of one: there is nothing to wait for, so
+	what is held is the answer itself, and the only thing that changes it is the
+	range. The alternative — asking on every render — would ask again on a
+	resize, and a store that cannot answer answers the same way every time, so a
+	failed read would land in the Run Log once per frame instead of once per
+	failure (ADR-0010, #30). This is the same keying the effect it replaced had,
+	without the effect.
+	*/
+	const result = useMemo(
+		() => history.load(range, new Date()),
+		[history, range],
+	);
 
 	useInput(input => {
 		switch (input) {
@@ -123,7 +137,7 @@ export default function App({
 		height of its content and the spacer has nothing to take.
 		*/
 		<Box flexDirection="column" minHeight={height}>
-			{view === 'history' && <HistoryView state={state} range={range} />}
+			{view === 'history' && <HistoryView result={result} range={range} />}
 			{view === 'live' && (
 				<Live source={telemetry} startedAt={startedAt} timeZone={timeZone} />
 			)}

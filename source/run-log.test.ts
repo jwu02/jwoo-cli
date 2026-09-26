@@ -198,36 +198,13 @@ middle of the frame. Its spelling is the seam's — the entry composes nothing
 about a read and borrows the words the seam would have warned with.
 */
 test('a failed read is an entry carrying the driver’s own message', t => {
-	const failure = historyEntry(
-		{kind: 'failed-read', error: new Error('connect ECONNREFUSED')},
-		AT,
-	);
+	const failure = historyEntry({error: new Error('connect ECONNREFUSED')}, AT);
 
 	t.deepEqual(failure.at, AT);
 	t.is(failure.class, 'History');
 	t.true(failure.failed === true, 'which is what draws it red');
 	t.is(failure.summary, 'connect ECONNREFUSED');
 	t.is(failure.detail, failure.summary);
-});
-
-/*
-A read that answered. A bucket the boundaries never named is worth seeing — the
-reader drops it loudly rather than zero-filling it — but the view drew, and
-nothing is coming back, so it is not drawn as a failure.
-*/
-test('an ignored bucket is an entry, and not a failure', t => {
-	const ignored = historyEntry(
-		{kind: 'ignored-buckets', buckets: ['default']},
-		AT,
-	);
-
-	t.deepEqual(ignored.at, AT);
-	t.is(ignored.class, 'History');
-	t.is(ignored.failed, undefined);
-	t.is(
-		ignored.summary,
-		'Ignored 1 time series bucket(s) outside the range boundaries',
-	);
 });
 
 /*

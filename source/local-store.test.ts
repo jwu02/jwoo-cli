@@ -703,11 +703,11 @@ test('a read that cannot be answered comes back as a value, and is reported', t 
 	// The driver's own sentence, passed through rather than replaced.
 	t.regex(messageFrom(result), /Bogus\/Zone/v);
 
-	// One failure, reported once. The entry the Run Log draws is built from
-	// this, which is why the seam says what happened rather than only that
-	// something did.
+	// One failure, reported once. The entry the Run Log draws is built from this
+	// — and so is the sentence the terminal prints — which is why the seam hands
+	// over what went wrong rather than only that something did.
 	t.is(warnings.length, 1);
-	t.is(warnings[0]?.kind, 'failed-read');
+	t.regex(String(warnings[0]?.error), /Bogus\/Zone/v);
 });
 
 test('a read from a closed store is a value rather than a rejection', t => {

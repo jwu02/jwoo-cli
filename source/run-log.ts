@@ -1,13 +1,13 @@
 /*
 The dashboard's record of the run that is happening now.
 
-A fourth seam, and shaped like the third. `history.ts` reads what has already
-been written, `telemetry.ts` reads what has been counted, and this reads what
-the run has *done*: each Flush attempt with the counts it wrote, or that it
-failed; the problems the helper and the stream reading it reported; and
+A seam of its own, shaped like the live view's. The Local Store's read face answers what
+has already been written, `telemetry.ts` reads what has been counted, and this
+reads what the run has *done*: each Flush attempt with the counts it wrote, or
+that it failed; the problems the helper and the stream reading it reported; and
 collection that started with no grant. All three are separate sources rather
 than modes of one, because they are answers to different questions — and none
-of them is a database read the caller has to wait on.
+of them is a read the caller has to wait on.
 
 The read is synchronous here for the same reason it is in `telemetry.ts`: the
 buffer is a field access away and there is nothing to await. That is a fact about
@@ -33,7 +33,7 @@ when the CLI exits (CONTEXT.md, Deliberately absent).
 
 import {COUNT_FORMAT, METRES_FORMAT} from './format.js';
 import {problemMessage, type StreamProblem} from './helper.js';
-import {readWarningMessage, type ReadWarning} from './local-store.js';
+import {messageOf, type ReadWarning} from './local-store.js';
 import {type DisabledCollector, type DisabledReport} from './permissions.js';
 import {type FlushAttempt} from './session.js';
 
@@ -163,23 +163,19 @@ export function helperEntry(problem: StreamProblem, at: Date): RunLogEntry {
 A read the history seam reported on.
 
 Both texts are the seam's own sentence for the warning, for the reason
-`helperEntry` borrows `problemMessage`: there is one spelling of "the read
-dropped a bucket" and one of what the driver said, and a view, a terminal and a
-log that each composed their own would be three descriptions of one event.
+`helperEntry` borrows `problemMessage`: there is one spelling of what the driver
+said — `messageOf`, which is also what the read answers a caller with — and a
+view, a terminal and a log that each composed their own would be three
+descriptions of one event.
 
-A failed read draws red and carries the driver's message, which is the text the
-history view used to draw in place of the dashboard and now points here for. An
-ignored bucket does not: the read answered and the view drew, so the entry
-exists because a bucket the boundaries never named is worth seeing rather than
-because anything failed.
+It draws red, and there is no arm that does not: a read either answers or fails,
+so a warning is a failure by definition. The whole of it is what the history view
+points here for rather than drawing in place of the dashboard (#23, #30).
 */
 export function historyEntry(warning: ReadWarning, at: Date): RunLogEntry {
-	const detail = readWarningMessage(warning);
-	const summary = oneLine(detail);
+	const detail = messageOf(warning.error);
 
-	return warning.kind === 'failed-read'
-		? {at, class: 'History', failed: true, summary, detail}
-		: {at, class: 'History', summary, detail};
+	return {at, class: 'History', failed: true, summary: oneLine(detail), detail};
 }
 
 /*
