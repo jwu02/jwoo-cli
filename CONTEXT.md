@@ -1,9 +1,10 @@
 # Telemetry
 
 Personal activity telemetry for a single user. A local CLI observes mouse and keyboard
-input on the author's own machine, accumulates counts in memory, and periodically writes
-them to MongoDB Atlas, where a personal website renders them as a mouse and keyboard
-heatmap.
+input on the author's own machine, accumulates counts in memory, periodically Flushes
+them to a Local Store on the same machine, and Pushes them to MongoDB Atlas, where a
+personal website renders them as a mouse and keyboard heatmap. The CLI reads only the
+Local Store; MongoDB is write-only to it (ADR-0012).
 
 ## Language
 
@@ -58,18 +59,19 @@ An immutable copy of Telemetry State, safe to hand to storage.
 _Avoid_: dump, export, freeze
 
 **Flush**:
-Writing a Snapshot to storage. Telemetry State is cleared only on a successful Flush; a failed
-Flush leaves it intact so the same data is retried on the next interval, overwriting what the
-failed attempt wrote rather than adding to it (ADR-0009).
-_Avoid_: save, persist, sync, upload, commit
+Writing a Snapshot to the Local Store. Telemetry State is cleared only on a successful Flush;
+a failed Flush leaves it intact so the same Activity is retried on the next interval rather
+than lost (ADR-0009).
+_Avoid_: save, persist, sync, upload, commit (and Push — that is the write to MongoDB, not this)
 
 **Flush Interval**:
 How long Telemetry State accumulates before a Flush is attempted.
 
 **Era**:
 The Activity accumulated between one successful Flush and the next — what one Telemetry State
-holds while it is being written. A Flush that fails stays in its era: the retry writes the same
-era's documents again, under the same stamp, rather than opening a new one (ADR-0009).
+holds while it is being written. A Flush that fails stays in its era: the retry completes the
+same era rather than opening a new one. The era keeps the stamp of the write that recorded it,
+and a Push retries under that stamp, overwriting rather than duplicating (ADR-0009).
 _Avoid_: epoch, generation, attempt (an attempt is one try; an era can span several)
 
 **Telemetry Document**:
@@ -77,6 +79,32 @@ One flushed interval's mouse and keyboard totals.
 
 **Key Count Document**:
 One flushed interval's Key Counts, written only when keys were pressed during it.
+
+**Local Store**:
+The durable local record of every era this machine has Flushed: the CLI's only source for the
+history view, and the only write a Flush is required to reach. It is one machine's record — it
+holds what this machine observed and nothing else — and MongoDB is never read to fill it
+(ADR-0012).
+_Avoid_: cache (nothing here is a copy of the database), local database, journal, log file
+
+**Push**:
+Writing a Flushed era to MongoDB, where the website reads it. Best-effort: an era that fails to
+Push waits in the Push Backlog and is retried under its own stamp, overwriting what a lost
+acknowledgement landed rather than adding to it (ADR-0009). A Push that has not happened costs
+the website an era; it never costs the CLI one.
+_Avoid_: save, persist, sync, upload, commit (and Flush — that is the write to the Local Store,
+not this)
+
+**Push Backlog**:
+Flushed eras not yet Pushed — the tail of the Local Store past the last successful Push. A fact
+about the network rather than about the run: it exists while the machine is offline and drains
+without ceremony once Pushes land again.
+_Avoid_: queue, pending writes, failed Flushes (the Flushes succeeded)
+
+**Drain**:
+Pushing the Push Backlog, oldest era first, stopping at the first failure so the backlog stays
+a tail rather than a scatter of holes.
+_Avoid_: catch-up, retry loop, sync
 
 ### The reader
 
@@ -150,8 +178,9 @@ Key Counts and are still different things
 
 **Run Log**:
 The dashboard's record of what the current run did and hit: each Flush attempt with the counts
-it wrote, or that it failed; the problems the helper and the reads reported; what the write seam
-reported about itself; and collection that started disabled by a missing permission. It holds
+it wrote, or that it failed; Pushes that failed and backlogs that drained; the problems the
+helper and the reads reported; what the write seam reported about itself; and collection that
+started disabled by a missing permission. It holds
 only this run — it exists while the CLI runs and is gone when it exits. A Flush is attempted
 only when there is Activity, so the log lists attempts, not intervals. The full text of an entry
 is one keypress away.
@@ -176,4 +205,7 @@ These are not gaps. They are out of scope, and the vocabulary should not drift b
 - **Daemon.** There is no background process and no service. Collection happens only while the
   CLI is running. Do not name anything `Daemon`, `Service`, or `Agent`.
 - **A log file.** The Run Log lives in memory for the current run only. Diagnosing a run that
-  is already over is what the exit code and the database are for.
+  is already over is what the exit code and the Local Store are for.
+- **More than one machine.** The Local Store is one machine's record and the history view reads
+  only it; a second machine would Push a union to MongoDB that this CLI never shows. If it
+  returns, it returns with an answer for whose era is whose.

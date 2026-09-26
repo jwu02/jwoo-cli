@@ -1,5 +1,11 @@
 # A Flush writes idempotently, keyed by its stamp
 
+> **Status note (2026-09-25).** ADR-0012 moves the stamp's home. The Flush writes the era to the
+> Local Store under its stamp — a primary key, so the retry overwrites as it did — and the Push
+> writes the era's documents to MongoDB under the same stamp, upserting. The stamp guard is
+> seeded from the Local Store's newest stamp at open, so a stamp repeats nobody across runs
+> either.
+
 A Flush writes two documents sequentially — the Telemetry Document, then the Key Count
 Document when keys were pressed. Nothing makes the pair atomic, and nothing has to: Telemetry
 State is cleared only after a successful Flush, so a failed Flush retries on the next Flush

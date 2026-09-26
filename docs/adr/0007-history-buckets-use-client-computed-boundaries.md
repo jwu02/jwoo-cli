@@ -1,5 +1,10 @@
 # The history view hands MongoDB explicit bucket boundaries
 
+> **Status note (2026-09-25).** ADR-0012 retires the MongoDB read this ADR was written for: the
+> history view now reads the Local Store and groups in JavaScript. What survives is the
+> principle this ADR records — the boundary list is the bucket identity, computed by
+> `bucketBoundaries` in one place — and `ranges.ts` is unchanged.
+
 The website buckets its time series with `$dateTrunc` given a `timezone` name, and generates the
 matching bucket keys client-side in `jwoo/lib/timezone.ts` (`generateBuckets` → `alignToInterval`
 → `addInterval`). That works, and we did not copy it. The reader in `source/aggregation.ts` uses
