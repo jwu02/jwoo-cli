@@ -263,7 +263,10 @@ async function settle(): Promise<void> {
 }
 
 test('a Drain Pushes the backlog oldest first, and acknowledges each era', async t => {
-	const {pusher, backlog, database} = await build([era(AT_10), era(AT_11)]);
+	const {pusher, backlog, database, attempts} = await build([
+		era(AT_10),
+		era(AT_11),
+	]);
 
 	await pusher.drain();
 
@@ -279,6 +282,14 @@ test('a Drain Pushes the backlog oldest first, and acknowledges each era', async
 		[AT_10, AT_11],
 	);
 	t.deepEqual(backlog.backlog(), [], 'the backlog drained to nothing');
+	/*
+	And the ground it covered is what the attempt reports, which is what the Run
+	Log's gathered-ground entry counts: two eras is the smallest Drain that made
+	up ground rather than keeping up with it.
+	*/
+	t.is(attempts.length, 1, 'one attempt, however many eras it carried');
+	t.is(attempts[0]?.pushed, 2);
+	t.true(attempts[0]?.ok === true, 'which reached the end of the backlog');
 });
 
 test('an era is Pushed under its own stamp, in the wire shape', async t => {

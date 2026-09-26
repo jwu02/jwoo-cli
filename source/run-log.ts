@@ -4,7 +4,8 @@ The dashboard's record of the run that is happening now.
 A seam of its own, shaped like the live view's. The Local Store's read face answers what
 has already been written, `telemetry.ts` reads what has been counted, and this
 reads what the run has *done*: each Flush attempt with the counts it wrote, or
-that it failed; the problems the helper and the stream reading it reported; and
+that it failed; each Drain with the ground it covered, or the failure that
+stopped it; the problems the helper and the stream reading it reported; and
 collection that started with no grant. All three are separate sources rather
 than modes of one, because they are answers to different questions — and none
 of them is a read the caller has to wait on.
@@ -38,22 +39,24 @@ import {
 	type DisabledCollector,
 	type DisabledReport,
 } from './capture/permissions.js';
+import {type PushAttempt} from './store/push.js';
 import {type FlushAttempt} from './session.js';
 
 /*
-The kinds of thing a run can report: a Flush attempt, a problem the helper or
-the stream reading it reported, a warning from the history read, a warning the
-write seam raised while setting itself up, and collection that started
-disabled. The block draws the class of an entry beside its text, which is what
-tells a `Helper` line from a `Collection` one at a glance.
+The kinds of thing a run can report: a Flush attempt, a Drain attempt, a problem
+the helper or the stream reading it reported, a warning from the history read, a
+warning the Push seam raised while setting itself up, and collection that
+started disabled. The block draws the class of an entry beside its text, which
+is what tells a `Helper` line from a `Collection` one at a glance.
 
-`Storage` is the write seam's own, and it is here rather than folded into
-`Flush` because it is not one: the store raises it as it is built, before any
-Flush has happened, and a line about a TTL index filed under a Flush would read
-as something the write below it did.
+`Push` is the Push seam's own, and it is here rather than folded into `Flush`
+because it is not one: the two writes are separate and fail for separate
+reasons — a Flush writes this machine, a Push carries what the Flush wrote to
+MongoDB — and a line about a TTL index or a stranded era filed under a Flush
+would read as something the write below it did.
 */
 export type RunLogClass =
-	'Flush' | 'Helper' | 'History' | 'Storage' | 'Collection';
+	'Flush' | 'Helper' | 'History' | 'Push' | 'Collection';
 
 /*
 Two texts rather than one, because a block that stays a fixed size has to cut
@@ -140,6 +143,52 @@ export function flushEntry({at, ok, snapshot}: FlushAttempt): RunLogEntry {
 }
 
 /*
+How much ground a Drain has to make up before it is worth a line: one era is the
+steady state rather than news, and a line for it would push Flush lines out of
+the six-entry window.
+*/
+const GATHERED_GROUND = 2;
+
+/*
+A Drain attempt as the log records it, or `undefined` for the attempt that is
+not worth a line at all.
+
+A Drain that failed is one red entry, repeated for as long as the problem lasts
+— one per Flush Interval, exactly as a failed Flush repeats. Its line is the
+driver's own sentence, borrowed rather than composed, for the reason
+`historyEntry` borrows `messageOf`: why a Push did not land is the part of it
+worth reading, and there is one spelling of what the driver said.
+
+A Drain that made up gathered ground — two eras or more — says so in one plain
+entry: those eras' Flush entries have long since left the six-entry window, and
+a backlog that has started moving again is news. A Drain that carried one era
+says nothing, which is why this answers `undefined` rather than an entry no
+frame would want: that is the steady state, one era Flushed and Pushed seconds
+later, and the Flush's own entry already told that story.
+*/
+export function pushEntry(attempt: PushAttempt): RunLogEntry | undefined {
+	if (!attempt.ok) {
+		const detail = messageOf(attempt.error);
+
+		return {
+			at: attempt.at,
+			class: 'Push',
+			failed: true,
+			summary: oneLine(detail),
+			detail,
+		};
+	}
+
+	if (attempt.pushed < GATHERED_GROUND) {
+		return undefined;
+	}
+
+	const summary = `Pushed ${COUNT_FORMAT.format(attempt.pushed)} eras`;
+
+	return {at: attempt.at, class: 'Push', summary, detail: summary};
+}
+
+/*
 A problem the helper, or the stream reading it, reported.
 
 The message is `helper.ts`'s own sentence for the problem — the one the stderr
@@ -182,27 +231,27 @@ export function historyEntry(warning: ReadWarning, at: Date): RunLogEntry {
 }
 
 /*
-A warning the write seam raised, as the log records it.
+A warning the Push seam raised, as the log records it.
 
-The store reports through a logger rather than as a return value — the one
-thing on that side that is not a Flush is a TTL index it could not create — so
-this is the entry the dashboard answers that logger with. A failed Flush never
-arrives this way: `flush` returns `undefined` for one, and the attempt the
-Session reports is what the log draws it from.
+The seam reports through a logger rather than as a return value — the one thing
+on that side that is not an era is a TTL index it could not create — so this is
+the entry the dashboard answers that logger with. A Drain that failed never
+arrives this way: `pushEntry` is what the attempt it reports becomes, and this
+is the seam's word about itself rather than about an era it was carrying.
 
 The extra arguments a logger call carried are kept in `detail`, where the
 diagnostics view shows them: a driver's error is worth more than the one line
 the message makes of it, and dropping it here would leave the driver's own
 sentence nowhere at all.
 */
-export function storageEntry(
+export function pushWarningEntry(
 	message: string,
 	extra: readonly unknown[],
 	at: Date,
 ): RunLogEntry {
 	return {
 		at,
-		class: 'Storage',
+		class: 'Push',
 		failed: true,
 		summary: oneLine(message),
 		detail: [message, ...extra.map(String)].join(' '),

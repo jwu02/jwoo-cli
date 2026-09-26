@@ -26,6 +26,7 @@ switch kept there was reached by no test at all.
 
 import process from 'node:process';
 import {type Command} from './args.js';
+import {COUNT_FORMAT} from './format.js';
 import {type Config, loadConfig} from './store/config.js';
 import {
 	defaultHelperStderr,
@@ -52,7 +53,11 @@ The class is this module's name for the real Push; the type it is held as is
 `session.ts`'s slice of it, which a stand-in can satisfy — the same split
 `EventStream as HelperStream` above makes.
 */
-import {type PushBacklog, Pusher as MongoPusher} from './store/push.js';
+import {
+	type PushAttempt,
+	type PushBacklog,
+	Pusher as MongoPusher,
+} from './store/push.js';
 import {type RawEvent} from './capture/raw-event.js';
 import {
 	collectionEntry,
@@ -60,8 +65,9 @@ import {
 	helperEntry,
 	historyEntry,
 	InProcessRunLogSource,
+	pushEntry,
+	pushWarningEntry,
 	type RunLogSource,
-	storageEntry,
 } from './run-log.js';
 import {
 	type Collector,
@@ -358,8 +364,9 @@ export type RunOptions = CollectorFactoryOptions & {
 	*/
 	readonly createStore?: (onWarning: ReadWarningReporter) => RunStore;
 	/*
-	The Push seam, built over the store's Push Backlog and with the logger its
-	warnings go to — the shape `createStore` has, and for the same reason. A
+	The Push seam, built over the store's Push Backlog and with both things it
+	reports through: the logger its own warnings go to, and the sink each Drain
+	attempt goes to — the shape `createStore` has, and for the same reason. A
 	caller supplying this is a test: what a Drain carries is `push.test.ts`'s,
 	and what a test wants here is a Drain that does nothing rather than one that
 	reaches for Atlas.
@@ -367,6 +374,7 @@ export type RunOptions = CollectorFactoryOptions & {
 	readonly createPusher?: (
 		backlog: PushBacklog,
 		logger: Pick<Console, 'warn'>,
+		onAttempt: (attempt: PushAttempt) => void,
 	) => Pusher;
 	readonly state?: TelemetryState;
 	/*
@@ -438,15 +446,17 @@ function stateFor(options: RunOptions, config: Config): TelemetryState {
 }
 
 /*
-Where a mode's warnings go, as one value because it is one decision: the Push
-seam reports a TTL index it could not create through a logger, and the Local
-Store reports a failed read through a reporter. Both are the mode's to answer —
-an entry under a frame, a line on stderr without one — and neither is the
-store's business: it is handed them, as it is handed the file it opens.
+Where a mode's reports go, as one value because it is one decision: the Push
+seam reports a TTL index it could not create through a logger and each Drain
+attempt through a callback, and the Local Store reports a failed read through a
+reporter. All three are the mode's to answer — an entry under a frame, a line on
+stderr without one — and none is the seam's business: they are handed over, as
+the file to open is.
 */
 type RunSinks = {
 	readonly logger: Pick<Console, 'warn'>;
 	readonly onReadWarning: ReadWarningReporter;
+	readonly onPushAttempt: (attempt: PushAttempt) => void;
 };
 
 /*
@@ -468,7 +478,7 @@ begin.
 function openRun(
 	options: RunOptions,
 	config: Config,
-	{logger, onReadWarning}: RunSinks,
+	{logger, onReadWarning, onPushAttempt}: RunSinks,
 ): RunDeps {
 	const store = (
 		options.createStore ??
@@ -477,17 +487,20 @@ function openRun(
 
 	try {
 		/*
-		The default takes the logger it is handed rather than closing over this
-		function's, so that the one value travels by one route. A `createPusher`
-		that ignores the logger is a caller saying it knows where its own
-		warnings go, which is the same thing the option means everywhere else.
+		The default takes what it is handed rather than closing over this
+		function's, so that each value travels by one route. A `createPusher` that
+		ignores them is a caller saying it knows where its own reports go, which is
+		the same thing the option means everywhere else.
 		*/
 		const buildPusher =
 			options.createPusher ??
-			((backlog: PushBacklog, pushLogger: Pick<Console, 'warn'>) =>
-				new MongoPusher(config, backlog, {logger: pushLogger}));
+			((
+				backlog: PushBacklog,
+				pushLogger: Pick<Console, 'warn'>,
+				onAttempt: (attempt: PushAttempt) => void,
+			) => new MongoPusher(config, backlog, {logger: pushLogger, onAttempt}));
 
-		return {store, pusher: buildPusher(store, logger)};
+		return {store, pusher: buildPusher(store, logger, onPushAttempt)};
 	} catch (error) {
 		store.close();
 		throw error;
@@ -612,15 +625,53 @@ rather than a line of stderr in the middle of the drawing (ADR-0010).
 
 The extra arguments a warning was given are kept, because they are where a
 driver's error travels.
-
-The entry it appends is still the Run Log's `Storage` class: which class a Push
-belongs under is the reporting work, and this is only the cutover.
 */
 function pushLoggerFor(runLog: InProcessRunLogSource): Pick<Console, 'warn'> {
 	return {
 		warn(message: string, ...extra: unknown[]) {
-			runLog.append(storageEntry(message, extra, new Date()));
+			runLog.append(pushWarningEntry(message, extra, new Date()));
 		},
+	};
+}
+
+/*
+Each Drain attempt, as the dashboard records it.
+
+`pushEntry` answers `undefined` for the attempt that is not worth a line — one
+era, the steady state — and what it does answer with is appended here rather
+than by the seam, which cannot know whether there is a frame to draw it in
+(ADR-0010).
+*/
+function pushEntriesFor(
+	runLog: InProcessRunLogSource,
+): (attempt: PushAttempt) => void {
+	return attempt => {
+		const entry = pushEntry(attempt);
+		if (entry !== undefined) {
+			runLog.append(entry);
+		}
+	};
+}
+
+/*
+The same attempt, as a headless run reports it: what the entry holds, on the
+terminal. There is one spelling of what a Push did, and this is that spelling
+going somewhere else — which is the whole of the difference between the two
+modes, and the reason this takes a logger rather than reaching for the console
+itself.
+
+The whole text rather than the summary, and the difference only shows when a
+driver's message ran to more than one line: folding one is the block's business,
+where an entry gets a single row, and a `collect` run has no block and no
+diagnostics view — so the sentence alone would leave the rest of what the driver
+said nowhere at all. A one-line message is its own full text, and prints once.
+*/
+function pushSentencesFor(logger: Logger): (attempt: PushAttempt) => void {
+	return attempt => {
+		const entry = pushEntry(attempt);
+		if (entry !== undefined) {
+			logger.warn(entry.detail);
+		}
 	};
 }
 
@@ -631,20 +682,45 @@ A final Flush that failed means the counters were still in Telemetry State when
 the store closed, so they are gone and the run did not end cleanly. Said
 plainly, and as a non-zero exit code, because a shell reads the exit code and
 not the log.
+
+A Push Backlog that survived the run is said after that, and it is the one thing
+here that decides nothing: the eras are in the Local Store, the next run's
+startup Drain will carry them, and what a Push owes the website is not an exit
+code the CLI can be handed (ADR-0012).
 */
-function reportShutdown({signal, finalFlush}: Shutdown, logger: Logger): void {
-	if (!finalFlush) {
+function reportShutdown(
+	{signal, finalFlush, backlogLength}: Shutdown,
+	logger: Logger,
+): void {
+	if (finalFlush) {
+		logger.log(
+			signal === undefined
+				? 'Stopped.'
+				: `Received ${signal}; flushed and stopped.`,
+		);
+	} else {
 		logger.warn(
 			'The final Flush failed; the counters since the last Flush were lost.',
 		);
 		process.exitCode = 1;
+	}
+
+	// Nothing is waiting, and a line saying so would be a line about nothing.
+	if (backlogLength === 0) {
 		return;
 	}
 
+	/*
+	One era is still one to carry, so the sentence has to read as one — the same
+	care `collectionEntry` takes over naming a single Collector. The count is
+	spelled by the formatter the totals are, because the same number can appear in
+	a frame a moment earlier: `Pushed 1,234 eras` and `1,234 eras await Push.` are
+	one quantity, and it reads one way.
+	*/
+	const eras = COUNT_FORMAT.format(backlogLength);
+
 	logger.log(
-		signal === undefined
-			? 'Stopped.'
-			: `Received ${signal}; flushed and stopped.`,
+		backlogLength === 1 ? '1 era awaits Push.' : `${eras} eras await Push.`,
 	);
 }
 
@@ -659,13 +735,17 @@ async function runCollect(options: RunOptions): Promise<void> {
 
 	The Push seam's warnings keep the terminal, which is where a headless run
 	reports: the run's own logger is for the run's own report, and a TTL index
-	the server would not create is the seam's. The read face's warnings go the
-	same way, and are unreachable here: `collect` draws no history, so nothing
-	asks the store a question — the default is what a run that never reads keeps.
+	the server would not create is the seam's. Its Drain attempts go the other
+	way — through the run's logger, because they are sentences about this run
+	rather than about the seam — and both are stderr in a real one. The read
+	face's warnings go the same way, and are unreachable here: `collect` draws no
+	history, so nothing asks the store a question — the default is what a run
+	that never reads keeps.
 	*/
 	const deps = openRun(options, config, {
 		logger: console,
 		onReadWarning: defaultReadWarningReporter,
+		onPushAttempt: pushSentencesFor(logger),
 	});
 
 	try {
@@ -778,6 +858,7 @@ async function runDashboard(options: RunOptions): Promise<void> {
 	*/
 	const deps = openRun(options, config, {
 		logger: pushLoggerFor(runLog),
+		onPushAttempt: pushEntriesFor(runLog),
 		onReadWarning(warning) {
 			runLog.append(historyEntry(warning, new Date()));
 		},

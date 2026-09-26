@@ -1,5 +1,12 @@
 # In dashboard mode the frame is the only output
 
+> **Status note (2026-09-26).** The write seam this ADR records the warning under is the Push
+> seam now (ADR-0012), so the one thing reported through a logger is the TTL index `push.ts`
+> asks for rather than the store's; and the Run Log class an entry is filed under is `Push`,
+> not `Storage` (issue #32) — `pushWarningEntry` for that warning, and `pushEntry` for each
+> Drain attempt beside it. What this ADR decides — that a seam's byproducts become entries
+> rather than lines of stderr while a frame is up — is unchanged.
+
 Ink draws by writing the whole frame over the one before it, positioned from its own idea of
 the layout. A line written to stderr between two frames lands wherever the terminal's cursor
 happens to be — inside the drawing, partway along a line — and the frame drawn after it does

@@ -231,16 +231,18 @@ mode is what decides the default rather than the rule. Both commands append one 
 starts with no grant, naming the Collectors it took out, which is what puts a missing grant on
 the landing view without the live-view key being pressed — the live view's own report is
 untouched. `problemMessage` in `helper.ts` is the one spelling of a problem, shared by the stderr
-reporter and the entry, and the entry constructors (`flushEntry`, `helperEntry`, `historyEntry`,
-`storageEntry`, `collectionEntry`) live beside the buffer because the two texts are one decision:
+reporter and the entry, and the entry constructors (`flushEntry`, `pushEntry`, `pushWarningEntry`,
+`helperEntry`, `historyEntry`, `collectionEntry`) live beside the buffer because the two texts are one decision:
 the line the block draws and the full text the diagnostics view draws.
 
 **In dashboard mode the frame is the only output** (ADR-0010). Nothing writes to stderr while the
 frame is up, because Ink draws over its own last frame and a stray line shifts every frame after
 it. So the helper's stderr chatter is dropped rather than passed through — `EventStream` takes an
 `onHelperStderr` sink, and the dashboard hands it one that does nothing, while `collect` keeps
-`defaultHelperStderr` — and the write seam's warnings become entries: `sessionFor` builds the
-store with the logger the mode's warnings go to, which is `storageEntry`'s one use (`Storage`).
+`defaultHelperStderr` — and the write seam's warnings become entries: the composition root
+builds the Push seam with the logger the mode's warnings go to, which is `pushWarningEntry`'s
+one use (`Push`), and with the sink each Drain attempt goes to, which is `pushEntry`'s — an
+entry under a frame, the same sentence on stderr without one.
 The preflight is unaffected, being written before the frame mounts, and so is the end of a run:
 `reportShutdown`'s message about a lost final Flush and the non-zero exit code beside it are
 written after the frame is down, which is the first moment the terminal can be written to again.

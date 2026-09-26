@@ -9,9 +9,11 @@ import {
 	helperEntry,
 	historyEntry,
 	InProcessRunLogSource,
+	pushEntry,
+	pushWarningEntry,
 	type RunLogEntry,
-	storageEntry,
 } from './run-log.js';
+import {type PushAttempt} from './store/push.js';
 import {type FlushAttempt} from './session.js';
 import {type Snapshot} from './state.js';
 
@@ -211,24 +213,35 @@ test('a failed read is an entry carrying the driver’s own message', t => {
 });
 
 /*
-The write seam's warning, which is the store's own side of a run and the one
-thing it reports that is not a Flush.
+A Drain attempt, as `push.ts` reports one: when it ran, whether it reached the end
+of the Push Backlog, and how many eras it acknowledged on the way.
+*/
+function drain(
+	pushed: number,
+	{ok = true, error = new Error('connect ECONNREFUSED')} = {},
+): PushAttempt {
+	return ok ? {at: AT, ok: true, pushed} : {at: AT, ok: false, pushed, error};
+}
 
-The message is the store's, because the store composes it; what this module
+/*
+The Push seam's warning, which is the one thing it reports about itself rather
+than about an era it was carrying: the TTL index it could not create.
+
+The message is the seam's, because the seam composes it; what this module
 decides is that it is the entry's line, that a warning is drawn as a fault, and
 that the arguments a logger call carried are kept rather than dropped — a
 driver's error is worth more than the one line the message makes of it, and the
 diagnostics view is the only place left to read it.
 */
-test('a write seam warning is an entry keeping the driver’s own words', t => {
-	const warning = storageEntry(
+test('a Push seam warning is an entry keeping the driver’s own words', t => {
+	const warning = pushWarningEntry(
 		'Failed to create TTL index on telemetry',
 		[new Error('not authorized')],
 		AT,
 	);
 
 	t.deepEqual(warning.at, AT);
-	t.is(warning.class, 'Storage');
+	t.is(warning.class, 'Push');
 	t.true(warning.failed === true, 'which is what draws it red');
 	t.is(warning.summary, 'Failed to create TTL index on telemetry');
 	t.is(
@@ -243,9 +256,71 @@ the full text is then the same sentence the line shows, and nothing is invented
 to pad it.
 */
 test('a warning with nothing after the message is its own full text', t => {
-	const warning = storageEntry('Failed to create TTL index', [], AT);
+	const warning = pushWarningEntry('Failed to create TTL index', [], AT);
 
 	t.is(warning.detail, warning.summary);
+});
+
+/*
+A Drain that stopped, as the block draws it: one red entry per attempt, wearing
+the driver's own sentence — which is the part of a failed Push worth reading,
+and the same one the read face reports a failure with.
+*/
+test('a Drain that failed is a red entry carrying the driver’s message', t => {
+	const failure = pushEntry(
+		drain(2, {ok: false, error: new Error('connect ECONNREFUSED 127.0.0.1')}),
+	);
+
+	t.deepEqual(failure?.at, AT);
+	t.is(failure?.class, 'Push');
+	t.true(failure?.failed === true, 'which is what draws it red');
+	t.is(failure?.summary, 'connect ECONNREFUSED 127.0.0.1');
+	t.is(failure?.detail, failure?.summary);
+});
+
+/*
+The message is the driver's, so it is the one part of an entry this side does
+not compose — and the block draws a summary on a single row, so a sentence that
+arrived with a line break in it would reshape the frame. Nothing is lost by
+folding it: the whole of it is what the diagnostics view draws.
+*/
+test('a driver’s message with a line break in it still draws as one line', t => {
+	const failure = pushEntry(
+		drain(0, {ok: false, error: new Error('server selection\nfailed')}),
+	);
+
+	t.is(failure?.summary, 'server selection failed');
+	t.is(failure?.detail, 'server selection\nfailed');
+});
+
+/*
+A Drain that made up gathered ground. Only a Drain that found two eras or more
+says so: one is the steady state, where the Flush's own entry has already said
+what happened, and a line for it would push Flush lines out of the six-entry
+window.
+*/
+test('a Drain that carried two eras or more says how many', t => {
+	const gathered = pushEntry(drain(7));
+
+	t.deepEqual(gathered?.at, AT);
+	t.is(gathered?.class, 'Push');
+	t.is(gathered?.failed, undefined, 'which is what leaves it undyed');
+	t.is(gathered?.summary, 'Pushed 7 eras');
+	t.is(gathered?.detail, gathered?.summary);
+	t.is(
+		pushEntry(drain(1234))?.summary,
+		'Pushed 1,234 eras',
+		'and the count is spelled the way the totals are',
+	);
+});
+
+/*
+The steady state: one era Flushed and Pushed seconds later. The Flush's own
+entry already told that story, and a second line saying the same thing would be
+one interval drawn twice.
+*/
+test('a Drain that carried one era says nothing at all', t => {
+	t.is(pushEntry(drain(1)), undefined);
 });
 
 function denied(

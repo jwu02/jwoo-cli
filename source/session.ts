@@ -14,10 +14,14 @@ the last interval is lost.
 It owns the Push's timing too, and nothing else about it: a Drain is asked for
 after a Flush that landed and once as the run starts, and never waited on from
 the Flush path — a hanging Atlas must not delay the next local write, which is
-the write that matters (ADR-0012). What a Drain found is the Pusher's to report.
+the write that matters (ADR-0012). What a Drain found is the Pusher's to report,
+and how much is still waiting for one is the store's: the count below is taken
+on the way out, because the store is closed by the time anyone outside the run
+could ask it.
 */
 
 import process from 'node:process';
+import {type Era} from './store/local-store.js';
 import {type Snapshot, type TelemetryState} from './state.js';
 
 /*
@@ -46,12 +50,20 @@ export type EventStream = {
 };
 
 /*
-The Local Store's write face, as the Session reaches for it: a Flush and a close.
+The Local Store, as the Session reaches for it: a Flush, the Push Backlog, and a
+close.
 
 Declared here rather than in `local-store.ts` for the reason the `EventStream`
 above is: the Session's job is owning a lifetime, and a module names only what it
 uses. A fake can stand in without a SQLite file behind it — which is the rule
 ADR-0012 leaves in place, a fake for every seam above the store.
+
+The Backlog is here rather than taken from the Pusher because it is a fact about
+the store and not about a Drain: a run whose Pusher was never built still has
+eras waiting, and a Drain that stopped at the first failure never saw most of
+what is behind it. It is the eras rather than a count because that is the query
+the store already answers — the one the Drains walk — and a second method
+counting the same rows would be a second thing to keep in step with it.
 
 No Promise anywhere on it. `node:sqlite` has no promise in it and the store
 answers synchronously (ADR-0012), so saying otherwise here would be a pretence
@@ -63,6 +75,7 @@ time.
 */
 export type FlushStore = {
 	flush(snapshot: Snapshot): Date | undefined;
+	backlog(): readonly Era[];
 	close(): void;
 };
 
@@ -94,15 +107,24 @@ async function settled(attempt: Promise<void>): Promise<void> {
 
 /*
 What a shutdown looks like once it has finished, rather than the moment it
-arrives: the signal that caused it, and whether the counters made it to storage
-on the way out. `finalFlush` false means Telemetry State was still holding
-Activity when the store was closed, so a caller can say so instead of claiming
-the run ended cleanly.
+arrives: the signal that caused it, whether the counters made it to storage on
+the way out, and how much of the Push Backlog is left for the next run.
+`finalFlush` false means Telemetry State was still holding Activity when the
+store was closed, so a caller can say so instead of claiming the run ended
+cleanly.
 */
 export type Shutdown = {
 	readonly reason: 'signal' | 'stop';
 	readonly signal: NodeJS.Signals | undefined;
 	readonly finalFlush: boolean;
+	/*
+	How long the Push Backlog was when the store closed: a count rather than the
+	eras, because what a caller does with it is say how much is waiting. Counted
+	here because the store is the only thing that knows and it is about to be
+	closed — and reported to the caller rather than acted on, because a Push that
+	has not happened costs the website an era and never costs the CLI one.
+	*/
+	readonly backlogLength: number;
 };
 
 /*
@@ -244,6 +266,12 @@ export class CollectionSession {
 	*/
 	#drainInFlight: Promise<void> | undefined;
 	#finalFlush = false;
+	/*
+	What the last run of `stop()` counted, held for the same reason `#finalFlush`
+	is: a second call has to answer with the first run's outcome rather than
+	close a store that is already closed to find out.
+	*/
+	#backlogLength = 0;
 
 	constructor(options: SessionOptions) {
 		this.#store = options.store;
@@ -296,11 +324,11 @@ export class CollectionSession {
 		this.#unsubscribe = undefined;
 		this.#endRun = undefined;
 
-		const {finalFlush} = await this.stop();
+		const {finalFlush, backlogLength} = await this.stop();
 
 		return reason === undefined
-			? {reason: 'stop', signal: undefined, finalFlush}
-			: {reason: 'signal', signal: reason.signal, finalFlush};
+			? {reason: 'stop', signal: undefined, finalFlush, backlogLength}
+			: {reason: 'signal', signal: reason.signal, finalFlush, backlogLength};
 	}
 
 	#scheduleFlush(): void {
@@ -462,6 +490,7 @@ export class CollectionSession {
 				reason: 'stop',
 				signal: undefined,
 				finalFlush: this.#finalFlush,
+				backlogLength: this.#backlogLength,
 			};
 		}
 
@@ -510,6 +539,16 @@ export class CollectionSession {
 		await this.#startDrain();
 
 		/*
+		Counted here, after the last Drain has had its say and while the store is
+		still open to answer: a Drain acknowledges the eras it carried, so counting
+		before it would report ground that has just been made up. This is the one
+		reading of the store the Session takes that is not a Flush, and it is taken
+		rather than left to the caller because the close below is the last moment it
+		can be — `backlog()` on a closed store is a driver error, not an answer.
+		*/
+		this.#backlogLength = this.#store.backlog().length;
+
+		/*
 		Called at most once, because a Flush that threw leaves the store unclosed
 		and closing it is still the right thing to do on a second call.
 		*/
@@ -534,6 +573,11 @@ export class CollectionSession {
 		*/
 		this.#endRun?.();
 
-		return {reason: 'stop', signal: undefined, finalFlush: this.#finalFlush};
+		return {
+			reason: 'stop',
+			signal: undefined,
+			finalFlush: this.#finalFlush,
+			backlogLength: this.#backlogLength,
+		};
 	}
 }

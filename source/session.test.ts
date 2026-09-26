@@ -10,6 +10,7 @@ import {
 	type ShutdownReason,
 	type ShutdownSignal,
 } from './session.js';
+import {type Era} from './store/local-store.js';
 import {TelemetryState} from './state.js';
 
 /*
@@ -50,6 +51,12 @@ class FakeStore implements FlushStore {
 	#failures: number;
 	readonly trace: string[];
 	readonly snapshots: Array<Record<string, unknown>> = [];
+	/*
+	The Push Backlog, which is a length here and nothing more: what a Drain does
+	with an era is `push.test.ts`'s business, and the Session asks only how much
+	is waiting.
+	*/
+	readonly waiting: Era[] = [];
 	closed = 0;
 
 	constructor(failures = 0, trace: string[] = []) {
@@ -70,10 +77,39 @@ class FakeStore implements FlushStore {
 		return new Date();
 	}
 
+	/*
+	Throws once closed, as the real one does — SQLite answers "database is not
+	open" — so a Session that counted the backlog after closing the store would
+	fail here rather than report a backlog of zero.
+	*/
+	backlog(): readonly Era[] {
+		if (this.closed > 0) {
+			throw new Error('database is not open');
+		}
+
+		this.trace.push('backlog');
+		return this.waiting;
+	}
+
 	close(): void {
 		this.closed += 1;
 		this.trace.push('store:close');
 	}
+}
+
+/*
+An era with nothing in it, because what one holds is not what these tests are
+about: the Session counts them.
+*/
+function era(stamp: number): Era {
+	return {
+		stamp: new Date(stamp),
+		leftClicks: 0,
+		rightClicks: 0,
+		movementMeters: 0,
+		pressTotal: 0,
+		keyCounts: {},
+	};
 }
 
 /*
@@ -353,6 +389,39 @@ test('stop() reports the outcome of its final Flush', async t => {
 	t.false(shutdown.finalFlush);
 });
 
+/*
+What the run leaves behind. A Drain is best-effort, so a run can end with eras
+the website has not been given — a fact about the network rather than about the
+run, and the one thing a shutdown says that is not about this machine.
+
+Counted from the store rather than from the last Drain's report, because the
+two disagree exactly when it matters: a Drain that stopped at the first failure
+leaves everything it did not reach, and there is no Drain at all on a run whose
+Pusher was never built.
+*/
+test('a shutdown reports the Push Backlog the store still holds', async t => {
+	const store = new FakeStore();
+	store.waiting.push(era(1), era(2), era(3));
+	const {session, signal} = build({store});
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+	const shutdown = await running;
+
+	t.is(shutdown.backlogLength, 3);
+});
+
+test('a run that emptied its backlog reports none waiting', async t => {
+	const store = new FakeStore();
+	const {session, signal} = build({store});
+
+	const running = session.run();
+	signal.fire('SIGTERM');
+	const shutdown = await running;
+
+	t.is(shutdown.backlogLength, 0);
+});
+
 test('Every Collector is started and stopped once', async t => {
 	const mouse = collector();
 	const keyboard = collector();
@@ -601,6 +670,7 @@ test('a Drain is asked for after a Flush that landed, and not after one that fai
 		'flush:ok',
 		'drain', // Asked for by the Flush that landed
 		'drain', // One last attempt on the way out
+		'backlog', // Counted after the last Drain, so it is what survived it
 		'store:close',
 		'pusher:close',
 	]);
@@ -627,6 +697,7 @@ test('the last Drain is awaited before the store and the client close', async t 
 		'drain', // The startup backlog, which `stop()` waits out first
 		'flush:ok',
 		'drain', // Asked for by the final Flush, and awaited before anything closes
+		'backlog', // And counted while the store is still open to answer
 		'store:close',
 		'pusher:close',
 	]);

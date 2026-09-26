@@ -23,7 +23,7 @@ import {
 	type PermissionReport,
 	type PermissionSource,
 } from './capture/permissions.js';
-import {type PushBacklog} from './store/push.js';
+import {type PushAttempt, type PushBacklog} from './store/push.js';
 import {
 	type HelperError,
 	keyEventAt,
@@ -73,6 +73,22 @@ const FN = 63;
 const A_KEY = 0;
 
 /*
+An era with nothing in it. Only its number matters here: a test that wants a run
+to end with a backlog fills the store's `waiting` with these, and what one holds
+is a Flush's business rather than this file's.
+*/
+function era(stamp: number): Era {
+	return {
+		stamp: new Date(stamp),
+		leftClicks: 0,
+		rightClicks: 0,
+		movementMeters: 0,
+		pressTotal: 0,
+		keyCounts: {},
+	};
+}
+
+/*
 The Local Store, standing in: a store that writes, or one that fails a set
 number of Flushes and then writes.
 
@@ -95,6 +111,14 @@ composition root hands the reporter over as it builds it.
 class FakeStore implements RunStore {
 	#failures: number;
 	readonly snapshots: Array<Record<string, unknown>> = [];
+	/*
+	The Push Backlog, which is a length here and nothing more: what a Drain
+	carries is `push.test.ts`'s, and a run that Pushed something here would be
+	reaching for Atlas.
+
+	A test that wants a run to end with ground still to make up fills this in.
+	*/
+	readonly waiting: Era[] = [];
 	/*
 	Where a read's warning goes. Silent until the composition root says
 	otherwise, because the default reporter writes to stderr and a test that is
@@ -140,16 +164,12 @@ class FakeStore implements RunStore {
 		return new Date();
 	}
 
-	/*
-	The Push Backlog, which is empty: what a Drain carries is `push.test.ts`'s,
-	and a run that Pushed something here would be reaching for Atlas.
-	*/
 	backlog(): readonly Era[] {
-		return [];
+		return this.waiting;
 	}
 
 	markPushed(): void {
-		// Nothing is in the backlog, so nothing is ever acknowledged.
+		// Nothing here is ever acknowledged, so nothing ever leaves this list.
 	}
 
 	close(): void {
@@ -161,16 +181,34 @@ class FakeStore implements RunStore {
 
 /*
 The Push, standing in. What the composition root has to get right about it is
-where it is built from and that it is closed with everything else; what a Drain
-carries is `push.test.ts`'s.
+where it is built from, where its reports go, and that it is closed with
+everything else; what a Drain carries is `push.test.ts`'s.
+
+A Drain here reports through the callback the run built it with, the way the
+real one does — which is what makes the routing assertable without a server that
+is down. What it reports is `pushed`: one era by default, the steady state, and
+a test that wants the gathered case says how many.
 */
 class FakePusher implements Pusher {
 	readonly backlogs: PushBacklog[] = [];
 	drains = 0;
 	closed = 0;
+	onAttempt: ((attempt: PushAttempt) => void) | undefined;
+	pushed = 1;
+	/*
+	A Drain that could not reach MongoDB, as a run against a dead host has. The
+	eras it did not carry stay in the backlog, which is the store's to say.
+	*/
+	failsWith: Error | undefined;
 
 	async drain(): Promise<void> {
 		this.drains += 1;
+
+		this.onAttempt?.(
+			this.failsWith === undefined
+				? {at: new Date(), ok: true, pushed: this.pushed}
+				: {at: new Date(), ok: false, pushed: 0, error: this.failsWith},
+		);
 	}
 
 	async close(): Promise<void> {
@@ -418,6 +456,11 @@ type Harness = {
 	is no other way to reach it from outside a run.
 	*/
 	readonly pushLoggers: Array<Pick<Console, 'warn'>>;
+	/*
+	Where each run's Drain attempts were sent, one per run — the same idea as the
+	logger above, and the only way to see the mode's routing from outside a run.
+	*/
+	readonly pushAttempts: Array<(attempt: PushAttempt) => void>;
 };
 
 function harness(report: PermissionReport): Harness {
@@ -429,6 +472,7 @@ function harness(report: PermissionReport): Harness {
 	const reports: PermissionReport[] = [];
 	const collectors: Array<ReturnType<typeof collector>> = [];
 	const pushLoggers: Array<Pick<Console, 'warn'>> = [];
+	const pushAttempts: Array<(attempt: PushAttempt) => void> = [];
 
 	const buildCollectors: CollectorFactory = seen => {
 		reports.push(seen);
@@ -446,6 +490,7 @@ function harness(report: PermissionReport): Harness {
 		reports,
 		collectors,
 		pushLoggers,
+		pushAttempts,
 		options: {
 			permissions,
 			shutdown,
@@ -462,12 +507,14 @@ function harness(report: PermissionReport): Harness {
 				return store;
 			},
 			/*
-			Built the way the real one is, and handed the logger the composition
-			root decided the mode's warnings go through.
+			Built the way the real one is, and handed the logger and the attempt
+			sink the composition root decided the mode's Push reports go through.
 			*/
-			createPusher(backlog, pushLogger) {
+			createPusher(backlog, pushLogger, onAttempt) {
 				pusher.backlogs.push(backlog);
+				pusher.onAttempt = onAttempt;
 				pushLoggers.push(pushLogger);
+				pushAttempts.push(onAttempt);
 				return pusher;
 			},
 			state: new TelemetryState(),
@@ -1541,7 +1588,7 @@ test('the write seam’s warning is an entry in dashboard mode, and not a line o
 	t.deepEqual(written, [], 'the frame is the only output');
 	t.deepEqual(
 		runLog.read().map(entry => [entry.class, entry.summary]),
-		[['Storage', 'Failed to create TTL index on telemetry']],
+		[['Push', 'Failed to create TTL index on telemetry']],
 	);
 	t.regex(
 		runLog.read()[0]?.detail ?? '',
@@ -1750,6 +1797,225 @@ test('the Push is built over the store, and closed with the run', async t => {
 	t.true(test_.pusher.drains > 0, 'and the run asked for a Drain');
 	t.is(test_.store.closed, 1);
 	t.is(test_.pusher.closed, 1);
+});
+
+/*
+A Drain that failed, which is what a run against a dead host has: one red entry
+per attempt, repeating for as long as the problem lasts, wearing the driver's
+own sentence. The Flush entries beside it say the write landed; this one says
+the copy did not go anywhere, which is a different thing (ADR-0012).
+
+The attempts are the run's own, reported by the seam the composition root built
+and through the sink it handed that seam — so what is under test is the routing,
+and not `push.ts`'s half of it.
+*/
+test('a failed Drain is one red entry in dashboard mode', async t => {
+	const test_ = harness(granted());
+	const runLog = new InProcessRunLogSource();
+	test_.pusher.failsWith = new Error('connect ECONNREFUSED 127.0.0.1');
+
+	await run(
+		{kind: 'dashboard'},
+		{
+			...test_.options,
+			runLog,
+			async renderApp() {
+				/*
+				The frame comes down here, and the run ends — which is what asks
+				for the last Drain, so both attempts the run makes are its own.
+				*/
+				test_.shutdown.fire('SIGINT');
+			},
+		},
+	);
+
+	const failures = runLog.read();
+	t.true(test_.pusher.drains > 0, 'the run really did Drain');
+	t.is(
+		failures.length,
+		test_.pusher.drains,
+		'one entry per attempt, and nothing else recorded',
+	);
+	t.true(
+		failures.every(entry => entry.class === 'Push' && entry.failed === true),
+		'which is what draws them red',
+	);
+	t.is(failures[0]?.summary, 'connect ECONNREFUSED 127.0.0.1');
+});
+
+/*
+The two Drain attempts that are not worth a line, and the one that is. One era
+is the steady state, where the Flush's own entry already said what happened; two
+or more is a backlog that had stopped moving and has started again, which no
+other line in the block would show.
+
+The run's own Drains report one era each, so the entries asserted here are the
+hand-driven ones — and "the steady state records nothing" is asserted by the
+same list rather than by a second run.
+*/
+test('a gathered Drain is one plain entry, and a single era is none at all', async t => {
+	const test_ = harness(granted());
+	const runLog = new InProcessRunLogSource();
+
+	await run(
+		{kind: 'dashboard'},
+		{
+			...test_.options,
+			runLog,
+			async renderApp() {
+				const sink = test_.pushAttempts[0];
+				sink?.({at: new Date(), ok: true, pushed: 4});
+				sink?.({at: new Date(), ok: true, pushed: 1});
+				sink?.({at: new Date(), ok: true, pushed: 1234});
+				test_.shutdown.fire('SIGINT');
+			},
+		},
+	);
+
+	t.deepEqual(
+		runLog.read().map(entry => [entry.class, entry.failed, entry.summary]),
+		[
+			['Push', undefined, 'Pushed 4 eras'],
+			['Push', undefined, 'Pushed 1,234 eras'],
+		],
+	);
+});
+
+/*
+A headless run's half of the same decision, and the reason it cannot be made by
+handing the seam a logger and hoping: it has no frame to draw an entry in, so
+the sentences the entries would have carried go to the terminal instead.
+
+Both sentences are asserted, because "the same sentences" is the whole of what
+`collect` promises — a run that printed only the failures would leave a backlog
+draining in silence.
+*/
+test('collect sends the Push seam’s sentences to the terminal', async t => {
+	const failed = harness(granted());
+	const failedLog = new InProcessRunLogSource();
+	failed.pusher.failsWith = new Error('connect ECONNREFUSED 127.0.0.1');
+	failed.shutdown.fire('SIGINT');
+
+	const gathered = harness(granted());
+	gathered.pusher.pushed = 3;
+	gathered.shutdown.fire('SIGINT');
+
+	await run({kind: 'collect'}, {...failed.options, runLog: failedLog});
+	await run({kind: 'collect'}, gathered.options);
+
+	t.true(
+		failed.logger.warnings.includes('connect ECONNREFUSED 127.0.0.1'),
+		'what the block would have drawn red',
+	);
+	t.true(
+		gathered.logger.warnings.includes('Pushed 3 eras'),
+		'and what it would have said about a backlog moving again',
+	);
+	t.deepEqual(
+		failedLog.read(),
+		[],
+		'and nothing appends an entry no view would ever draw',
+	);
+});
+
+/*
+The one place the two modes' texts can differ, and the reason a headless run
+gets the full text rather than the folded sentence: a frame has one row to an
+entry, so the block draws a driver's multi-line message with its breaks taken
+out — and there is no block here, and no diagnostics view behind a keypress
+either, so the folding would leave the rest of what the driver said nowhere.
+*/
+test('a driver’s multi-line message reaches a headless run whole', async t => {
+	const test_ = harness(granted());
+	test_.pusher.failsWith = new Error('server selection timed out\nafter 30s');
+	test_.shutdown.fire('SIGINT');
+
+	await run({kind: 'collect'}, test_.options);
+
+	t.true(
+		test_.logger.warnings.includes('server selection timed out\nafter 30s'),
+		'breaks and all, which is what the diagnostics view would have drawn',
+	);
+});
+
+/*
+What the run leaves behind, said at the end of it — and the one report a run
+makes that changes nothing. The eras are in the Local Store, the next run's
+startup Drain will carry them, and the exit code is the Flush's to set: a Push
+that has not happened costs the website an era and never the CLI one (ADR-0012).
+*/
+test('a backlog that survives the run is logged without touching the exit code', async t => {
+	const test_ = harness(granted());
+	test_.store.waiting.push(era(1), era(2));
+	/*
+	MongoDB is down, which is the only way a backlog survives a run: every Drain
+	fails, the eras stay in the Local Store, and the run ends anyway — with the
+	website's copies owed and the exit code the Flush's to set.
+	*/
+	test_.pusher.failsWith = new Error('connect ECONNREFUSED 127.0.0.1');
+	/*
+	The exit code is process-wide, and ava's worker reads it when it exits: left
+	set, it would end this file non-zero with every test in it passing.
+	*/
+	const previous = process.exitCode;
+
+	try {
+		test_.shutdown.fire('SIGTERM');
+		await run({kind: 'collect'}, test_.options);
+
+		t.is(
+			process.exitCode,
+			previous,
+			'a Push the CLI owes nobody costs it nothing',
+		);
+		t.is(test_.logger.lines.at(-1), '2 eras await Push.');
+	} finally {
+		process.exitCode = previous;
+	}
+});
+
+/*
+The count in that sentence is the same quantity `Pushed N eras` carries, and it
+is spelled the same way: a backlog of four figures is reachable — an afternoon
+offline at the Flush Interval — and `1234` beside a frame's `1,234` would read
+as two different numbers.
+*/
+test('the stranded count is spelled the way the totals are', async t => {
+	const test_ = harness(granted());
+	test_.store.waiting.push(
+		...Array.from({length: 1234}, (_, index) => era(index)),
+	);
+	test_.shutdown.fire('SIGTERM');
+
+	await run({kind: 'collect'}, test_.options);
+
+	t.is(test_.logger.lines.at(-1), '1,234 eras await Push.');
+});
+
+/*
+One era is still "await Push", and the sentence has to read as one — the same
+care `collectionEntry` takes over naming one Collector rather than two.
+*/
+test('one stranded era is spelled as one', async t => {
+	const test_ = harness(granted());
+	test_.store.waiting.push(era(1));
+	test_.shutdown.fire('SIGTERM');
+
+	await run({kind: 'collect'}, test_.options);
+
+	t.is(test_.logger.lines.at(-1), '1 era awaits Push.');
+});
+
+test('a run that left no backlog behind says nothing about one', async t => {
+	const test_ = harness(granted());
+	test_.shutdown.fire('SIGTERM');
+
+	await run({kind: 'collect'}, test_.options);
+
+	t.false(
+		test_.logger.lines.some(line => line.includes('await Push')),
+		'a backlog of none is not a line',
+	);
 });
 
 /*
