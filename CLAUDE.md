@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## What this is
 
 A terminal dashboard for personal activity telemetry. It observes mouse and keyboard input on
@@ -13,443 +11,94 @@ heatmap. This repo is a TypeScript port of a Python client (`activity-telemetry-
 `CONTEXT.md` is the authoritative glossary and `docs/adr/` records the decisions behind the
 design. Read both before naming anything or proposing a change.
 
+`docs/architecture.md` is the same design at module depth — the Local Store's two faces, the
+Push Drain, the Collector loop, the preflight, the sync rules, the React wall — and each section
+names the invariants its module must hold. Before editing `store/`, `session.ts`, `push.ts`,
+`helper/`, `permissions.ts`, `args.ts`, or anything under `views/`, read that module's section.
+
 ## Commands
 
 The ambient `node` is older than the `engines` floor (`>=22.20.0`) and `tsx` fails with a
-misleading loader error when it is used. Prepend the pinned version:
+misleading loader error when it is used. Prepend the pinned version (`.nvmrc` pins the same
+one):
 
 ```bash
 export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 ```
 
-| Command                                                                              | What it does                                                          |
-| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
-| `npm test`                                                                           | The whole gate: prettier `--check`, `xo`, `tsc --noEmit`, then `ava`. |
-| `npx ava source/state.test.ts`                                                       | One test file.                                                        |
-| `npx ava --match 'click counters'`                                                   | One test by name.                                                     |
-| `npm run build`                                                                      | `tsc --project tsconfig.build.json` → `dist/`, tests excluded.        |
-| `npm run dev`                                                                        | The same build, in watch mode.                                        |
-| `node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js`             | The dashboard, which collects while it is open. Needs `MONGO_URI`.    |
-| `node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js collect`     | Collect and Flush, with no TUI.                                       |
-| `node --disable-warning=ExperimentalWarning --env-file=.env dist/cli.js permissions` | Report the macOS grants and exit.                                     |
-| `./helper/build.sh`                                                                  | Rebuild the native capture helper. Needs Xcode CLI tools.             |
+- `npm test` — the gate: prettier `--check`, `xo`, `tsc --noEmit`, then `ava`. Its failures are
+  errors to fix, not advice.
+- `npx ava source/state.test.ts`, or `npx ava --match '…'` — one file, one test.
+- `npm run build` / `npm run dev` — `tsc --project tsconfig.build.json` to `dist/`, tests
+  excluded / the same in watch mode.
+- `./helper/build.sh` — rebuild the native capture helper. Needs Xcode CLI tools.
 
-The flag is on every run line because `node:sqlite` is experimental in Node and says so on stderr
-the moment it is imported — and `main.tsx` imports the Local Store on every path, whichever
+Run lines carry `--disable-warning=ExperimentalWarning --env-file=.env` and need `MONGO_URI` —
+for example, the dashboard is `node --disable-warning=ExperimentalWarning --env-file=.env
+dist/cli.js`, which collects while it is open. `collect` after that runs collection headlessly;
+`permissions` reports the macOS grants and exits.
+
+The flag is on every run line because `node:sqlite` is experimental and says so on stderr the
+moment it is imported — and `main.tsx` imports the Local Store on every path, whichever
 subcommand asked. `npm test` needs it too, which is why it sits in `package.json`'s
 `ava.nodeArguments` beside `tsx`.
 
-The helper's _source_ is not part of `npm test`: `prettier` and `xo` do not read `.swift`, so
-nothing in the gate compiles or lints it. What the gate does exercise is the binary committed
-beside it — `helper.test.ts` spawns it for the `--self-check` pin, for `--preflight`, and to
-watch `stop()` kill it — but nothing compares that binary to `eventtap.swift`, so a rebuild left
-uncommitted passes the gate it should have failed. Build it by hand after changing it and commit
-the binary with the source.
+The helper's `.swift` source is outside the gate — `prettier` and `xo` do not read it; what the
+gate exercises is the binary committed beside it (`helper.test.ts` spawns it for `--self-check`,
+`--preflight`, and to watch `stop()` kill it). So a rebuild left uncommitted passes the gate it
+should have failed: build by hand after changing the source and commit the binary with it.
 
 No test reaches the network or another installation, and none may start a server: the `ava` step
-has to pass on a clone of this repo alone. Its scratch space is its own — the temp directory
-`local-store.test.ts` makes is a file this repo does not ship, and no other checkout can see it.
-The Key Label wire format was once checked by importing the website's
-`jwoo/lib/telemetry/key-layout.ts`, and that test is gone — the label set is pinned here
-instead, by hand, against the website's reader rather than against its module.
+has to pass on a clone of this repo alone. The exception is `local-store.ts`, tested against real
+files — a temp directory its test makes and hands back — because a fake of SQLite would fake the
+one component whose whole job is to be durable.
 
-Tabs, not spaces (`.editorconfig`). Formatting is `@vdemedes/prettier-config` and `npm test`
-enforces it rather than advising it.
+`.env` is gitignored and loaded by the `--env-file` flag, not by the code. `config.ts` is the
+only place any environment variable is read, and stays a pure function of an injected
+environment (`loadConfig(env = process.env)`) — which is what lets `config.test.ts` pass an exact
+set of variables per test. No `loadEnvFile` call inside it.
 
-`.env` is gitignored and loaded by the `--env-file` flag, not by the code. `config.ts` stays a
-pure function of an injected environment (`loadConfig(env = process.env)`), which is what lets
-`config.test.ts` pass an exact set of variables per test — do not add a `loadEnvFile` call inside
-it. `config.ts` is the only place any environment variable is read.
+## Layout
 
-## Architecture
+`source/` is grouped by the import graph rather than by a generic layering: `capture/` (the
+helper, the wire format, the Key Label tables, the Collectors), `store/` (the Local Store, the
+Pusher, the Range arithmetic, config), `views/` (the Ink layer). What is left at the root is the
+run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`,
+`format.ts` — each reads across the groups, which is why the split is three and not four. Tests
+sit beside their subject and moved with it; ava's default globs find them there and read the
+directory as the test name's prefix.
 
-### Directory layout
-
-`source/` is four groups, drawn from the import graph rather than from a generic layering.
-`capture/` is the helper, the wire format, the Key Label table and the Collectors. `store/` is
-the Local Store, the Pusher, the Range arithmetic and config. `views/` is the Ink layer. What is
-left at the root is the run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`,
-`run-log.ts`, `state.ts` and `format.ts`.
-
-Those eight are the reason the split is three and not four. `state.ts` is the accumulator the
-Collectors write and both the store and the Session read; `telemetry.ts` and `run-log.ts` are
-seams that read across all three groups; `format.ts` is shared by five views and by `run-log.ts`.
-Filing any of them under a group would move a boundary edge rather than remove it — and for
-`format.ts` it would cost more than that, since `views/` is defined by what it imports (see
-_React layering_).
-
-Two constraints hold the layout in place. `cli.tsx` stays at the root because `tsconfig.json`
-sets `rootDir: "source"` and `dist/` mirrors that tree, so moving it would move `dist/cli.js` and
-with it the `bin` entry and every documented run command. And `helper.ts` finds the Swift binary
-by `import.meta.url` arithmetic rather than from the working directory: `capture/` puts it two
-levels under the repo root, so the URL climbs two, and `helper.test.ts` asserts the path
-_resolves_ as well as that it ends a certain way — the suffix check alone cannot fail on a wrong
-number of `../`, because dropping a level only inserts text before the suffix, and a wrong count
-would otherwise surface only as the `--preflight` spawn failing to start.
-
-Tests sit beside their subject and moved with it; ava's default globs find them where they land,
-and it reads the directory as the test name's prefix.
-
-### The Local Store has two faces, and the Push is a seam over its backlog
-
-`store/local-store.ts` owns the SQLite file and answers through it twice. The **write face** —
-`flush(snapshot)`, returning the stamp it wrote under or `undefined` — is what the Session
-Flushes through; the **read face** is the one-method `HistorySource` the history view draws,
-`load(range, now)`. They are one object rather than two readers of it, and `main.tsx` names the
-whole of it once as `RunStore = FlushStore & PushBacklog & HistorySource`, which is what makes
-the view read back exactly what the Flush wrote.
-
-Both faces are synchronous, which is the repo's async-ness rule applied rather than a shortcut:
-`node:sqlite` has no promise in it, so `flush` returns its stamp and `load` returns a
-`LoadResult` directly, and the history view asks during render with no loading state to draw.
-The Push is the one seam here that really does wait, and it says so — `Pusher.drain()` is async
-because a round trip to Atlas is.
-
-**Opening the store is the one thing in a run that fails fast.** It happens in `main.tsx` before
-the preflight and before anything is drawn, because the Local Store is the only write a Flush is
-required to reach; the Pusher is built over that same store and is the opposite case, since a
-Push is best-effort and a run carries on when Atlas is merely unreachable (ADR-0012).
-
-**The Push is a Drain over the store's backlog, and never a wait on the Flush path.** The backlog
-is the store's own query — `pushed_at IS NULL ORDER BY stamp` — rather than a second structure
-kept in step with it, and a Drain walks it oldest era first, stopping at the first failure so it
-stays a tail rather than a scatter of holes. One Drain is fired as the run starts and one after
-each successful Flush, and neither is awaited: a hanging Atlas must not delay the next local
-write. What a Drain found reaches the Run Log through the same callback shape a Flush attempt
-does, with the composition root deciding where the news belongs.
-
-### Seams, and no database server in the test suite
-
-`push.ts` is the one seam with MongoDB behind it, and it is a write seam: it declares its own
-narrow slice of the driver's types — `Collection`, `Database` — and no module but `push.ts` and
-its own test imports `mongodb`. Every test drives a hand-written in-memory fake; there is no
-test **server** and no test container. `telemetry.ts` and `run-log.ts` are two more seams, and
-neither has a database behind it at all — see _The live view reads its own seam_ and _The Run Log
-reads its own seam_ below.
-
-`local-store.ts` is the one module tested against real files, which is the exception ADR-0012's
-amendment to the gate carves out: the store _is_ the thing under test, and a fake of SQLite
-would be a fake of the one component whose whole job is to be durable. Its tests make a temp
-directory and hand it back, run in-process, and reach no network — so the `ava` step still
-passes on a clone of this repo alone.
-
-The narrow types are deliberately faithful about async-ness, and that is load-bearing.
-`Collection.replaceOne` returns a Promise because the driver's does — a fake that lied about it
-would let a missing `await` pass every test while losing data against a real server.
-
-`main.tsx` is the composition root and the only place a `Pusher` is built. It owns the Local
-Store's lifetime and the Pusher's — and, through it, the `MongoClient`'s — and closes both on
-every path, because a client left open keeps the process alive after the work has finished.
-`cli.tsx` is only the entry point above it: it parses argv and reports a failure's message rather
-than its stack.
-
-`main.tsx` supplies the Collectors too, and the default factory is its own rather than the
-entry point's, along with the things that factory reaches for — the helper stream it builds, the
-grant it asks for, and where the helper's problems are reported (ADR-0008). A test can
-therefore drive the real factory through `collect` with a stream of its own, which is how
-delivery is executed rather than described. The stream is built _with_ that reporter rather than
-having one attached afterwards: a stream's own problems — a line of stdout that would not parse,
-an exit — are settled when it is constructed, so `createStream` takes the reporter and the
-caller that builds a stream owns where its problems go.
-
-**Delivery is a loop, and every Collector is total** (ADR-0008). Each event is handed to every
-Collector, and each ignores by name what it does not own — the shape `mouse.ts` always had, and
-the one `keyboard.ts` now shares. Nothing outside a Collector states which events are its, so a
-new Collector is a new module and one entry in the list. A new wire event type is forced into
-view by the `--self-check` pin in `helper.test.ts`, which fails until it is considered,
-and the delivery tests in `main.test.tsx` are what execute the ownership for every type the
-format carries. The helper's failure line is delivered like any other event, owned by nobody,
-and reported by that wiring.
-
-### Three subcommands, and no others
-
-`args.ts` parses argv into exactly three commands: no argument opens the dashboard, `collect`
-runs collection headlessly, `permissions` reports the macOS grants. Parsing is a pure function
-of argv, so what a command line means is testable without a process — `cli.tsx` is what hands it
-the real `process.argv` and lets meow exit on a bad one.
-
-A bare `dashboard` is not a second spelling of the default, and there are no flags to forward:
-`allowUnknownFlags` is off, so a typo'd `--dry-run` is refused rather than silently ignored.
-That refusal is meow's and happens by exiting, which is why the one test covering it runs the
-entry point in a child process — in-process it would take the test runner down with it.
-
-The collector must not be reachable only through the TUI (ADR-0001), which is why `collect` is a
-subcommand and not a key. `main.tsx` reaches `tui.tsx` — the module that imports ink and react —
-through a dynamic import, so a headless run never loads either.
-
-**The dashboard collects too.** It runs the same preflight and the same Session `collect` does,
-and mounts the view over the run; `collect` is the way to run without a view, not the way to
-collect. The dependency runs the other way round as well: `q` arrives as input in a raw-mode
-terminal and never generates a SIGINT, so a view that comes down is what ends the run —
-`stop()` releases the promise `run()` handed back. On a signal the reverse happens: the run ends
-and `DashboardView.ended` is what brings the frame down, so a TUI cannot outlive its run and go
-on claiming to be live.
-
-### The permission preflight degrades, it does not stop
-
-`permissions.ts` asks the helper (`--preflight`) rather than checking anything itself, because
-`IOHIDCheckAccess` is the check ADR-0006 says to trust and the grant follows an ancestor process
-rather than this script's path. A missing grant comes back as a report naming the Collectors it
-disables; the composition root then builds fewer Collectors. Nothing exits on `disabled`.
-
-It throws only when the helper cannot be _asked_ — a missing binary, a crash, a hang — or when the
-helper answered and its stdout carried no report, which is treated as the same broken install.
-Neither is a missing permission, and the two must not be confused.
-
-**The helper's stdout has one reader.** `raw-event.ts`'s line parser is the only place a line is
-decoded, and `helper.ts` is the only module that reads the helper's stdout — the stream and
-`preflightFrom` (split it, parse each line through the shared parser, last preflight line wins)
-both go through that parser. `permissions.ts` holds only policy — what the answer means for which
-Collectors — and contains no line parsing or JSON decoding; its report function takes the parsed
-`PreflightEvent` wire type, whose access field is narrowed to the helper's three-value vocabulary
-in the format module. A preflight line with no message is dropped like any other malformed line,
-so stdout that carries only such lines reports "printed no permission report".
-
-### The live view reads its own seam
-
-`telemetry.ts` is a seam of its own beside the Local Store's: `TelemetrySource.read()` returns the
-counters for the run that is happening now. The in-process implementation reads Telemetry State,
-and the read is **synchronous** — there is nothing to await, and saying otherwise would be a
-pretence. Moving collection to a separate process makes it a socket and the read a promise, and
-that change lands in `telemetry.ts` and `use-telemetry.ts` and nowhere near the view, which asks
-a `TelemetrySource` and does not know what is behind it.
-
-**A successful Flush clears Telemetry State**, so a view reading the accumulator alone would
-watch every counter fall back to zero at the Flush Interval and call that live. The Session
-therefore reports each Flush attempt through `onFlush`, with the Snapshot it wrote, and the
-source adds a _successful_ one to a running total. Gating on success is load-bearing rather than
-defensive: a failed Flush leaves Telemetry State whole so the same counters are retried, and
-adding them here as well would count the same presses twice.
-
-The grant belongs to the reading rather than to the view. `LiveTelemetry` is a union of
-`collecting` and `disabled` instead of totals plus an `enabled` flag, because a machine with no
-grant produces counters that are zero in exactly the way a machine nobody has touched does — and
-the user who has just granted the permission is the one who cannot tell them apart.
-
-`session.ts` is where the Flush Interval and the final Flush live. It is a plain module with
-`run()`/`stop()`, and `run()` resolves only once the final Flush and the close have finished —
-`await`ing it is a complete shutdown, not the start of one. The signal listeners are released
-_after_ the run rather than inside the handler, so a second Ctrl-C cannot cut a Flush short.
-
-**The Flush write is honest-sync, and there is no in-flight Flush to wait for.** `FlushStore`
-carries no Promise on any of its three methods, because `node:sqlite` has none: an interval's
-Flush has already landed or already failed by the time anything can ask the run to end, so a
-final Flush cannot snapshot the same uncleared counters and write them twice. Nothing has to be
-awaited _before_ it — the ordering `stop()` does own is the Drain already in flight waited out
-(a Drain that merely joined it would have read the backlog before the final era existed), then
-the final Flush, then the awaited last Drain, then the backlog counted while the store can still
-answer it, then a synchronous store close and the Mongo client's. `Shutdown.finalFlush` reports
-whether the counters actually made it, and `main.tsx` sets a non-zero exit code when they did
-not, because a shell reads the exit code and not the log.
-
-The shutdown source is injectable. `processSignal` is the real one and the only place
-`process.on` is called; a test raises a signal through a fake, because a real SIGTERM inside the
-suite would take ava down with it.
-
-`snapshot()` and `clear()` are separate methods on purpose: Telemetry State is cleared only
-after a successful Flush, which is what makes retrying the same interval possible. A failed
-Flush returns `undefined` and leaves the state intact.
-
-### The Run Log reads its own seam
-
-`run-log.ts` sits beside the other three: `RunLogSource.read()` returns the entries of the run
-that is happening now, and the read is **synchronous** for the same reason `telemetry.ts`'s is.
-The in-process implementation owns a buffer capped at six entries and hands back a copy, so the
-buffer has exactly one author. Appending is not on the seam — a view is given the reading face —
-and `main.tsx` is what calls it, in both commands. `sessionFor` turns each `onFlush` attempt into
-an entry before passing the attempt on, so the log lists Flush _attempts_ rather than intervals,
-and `collect` records into a log nothing reads back, because the terminal and the exit code are
-what a headless run reports through. A Flush entry is spelled by the same formatters the totals
-are, so a number that appears twice in one frame reads the same way twice.
-
-**The mode decides where a problem goes.** The dashboard hands the factory a reporter that appends
-an entry per helper problem — its error line, a line of stdout that would not parse, its exit —
-with `helper.ts`'s own sentence as the entry's text, so a problem is not printed into the middle
-of the frame; `collect` leaves the reporter out and keeps the `[eventtap]` warnings on stderr it
-has always had. A caller that supplied a reporter of its own keeps it, in either mode, so the
-mode is what decides the default rather than the rule. Both commands append one entry when the run
-starts with no grant, naming the Collectors it took out, which is what puts a missing grant on
-the landing view without the live-view key being pressed — the live view's own report is
-untouched. `problemMessage` in `helper.ts` is the one spelling of a problem, shared by the stderr
-reporter and the entry, and the entry constructors (`flushEntry`, `pushEntry`, `pushWarningEntry`,
-`helperEntry`, `historyEntry`, `collectionEntry`) live beside the buffer because the two texts are one decision:
-the line the block draws and the full text the diagnostics view draws.
-
-**In dashboard mode the frame is the only output** (ADR-0010). Nothing writes to stderr while the
-frame is up, because Ink draws over its own last frame and a stray line shifts every frame after
-it. So the helper's stderr chatter is dropped rather than passed through — `EventStream` takes an
-`onHelperStderr` sink, and the dashboard hands it one that does nothing, while `collect` keeps
-`defaultHelperStderr` — and the write seam's warnings become entries: the composition root
-builds the Push seam with the logger the mode's warnings go to, which is `pushWarningEntry`'s
-one use (`Push`), and with the sink each Drain attempt goes to, which is `pushEntry`'s — an
-entry under a frame, the same sentence on stderr without one.
-The preflight is unaffected, being written before the frame mounts, and so is the end of a run:
-`reportShutdown`'s message about a lost final Flush and the non-zero exit code beside it are
-written after the frame is down, which is the first moment the terminal can be written to again.
-
-**A failed Flush is reported once.** Neither the Session nor the store warns about one; the
-`onFlush` attempt is the report, and the composition root decides what it is worth — an entry
-under a frame, a line on stderr without one. The Session therefore takes no logger at all, which
-is what makes the old duplication unrepresentable rather than merely absent.
-
-**The read seam reports the same way** (#23), and for the same reason. A failed read is a fact
-about this run rather than about the range on screen, so the Local Store raises a `ReadWarning`
-— one thing now, the failure, where it was once a union — and the composition root answers it
-with an entry; `messageOf` is the one spelling of it, as `problemMessage` is. The seam's
-default reporter is the stderr warning it has always written, which is what a run with no view to
-draw an entry in keeps. So the history view draws one compact red pointer line where the driver's
-sentence used to replace the dashboard: the sentence is in the log, whole, one `d` away.
-
-The block is drawn under the history and live views rather than inside one, because the dashboard
-lands on the history view and that view knows nothing about this run — a session whose every Flush
-failed would otherwise open on a frame with nothing to say about it. **The third view is the
-exception** (#22): `d` draws those same entries whole, one per entry with its summary and its full
-text, from the same source through the same hook, so the line the block had to cut is readable
-without the block drawing a truncated copy of it underneath.
-
-### The native helper emits raw events and nothing else
-
-`helper/eventtap.swift` owns a listen-only `CGEventTap` and prints one JSON event per line on
-stdout — keycode, `flagsRaw`, `timestampNs`, mouse position and button. It is built by
-`helper/build.sh` and the binary is committed, because requiring Xcode CLI tools on install would
-make the repo impossible to clone and run (ADR-0002).
-
-**`flagsRaw` is emitted uninterpreted on purpose.** The measured trap (ADR-0006) is that
-F1–F12 set `kCGEventFlagMaskSecondaryFn` too, so their raw flags are byte-identical to a bare Fn
-press — `0x800100`. Fn is identifiable _only_ as keycode 63 on a `flagsChanged` event; nothing
-may infer it from the flag bit. Any decoding rule added to `eventtap.swift` would be untestable
-here, and belongs in TypeScript instead (ADR-0003):
-
-- **The helper never maps a keycode to a Key Label.** It has no label table and does not know
-  what a Key Label is; `key-labels.ts` does that on the TypeScript side.
-- **It does no DPI conversion.** `TelemetryState.addMouseMovement(pixels)` takes pixels and
-  applies `MOUSE_DPI` itself.
-- **It does not de-duplicate auto-repeat**, even though macOS exposes
-  `kCGKeyboardEventAutorepeat`. A held-keys set in TypeScript is testable against synthetic
-  events; a flag is not.
-
-Failures are reported as a JSON line with a `type` of `error` and a non-zero exit, never as
-silence, so a consumer can tell "no input" from "no permission". `--self-check` prints one sample
-of each event type and exits without creating a tap — it is the only way to check the wire format
-with no permission and no live input, and it asserts the event mask has not drifted.
-
-`--preflight` prints the Input Monitoring grant as one JSON line and exits **0 whatever the
-answer**, because a denied grant is the caller's ordinary case to report on rather than this
-process's failure. Both report-only modes exit before a run loop or a tap exists, so neither can
-prompt — which is what lets the CLI ask on a startup path with nobody at the keyboard. It is the
-only permission check the helper makes, and `permissions.ts` is its only caller.
-
-### Time arithmetic is the subtle part
-
-`local-time.ts` and `ranges.ts` exist because a local day is not always 24 hours. Boundaries are
-stepped in wall-clock space and re-resolved to instants with a two-pass offset lookup; the
-second pass in `instantFromLocalFields` is what stops a day bin that straddles a DST transition
-from landing an hour out. The transition cases are asserted in `ranges.test.ts`.
-
-`bucketBoundaries` returns N+1 ascending instants, and that list _is_ the bucket identity: display
-bucket `i` is `[b[i], b[i+1])`, and a row lands in one by it and nothing else. The `$bucket` that
-used to consume the list was Mongo query language and went with the Mongo read (ADR-0012); the
-grouping is JavaScript over rows in `local-store.ts` now, bounded by the same list. See ADR-0007
-for why the website's `$dateTrunc`-plus-client-keys approach was not ported: it makes bucket
-identity an agreement between MongoDB's ICU and JavaScript's `Intl`, and this CLI cannot hold up
-its half of that agreement. **Do not "fix" the divergence by porting `generateBuckets`**, and note
-that no timezone _name_ ever crosses the wire.
-
-### React layering
-
-The TUI is Ink 7 on React 19, and it reaches no further than `views/`. The rule is the property
-rather than a list: every non-test file under `source/views/` imports `ink` or `react`, and no
-file outside it imports either — most of them `.tsx`, the hooks `.ts` because they hold no
-markup. That is what makes ADR-0001's wall checkable instead of enumerated: a module added to
-`views/` that imports neither is in the wrong place, and a module elsewhere that imports either
-has broken the rule the headless `collect` path depends on. Everything else is plain TypeScript,
-which is what ADR-0001 requires of the Collector so that the move to a separate process is a
-different entry point rather than a rewrite. Tests render through `ink-testing-library`.
-
-**The frame is the window, and the window is the terminal's** (ADR-0011). `use-window.ts` is the
-only reader of `stdout.rows`, subscribed to the stream's `resize`; `app.tsx` gives the root box
-that value as a `minHeight` — a floor rather than a size, so a terminal shorter than the content
-grows the frame instead of compressing it — with a `flexGrow` spacer above the keys line, and
-`tui.tsx` renders into the alternate screen so what the dashboard drew goes when it exits. A
-stream that reports no height (a pipe, or a stream with no terminal behind it) reports `rows` of
-absent or 0, and the frame is then the height of its content as it always was.
-
-The history and live views draw the same three lines — Clicks, Mouse Distance, Press Total — and
-share `totals-view.tsx` rather than each spelling them, with the number formats alongside in
-`format.ts`. Only the heading above the block says which view it is, so a difference between
-them would be a bug rather than a difference of meaning.
-
-`main.tsx` also carries the `.tsx` extension and imports neither ink nor react; it reaches
-`tui.tsx` dynamically. That is a constraint to keep, not a coincidence: a module on the
-`collect` path that started importing ink statically would drag it into a headless run.
-
-`history-view.tsx` is presentational and synchronous, tested by rendering a fixed answer. There
-is no loading hook and no loading state: the read is synchronous, so `app.tsx` asks the store
-during render and hands the view what came back — "nothing there" is drawn from data and "could
-not ask" from the failure, and "nothing yet" was a state only a read that took time could be in.
-`use-telemetry.ts` and `live-view.tsx` split the same way: the hook polls and holds nothing but
-the timer, and the view takes a reading plus the two facts outside it that it draws — the instant
-the run began, read in `main.tsx` where the run starts, and the zone that instant is spelled in,
-which is the one clock this view has. `use-run-log.ts` splits that way against both
-of the modules that draw its entries — `run-log-view.tsx` and `diagnostics-view.tsx` take entries
-and a zone. Each poll is owned by the component that draws it rather than held in `app.tsx`, so a
-tick re-renders that component's own subtree and not the view above it: the Run Log block is on
-screen under the history and live views, and the history view is not re-rendered once a second on
-its account.
-
-**Which view is up is one value, and the keys are absolute** (#22). `app.tsx` holds a
-`history | live | diagnostics` union rather than a flag per view, and every view key names the
-view it wants: `d` opens diagnostics from anywhere, `t` and `w` are the history view at their
-range, `l` is the live view, `q` quits. Nothing toggles and there is no way back to "whatever was
-showing". That one value also decides the block: every view but diagnostics gets it, written as
-the exclusion rather than as the two views that want it, so a view added later inherits the block
-rather than quietly losing it.
-
-**Unmount the Ink root in any test that leaves a polling hook mounted.** A pending `setInterval`
-holds ava's worker open, and the run ends in `✘ Timed out while running tests` rather than in a
-failed assertion. `t.teardown(() => { unmount(); })` is the whole fix — and since the Run Log
-block is under the history and live views and the diagnostics view polls the same entries, that
-is every test that mounts the dashboard, not only the ones that switch views.
-
-`HistorySource` arrives as a prop because it is a lifetime, not because a hook is keyed on it:
-it is the Local Store, which `main.tsx` opens and closes, and a view that built its own would
-have nothing to close it with. `TelemetrySource` is handed to the live view the same way.
-
-A failed read comes back as `{ok: false, message}` rather than throwing. A throw raised during a
-render is an unhandled error, which ends the process by default — the TUI would exit instead of
-drawing the error.
+Two walls hold the layout in place, each a property rather than a list: no module but `push.ts`
+and its own test imports `mongodb`, and no file outside `views/` imports `ink` or `react` —
+`main.tsx` reaches `tui.tsx` only through a dynamic import, so a headless run never loads either.
+`docs/architecture.md` carries the rest of the why, including why `cli.tsx` must stay at the
+root and how `helper.ts` finds the Swift binary.
 
 ## Vocabulary is a contract
 
 Use `CONTEXT.md`'s terms exactly — Flush, Snapshot, Telemetry State, Activity, Key Label, Key
-Counts, Press Total, Mouse Distance, Collector, Range, Key Ranking, Heatmap. Every glossary
-entry names the synonyms it avoids (`save`/`persist`/`sync` for Flush, `keycode`/`scancode` for
-Key Label, `period`/`window` for Range). Two that are easy to get wrong:
+Counts, Press Total, Mouse Distance, Collector, Range, Key Ranking, Heatmap. Every glossary entry
+names the synonyms it avoids (`save`/`persist`/`sync` for Flush, `keycode`/`scancode` for Key
+Label, `period`/`window` for Range). Two that are easy to get wrong:
 
 - **Key Ranking is not a Heatmap.** Both are renderings of Key Counts. The website draws a
   keyboard (Heatmap); the CLI draws a bar list ordered by count (Key Ranking). Only the Heatmap
   needs the Label → Physical Key mapping, and the CLI has no `key-layout.ts`.
-- **Range is calendar-aligned** — local midnight, or local Monday midnight — unlike the
-  website's rolling 24h/30d/1y. A heading that says "Today" has to mean today.
+- **Range is calendar-aligned** — local midnight, or local Monday midnight — unlike the website's
+  rolling 24h/30d/1y. A heading that says "Today" has to mean today.
 
 Key Labels are a wire format, not an implementation detail (ADR-0004). A label with no matching
-entry in the website's `jwoo/lib/telemetry/key-layout.ts` vanishes from the heatmap with no
-error anywhere, so adding or renaming one requires a matching website change. Key Counts must
+entry in the website's `jwoo/lib/telemetry/key-layout.ts` vanishes from the heatmap with no error
+anywhere, so adding or renaming one requires a matching website change. Nothing here compiles or
+reads that file — `key-labels.test.ts` pins the label set as a literal list, so a rename is two
+deliberate edits, and `key-character.test.ts` pins what each keycode and flag word resolves to; a
+character `key-character.ts` adds (the Shift/Option characters, the Fn overlays) has to be
+checked against the website by hand, or it vanishes exactly as ADR-0004 warns. Key Counts must
 stay flat numeric scalars and `createdAt` must stay a real BSON Date.
 
-`source/capture/key-labels.ts` is the ported table and `key-labels.test.ts` is what holds it in
-place.
-The label set is asserted there as a literal list, not derived from the table, so a rename has to
-be made in two places on purpose. It is the only guard: nothing here compiles or reads
-`key-layout.ts`, so a label this CLI emits that the website has not been taught is caught by
-nobody, and disappears in silence exactly as ADR-0004 warns.
-
 Never name anything `Daemon`, `Service`, or `Agent` (ADR-0001). App tracking and Windows support
-are documented as deliberately absent rather than missing, and the glossary should not drift
-back toward them.
-
-If a change contradicts an existing ADR, surface the conflict explicitly rather than quietly
-overriding it.
+are documented as deliberately absent rather than missing. If a change contradicts an existing
+ADR, surface the conflict explicitly rather than quietly overriding it.
 
 ## Agent skills
 
