@@ -9,7 +9,8 @@ each section names the invariants its module must hold.
 `source/` is grouped by the import graph rather than by a generic layering: `capture/` (the
 helper, the wire format, the Key Label tables — `key-labels.ts` pins what a keycode is called,
 `key-character.ts` what a key event produces — and the Collectors), `store/` (the Local Store,
-the Pusher, the Range arithmetic, config), `views/` (the Ink layer). What is left at the root is
+the Pusher, the Range arithmetic, the Pricing table, config), `views/` (the Ink layer). What
+is left at the root is
 the run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`
 and `format.ts` — each reads across the groups, so filing one under a group would move a
 boundary edge rather than remove it.

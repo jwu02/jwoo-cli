@@ -62,7 +62,8 @@ set of variables per test. No `loadEnvFile` call inside it.
 
 `source/` is grouped by the import graph rather than by a generic layering: `capture/` (the
 helper, the wire format, the Key Label tables, the Collectors), `store/` (the Local Store, the
-Pusher, the Range arithmetic, config), `views/` (the Ink layer). What is left at the root is the
+Pusher, the Range arithmetic, the Pricing table, config), `views/` (the Ink layer). What is
+left at the root is the
 run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`,
 `format.ts` — each reads across the groups, which is why the split is three and not four. Tests
 sit beside their subject and moved with it; ava's default globs find them there and read the

@@ -3,8 +3,9 @@
 Personal activity telemetry for a single user. A local CLI observes mouse and keyboard
 input on the author's own machine, accumulates counts in memory, periodically Flushes
 them to a Local Store on the same machine, and Pushes them to MongoDB Atlas, where a
-personal website renders them as a mouse and keyboard heatmap. The CLI reads only the
-Local Store; MongoDB is write-only to it (ADR-0012).
+personal website renders them as a mouse and keyboard heatmap. The same Local Store carries
+a second family — AI usage Ingested from coding-agent Harnesses — which Pushes by the same
+rules. The CLI reads only the Local Store; MongoDB is write-only to it (ADR-0012).
 
 ## Language
 
@@ -88,10 +89,11 @@ holds what this machine observed and nothing else — and MongoDB is never read 
 _Avoid_: cache (nothing here is a copy of the database), local database, journal, log file
 
 **Push**:
-Writing a Flushed era to MongoDB, where the website reads it. Best-effort: an era that fails to
-Push waits in the Push Backlog and is retried under its own stamp, overwriting what a lost
-acknowledgement landed rather than adding to it (ADR-0009). A Push that has not happened costs
-the website an era; it never costs the CLI one.
+Writing a Flushed era or an Ingested Usage Record to MongoDB, where the website reads it.
+Best-effort: whatever fails to Push waits in a backlog and is retried — an era under its own
+stamp (ADR-0009), a Usage Record under its content (ADR-0013) — overwriting what a lost
+acknowledgement landed rather than adding to it. A Push that has not happened costs the
+website what it was carrying; it never costs the CLI anything.
 _Avoid_: save, persist, sync, upload, commit (and Flush — that is the write to the Local Store,
 not this)
 
@@ -102,9 +104,53 @@ without ceremony once Pushes land again.
 _Avoid_: queue, pending writes, failed Flushes (the Flushes succeeded)
 
 **Drain**:
-Pushing the Push Backlog, oldest era first, stopping at the first failure so the backlog stays
-a tail rather than a scatter of holes.
+Pushing a backlog, oldest entry first, stopping at the first failure so the backlog stays a
+tail rather than a scatter of holes. The Push Backlog drains oldest era first; the Usage
+Backlog drains oldest `recorded_at` first, at the end of the invocation that touched it.
 _Avoid_: catch-up, retry loop, sync
+
+### AI usage
+
+**Harness**:
+The coding agent whose usage a record attributes: Claude Code or OpenCode. The CLI names
+the harness — the command that Ingests decides the string; a Harness never self-reports
+its own name. DSH stays out of scope, in `ai-usage/` — see Deliberately absent.
+_Avoid_: tool, client, agent (ADR-0001), provider, self-reported
+
+**Usage Record**:
+One LLM usage event as the Harness reports it — a turn's summed tokens or a single request's
+— with its cost and its own `recorded_at`. A point event: identity is content, so a
+re-Ingest near the same instant is dropped rather than rewritten (ADR-0013). An unpriced
+model still Ingests: the record's cost is null, not the record absent.
+_Avoid_: usage event (that is the helper's wire format), request, turn (neither names the
+record), document (a Telemetry Document family word), invalid, incomplete (an unpriced
+record is a record)
+
+**Pricing**:
+The CNY-per-1M-token rates a model is charged: cache-miss, cache-hit and output, with a
+DeepSeek peak/off-peak split selected by Beijing time at the record's own `recorded_at`.
+A model name prices only by exact match on its normalized form — the alias table, not a
+substring, carries the variants. Applied once, at Ingest: a stored cost never reprices
+when the rates change (ADR-0014, ADR-0015).
+_Avoid_: rates, tariff, billing, cost (that is the computed number a record carries)
+
+**Unpriced**:
+A Usage Record whose model matches no Pricing entry. It Ingests all the same — absent
+pricing is not an absent record — and priced-once means no later alias repairs it: the
+null cost is permanent unless a repair door is ever built. The accepted state of a name
+not yet covered, not a defect.
+_Avoid_: unknown model, invalid, zero-cost, missing model
+
+**Ingest**:
+Writing a Usage Record to the Local Store. Dedup happens at Ingest time, inside the store,
+so every caller — a live hook and a backfill alike — comes through the same face.
+_Avoid_: record (the noun), save, persist, sync, insert, import, log, Flush
+
+**Usage Backlog**:
+Ingested Usage Records not yet Pushed. It drains at the end of the CLI invocation that
+touched it — the usage commands, and nothing else, write usage — oldest `recorded_at` first,
+stopping at the first failure so the tail stays a tail.
+_Avoid_: queue, pending writes, failed Ingests
 
 ### The reader
 
@@ -209,3 +255,5 @@ These are not gaps. They are out of scope, and the vocabulary should not drift b
 - **More than one machine.** The Local Store is one machine's record and the history view reads
   only it; a second machine would Push a union to MongoDB that this CLI never shows. If it
   returns, it returns with an answer for whose era is whose.
+- **DSH usage.** The DeepSeek Harness stays behind in the retired `ai-usage/` scripts. If it
+  returns, it returns as a third Harness.
