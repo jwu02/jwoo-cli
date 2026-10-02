@@ -190,6 +190,15 @@ OpenCode's own process, so ADR-0016's contract is stronger there — at least as
 command it spawns. Like `helper/eventtap.swift`, it is excluded from the gate (`xo.config.js`,
 `.prettierignore`); what the gate exercises is the command and the projection behind it.
 
+**The Claude half is wired in the user's own settings, and needs no installer.** The root
+`~/.claude/settings.json` points `Stop` and `SubagentStop` at `dist/cli.js usage
+record-claude-hook` under the pinned node — the flip that retired `mongodb-usage-hook.mjs` is
+that one settings edit, and like the Shim the wiring dies quietly until the next `npm run
+build`, because `dist/` is gitignored. Neither Harness's wiring exports anything the CLI reads:
+the harness literal is the command's own, and `MONGO_URI` reaches the process the same way it
+reaches any other run, through the checkout's `.env` on `--env-file-if-exists` — so a record
+still Ingests without one and only the Push is lost.
+
 **The dashboard collects too.** It runs the same preflight and the same Session `collect` does,
 and mounts the view over the run; `collect` is the way to run without a view, not the way to
 collect. The dependency runs the other way round as well: `q` arrives as input in a raw-mode

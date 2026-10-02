@@ -15,8 +15,8 @@ no way to know whether more are coming.
 Plain JS, and no `@opencode-ai/plugin` import: the installed type package lags
 the binary (1.14.24 beside 1.18.32), so the package would describe a payload
 this file must not trust anyway. The spawn line is the same shape Claude Code's
-hook wiring uses — pinned node, absolute build, no `--env-file` — and it is
-deliberately not awaited: OpenCode's event bus is not made to wait on a
+hook wiring uses — pinned node, absolute build, the checkout's `.env` — and it
+is deliberately not awaited: OpenCode's event bus is not made to wait on a
 telemetry write.
 
 The whole handler is wrapped in a catch-all (ADR-0016): the plugin runs inside
@@ -34,11 +34,20 @@ because the ambient node is older than `node:sqlite` needs and hooks run
 non-interactively. Paths rather than a PATH lookup: OpenCode's own environment
 is not the shell's.
 */
-const NODE = join(homedir(), '.nvm/versions/node/v22.23.2/bin/node');
-const CLI = join(
+const CHECKOUT = join(
 	homedir(),
-	'Developer/PersonalProjects/personal-website/jwoo-cli/dist/cli.js',
+	'Developer/PersonalProjects/personal-website/jwoo-cli',
 );
+const NODE = join(homedir(), '.nvm/versions/node/v22.23.2/bin/node');
+const CLI = join(CHECKOUT, 'dist/cli.js');
+
+/*
+`MONGO_URI` is the app's own, read from the checkout's `.env` rather than
+inherited: OpenCode's environment is not Claude Code's, and the URI is what the
+end-of-invocation Push needs. `if-exists`, so a clone without the gitignored
+`.env` still Ingests to the Local Store instead of failing the spawn.
+*/
+const ENV_FILE = `--env-file-if-exists=${join(CHECKOUT, '.env')}`;
 
 export const Jwoo = async () => ({
 	event: async ({event}) => {
@@ -54,7 +63,13 @@ export const Jwoo = async () => ({
 
 			const child = spawn(
 				NODE,
-				['--disable-warning=ExperimentalWarning', CLI, 'usage', 'record-opencode'],
+				[
+					'--disable-warning=ExperimentalWarning',
+					ENV_FILE,
+					CLI,
+					'usage',
+					'record-opencode',
+				],
 				{stdio: ['pipe', 'ignore', 'inherit']},
 			);
 

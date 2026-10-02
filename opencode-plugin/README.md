@@ -32,4 +32,5 @@ way, but this one is meant to serve every project.
   the CLI's own hook wiring line makes. Edit both constants if it moves.
 
 Records land in the Local Store either way; `MONGO_URI` is only needed for the
-end-of-invocation Push, and the Shim sets no environment for the child.
+end-of-invocation Push, and the Shim reads it from this checkout's `.env`
+(`--env-file-if-exists`), never from OpenCode's environment.
