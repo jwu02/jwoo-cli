@@ -67,12 +67,26 @@ Drain of its own, so the sequencing that used to live in `CollectionSession.stop
 the in-flight pass out, asking for one more, then counting the store afterwards — is the seam's
 to do and is stated once, in `push.ts`.
 
+**The Usage Backlog drains through a sibling seam, one-shot rather than interval-driven.**
+`store/usage-push.ts` carries Ingested Usage Records to `ai_usage` in exactly the ten-field
+shape the website already reads — `harness`, `cwd`, `model`, `cost_yuan`, the five token buckets
+and a real BSON `recorded_at`, no TTL and no `createdAt` (spec #53). Each document is keyed by
+`<recorded_at>#<sha256 of the model and the five buckets>` and written through a `replaceOne`
+upsert inside an ordered `bulkWrite` of ~500, so a re-Push converges (ADR-0013) and a
+~1,800-record first drain is a handful of round trips instead of per-document ones. The drain
+stops at the first failed batch — the tail rule the era drain has — and reuses `PushAttempt`,
+with `pushed` counting records. It is deliberately not a second tail inside `Pusher`: the era
+Pusher's contract is era-specific (`settle()`, TTL indexes, a connection reopened for a long
+run), while this seam connects, drains once and closes, so it has no single-flight, no reopen
+and no index ask. The client it opens comes from `createMongoClient` in `push.ts`.
+
 ## Seams, and no database server in the test suite
 
 `push.ts` is the one seam with MongoDB behind it, and it is a write seam: it declares its own
-narrow slice of the driver's types (`Collection`, `Database`), and no module but `push.ts` and
-its own test imports `mongodb`. Every test drives a hand-written in-memory fake — no test
-server, no container. The narrow types are deliberately faithful about async-ness, and that is
+narrow slice of the driver's types (`Collection`, `Database`) and is the only module that
+imports `mongodb` as a value — `usage-push.ts` imports the driver's types type-only and takes
+the database structurally, so the wall holds there too. Every test drives a hand-written
+in-memory fake — no test server, no container. The narrow types are deliberately faithful about async-ness, and that is
 load-bearing: `Collection.replaceOne` returns a Promise because the driver's does, so a fake
 that lied about it would let a missing `await` pass every test while losing data against a real
 server.

@@ -70,7 +70,8 @@ sit beside their subject and moved with it; ava's default globs find them there 
 directory as the test name's prefix.
 
 Two walls hold the layout in place, each a property rather than a list: no module but `push.ts`
-and its own test imports `mongodb`, and no file outside `views/` imports `ink` or `react` —
+imports `mongodb` as a value (`usage-push.ts` and its test take the driver's types type-only),
+and no file outside `views/` imports `ink` or `react` —
 `main.tsx` reaches `tui.tsx` only through a dynamic import, so a headless run never loads either.
 `docs/architecture.md` carries the rest of the why, including why `cli.tsx` must stay at the
 root and how `helper.ts` finds the Swift binary.

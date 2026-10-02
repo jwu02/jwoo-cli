@@ -51,6 +51,18 @@ export type Database = {
 };
 
 /*
+The one place a real client is built.
+
+`push.ts` is the only module that imports `mongodb` as a value, so a sibling seam
+that needs a client of its own — the Usage Push — reaches for it here rather
+than importing the driver itself, and the wall holds by construction instead of
+by discipline.
+*/
+export function createMongoClient(config: Config): MongoClient {
+	return new MongoClient(requireMongoUri(config));
+}
+
+/*
 `MongoClient` is not itself a `Database` — it hands one out by name, which is
 where the configured database name comes in.
 */
@@ -231,7 +243,7 @@ export class Pusher {
 			database,
 			logger = console,
 			onAttempt,
-			createClient = () => new MongoClient(requireMongoUri(config)),
+			createClient = () => createMongoClient(config),
 		}: PusherOptions = {},
 	) {
 		this.#config = config;
