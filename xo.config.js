@@ -72,4 +72,17 @@ export default [
 			'@typescript-eslint/naming-convention': 'off',
 		},
 	},
+	{
+		/*
+		The transcript fixtures are Claude Code's own JSONL rows, so this test
+		writes the Anthropic field names verbatim — `input_tokens`,
+		`cache_read_input_tokens`, `tool_use_id` — because those are what the file
+		on disk holds, and a camelCase fixture would test a transcript nothing
+		produces.
+		*/
+		files: ['source/usage/usage-transcript.test.ts'],
+		rules: {
+			'@typescript-eslint/naming-convention': 'off',
+		},
+	},
 ];
