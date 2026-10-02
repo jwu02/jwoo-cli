@@ -73,6 +73,10 @@ test('usage names the command it runs', t => {
 		kind: 'usage',
 		command: 'record-claude-hook',
 	});
+	t.deepEqual(parseArguments(['usage', 'record-opencode']), {
+		kind: 'usage',
+		command: 'record-opencode',
+	});
 });
 
 test('the usage group alone is rejected', t => {

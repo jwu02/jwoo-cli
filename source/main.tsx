@@ -19,17 +19,18 @@ hours collecting into a retry that can never succeed. The Pusher's half of the
 same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
 it, or cannot be built at all, is a run that carries on.
 
-Four entry points stand at the top of it — `runCollect`, `runDashboard`,
-`runPermissions` and `runRecordClaudeHook` — one per command, each taking no
-more than the command reads and each named for what it runs. Which one a command
-line means is decided a module up, in `cli.tsx`, which is also the only caller
-that supplies the real permissions source: nothing here imports the command
-type, so a pairing of command and entry point cannot be stated twice and drift.
+Five entry points stand at the top of it — `runCollect`, `runDashboard`,
+`runPermissions`, `runRecordClaudeHook` and `runRecordOpencode` — one per command,
+each taking no more than the command reads and each named for what it runs. Which
+one a command line means is decided a module up, in `cli.tsx`, which is also the
+only caller that supplies the real permissions source: nothing here imports the
+command type, so a pairing of command and entry point cannot be stated twice and
+drift.
 
-The usage command is the one that does not collect: it reads one Hook payload
-from stdin, Ingests its turns and Drains the Usage Backlog, and owns none of the
-run skeleton above — which is why its section is its own, and why its store type
-is a narrower slice of the same file.
+The usage commands are the ones that do not collect: each reads one Harness's
+artifact from stdin, Ingests what it projects and Drains the Usage Backlog, and
+owns none of the run skeleton above — which is why their section is its own, and
+why their store type is a narrower slice of the same file.
 
 The pieces arrive as options rather than being reached for directly: this module
 is where permission, store, state and Collector meet, and a test that had to
@@ -66,6 +67,7 @@ import {
 	UsagePusher as MongoUsagePusher,
 	type UsagePushBacklog,
 } from './store/usage-push.js';
+import {projectOpencodeMessage} from './usage/usage-opencode.js';
 import {walkTranscript} from './usage/usage-transcript.js';
 import {MouseCollector} from './capture/mouse.js';
 import {
@@ -500,16 +502,21 @@ both stay the seam's business.
 export type UsagePush = Pick<MongoUsagePusher, 'drain' | 'close'>;
 
 /*
-What `usage record-claude-hook` is handed, each an option for the reason the
+What a `usage` record command is handed, each an option for the reason the
 collecting commands' are: a test that could not stand these in would open a
 store, a connection and a terminal, and the ADR-0016 contract is exactly what a
 test has to be able to drive down every path of.
+
+The two record commands — `record-claude-hook` and `record-opencode` — take the
+same set, because they differ by what arrives on stdin and nothing else: one
+Harness's artifact, one walk or projection, and the same Ingest and Drain around
+it.
 
 `stdin` and `stderr` are the two ends of that contract: the payload arrives on
 one and every diagnostic leaves on the other. Stdout is never written, and that
 is a property of the code below rather than of a sink it could be handed.
 */
-export type RecordClaudeHookOptions = {
+export type RecordUsageOptions = {
 	readonly stdin?: () => Promise<string>;
 	readonly stderr?: (message: string) => void;
 	readonly clock?: () => Date;
@@ -528,6 +535,19 @@ export type RecordClaudeHookOptions = {
 };
 
 /*
+A projected Usage Record before its Harness. Both commands' projections answer
+this shape — the transcript walk's `TranscriptCandidate` and the OpenCode
+projection's `OpencodeCandidate` are the same fields under different names — and
+the Ingest face pairs it with the literal the command owns.
+*/
+type UsageCandidate = Omit<UsageRecord, 'harness'>;
+
+/*
+Where a record command's diagnostics go: one line per problem, on stderr.
+*/
+type Reporter = (message: string) => void;
+
+/*
 The hook events this command answers: Stop and SubagentStop only. ApiReqDone is
 dead — wired nowhere, present in no transcript — and is not ported (spec #53),
 so any other event is a no-op run that still drains.
@@ -535,11 +555,12 @@ so any other event is a no-op run that still drains.
 const HOOK_EVENTS = new Set(['Stop', 'SubagentStop']);
 
 /*
-The Harness literal, owned here because a Harness never self-reports its name:
-the hook JSON carries no harness field, and the command that Ingests decides the
-string (CONTEXT.md).
+The Harness literals, owned here because a Harness never self-reports its name:
+neither the hook JSON nor OpenCode's `info` carries a harness field, and the
+command that Ingests decides the string (CONTEXT.md).
 */
 const CLAUDE_HARNESS = 'Claude Code';
+const OPENCODE_HARNESS = 'OpenCode';
 
 /*
 The fields of the hook JSON this command reads. Every one optional and read
@@ -555,34 +576,103 @@ type HookInput = {
 };
 
 /*
-The `usage record-claude-hook` entry point.
+The two `usage` record entry points. Each is one Harness's artifact projected
+into Usage Records and handed to the same Ingest face.
 
-It runs inside Claude Code's wiring, so ADR-0016 decides its whole shape: exit 0
-on every path of its own, stdout silent, every problem on stderr. Nothing here
-throws, and that is the contract rather than a style — `cli.tsx` turns a throw
-into a non-zero code, and a hook that failed loudly would surface an error into
-the session it was hired to observe.
+Both run inside their Harness's own wiring — Claude Code's hooks, OpenCode's
+Shim — so ADR-0016 decides their whole shape: exit 0 on every path of their own,
+stdout silent, every problem on stderr. Nothing here throws, and that is the
+contract rather than a style: `cli.tsx` turns a throw into a non-zero code, and a
+hook that failed loudly would surface an error into the session it was hired to
+observe.
 
-The store is opened and closed here, as a collecting run's is: it is the one
-write an Ingest must reach. The Usage Push is the opposite case — best-effort,
-built only when there is a `MONGO_URI`, and closed with the store.
-
-The Drain is attempted on every run, even one that Ingested nothing: the Usage
-Backlog may hold older records, and this invocation is a chance to carry them.
-It is skipped only by a failed Ingest — a store that could not take a record is
-not one to hand the backlog to — which leaves the tail where it was.
+What differs between them is what arrives on stdin and how it becomes
+candidates — the transcript walk that re-visits every turn, or the one OpenCode
+message the Shim sends. That is the whole of the callback each hands over; the
+store's lifetime, the Ingest, the reporting and the end-of-invocation Drain
+around it are `runUsageRecord`, one path for both.
 */
 export async function runRecordClaudeHook(
-	options: RecordClaudeHookOptions = {},
+	options: RecordUsageOptions = {},
+): Promise<void> {
+	await runUsageRecord(options, CLAUDE_HARNESS, async report => {
+		let input: HookInput | undefined;
+		try {
+			input = parseHookInput(await (options.stdin ?? readStdin)());
+		} catch (error) {
+			report(`Could not read the hook input: ${messageOf(error)}`);
+		}
+
+		if (input === undefined || !HOOK_EVENTS.has(input.hook_event_name ?? '')) {
+			return [];
+		}
+
+		/*
+		The transcript is always walked — the retired hook's `input.usage`
+		shortcut is not ported (spec #53): the walk sees every turn, gives each
+		its own `recorded_at`, and re-walking is safe because Ingest drops
+		duplicates. A missing or unreadable transcript is no turns, not a
+		failure.
+		*/
+		return walkTranscript(
+			input.agent_transcript_path ?? input.transcript_path,
+			{cwd: input.cwd, clock: options.clock},
+		);
+	});
+}
+
+/*
+The `usage record-opencode` entry point: one raw `info` JSON — an
+`AssistantMessage` — on stdin, projected to the one Usage Record it represents.
+
+No event guard here. The Shim's `time.completed` guard is what makes a delivered
+payload a finished turn, and it lives there because OpenCode's event fires on
+every message-row write. A message with no tokens is a skip, not a failure; a
+payload that is not a JSON object, or one with no `time.created` to place it in
+history, is reported, and the invocation drains all the same.
+*/
+export async function runRecordOpencode(
+	options: RecordUsageOptions = {},
+): Promise<void> {
+	await runUsageRecord(options, OPENCODE_HARNESS, async report => {
+		let candidate;
+		try {
+			candidate = projectOpencodeMessage(await (options.stdin ?? readStdin)());
+		} catch (error) {
+			report(`Could not read the OpenCode input: ${messageOf(error)}`);
+			return [];
+		}
+
+		return candidate === undefined ? [] : [candidate];
+	});
+}
+
+/*
+One record command, end to end: open the store, project the payload into
+candidates, Ingest them, Drain the Usage Backlog, close.
+
+The order and the catches are the whole of ADR-0016. The config and the store
+are the two things that can fail before the command's own work, and each is a
+line rather than a throw. A failed Ingest skips the Drain — a store that could
+not take a record is not one to hand the backlog to — while an invocation that
+Ingested nothing still drains, because the Backlog may hold older records.
+Closing is last and has its own catch, because it fails after the body's catch
+has already run, and a store that would not close must not take the exit code
+with it.
+*/
+async function runUsageRecord(
+	options: RecordUsageOptions,
+	harness: string,
+	candidatesFor: (report: Reporter) => Promise<readonly UsageCandidate[]>,
 ): Promise<void> {
 	const report = options.stderr ?? writeStderr;
 
 	/*
 	The first thing that can fail, and it is already inside the contract: a
 	`ConfigError` — a `FLUSH_INTERVAL_SECONDS` that is not a number — would
-	otherwise leave this module as a throw, and a hook that failed loudly is
-	the one thing ADR-0016 forbids. An unreadable config costs the records of
-	this invocation and nothing else.
+	otherwise leave this module as a throw, and a hook that failed loudly is the
+	one thing ADR-0016 forbids. An unreadable config costs the records of this
+	invocation and nothing else.
 	*/
 	let config: Config;
 	try {
@@ -601,20 +691,17 @@ export async function runRecordClaudeHook(
 	}
 
 	try {
-		await recordHookInput(options, config, store, report);
+		ingestCandidates(await candidatesFor(report), harness, store, report);
+		await drainUsageBacklog(options, config, store, report);
 	} catch (error) {
 		/*
-		The contract again: whatever went wrong after the store opened — a
-		backlog that would not read, a connection that would not close — is a
-		line on stderr and an exit 0, never a throw.
+		The contract again: whatever went wrong after the store opened — a store
+		that would not take a record, a backlog that would not read, a
+		connection that would not close — is a line on stderr and an exit 0,
+		never a throw.
 		*/
 		report(messageOf(error));
 	} finally {
-		/*
-		Closing is the last thing that can fail, and it fails after the catch
-		above has already run — so it needs its own, or a store that would not
-		close would take the exit code with it.
-		*/
 		try {
 			store.close();
 		} catch (error) {
@@ -624,67 +711,22 @@ export async function runRecordClaudeHook(
 }
 
 /*
-One hook payload, end to end: read it, Ingest its turns, drain.
-
-A payload that cannot be read is a no-op run rather than a failure — the same
-shape as a missing transcript — and it still drains, because the invocation is a
-chance to carry the backlog whatever arrived on stdin.
+Ingest one payload's candidates, reporting each outcome. Synchronous, and it
+throws on the one failure it can meet — a store that would not take a record —
+with the caller's catch doing the reporting that a failed Ingest is due; what it
+must not do is return as if the run had gone well.
 */
-async function recordHookInput(
-	options: RecordClaudeHookOptions,
-	config: Config,
+function ingestCandidates(
+	candidates: readonly UsageCandidate[],
+	harness: string,
 	store: UsageStore,
-	report: (message: string) => void,
-): Promise<void> {
-	let input: HookInput | undefined;
-	try {
-		input = parseHookInput(await (options.stdin ?? readHookStdin)());
-	} catch (error) {
-		report(`Could not read the hook input: ${messageOf(error)}`);
-	}
-
-	if (input !== undefined && HOOK_EVENTS.has(input.hook_event_name ?? '')) {
-		/*
-		A throw from here is a failed Ingest, and the caller catches it: the
-		Drain below is skipped, because a store that could not take a record is
-		not one to hand the backlog to — and the tail survives to the next
-		invocation, which is the two-tail rule (ADR-0012) doing the work the
-		contract needs here.
-		*/
-		ingestTurns(input, options, store, report);
-	}
-
-	await drainUsageBacklog(options, config, store, report);
-}
-
-/*
-Ingest one payload's turns, reporting each outcome. Synchronous, and it throws
-on the one failure it can meet — a store that would not take a record — with the
-caller's catch doing the reporting that a failed Ingest is due; what it must not
-do is return as if the run had gone well.
-*/
-function ingestTurns(
-	input: HookInput,
-	options: RecordClaudeHookOptions,
-	store: UsageStore,
-	report: (message: string) => void,
+	report: Reporter,
 ): void {
-	/*
-	The transcript is always walked — the retired hook's `input.usage` shortcut
-	is not ported (spec #53): the walk sees every turn, gives each its own
-	`recorded_at`, and re-walking is safe because Ingest drops duplicates. A
-	missing or unreadable transcript is no turns, not a failure.
-	*/
-	const candidates = walkTranscript(
-		input.agent_transcript_path ?? input.transcript_path,
-		{cwd: input.cwd, clock: options.clock},
-	);
-
 	let ingested = 0;
 	let duplicates = 0;
 
 	for (const candidate of candidates) {
-		const result = store.ingest({...candidate, harness: CLAUDE_HARNESS});
+		const result = store.ingest({...candidate, harness});
 
 		if (result.status === 'duplicate') {
 			duplicates += 1;
@@ -708,9 +750,10 @@ function ingestTurns(
 	/*
 	One line for the invocation rather than one per record. Every Stop re-walks
 	the whole transcript, so a per-record line would print a duplicate per turn
-	on every turn and grow without bound over a session. An invocation that
-	Ingested anything says "Recorded."; one that only dropped duplicates says
-	"Duplicate."; one with no turns at all says nothing.
+	on every turn and grow without bound over a session — and an OpenCode payload
+	is one record, so the two commands' lines mean the same thing. An invocation
+	that Ingested anything says "Recorded."; one that only dropped duplicates
+	says "Duplicate."; one with no candidates at all says nothing.
 	*/
 	if (ingested > 0) {
 		report('Recorded.');
@@ -730,10 +773,10 @@ failed leaves its records there, and that count is what the next invocation
 starts from.
 */
 async function drainUsageBacklog(
-	options: RecordClaudeHookOptions,
+	options: RecordUsageOptions,
 	config: Config,
 	store: UsageStore,
-	report: (message: string) => void,
+	report: Reporter,
 ): Promise<void> {
 	if (config.mongoUri === undefined) {
 		report('No MONGO_URI; nothing was Pushed.');
@@ -812,11 +855,12 @@ function parseHookInput(raw: string): HookInput {
 }
 
 /*
-All of stdin, which is where the wiring delivers the one JSON payload. Decoded
-as UTF-8 while it is read rather than after concatenation, so a multi-byte
+All of stdin, which is where the wiring delivers the one JSON payload — Claude
+Code's hook payload, or OpenCode's one `info` blob through the Shim. Decoded as
+UTF-8 while it is read rather than after concatenation, so a multi-byte
 character split across two chunks cannot come out as replacement characters.
 */
-async function readHookStdin(): Promise<string> {
+async function readStdin(): Promise<string> {
 	process.stdin.setEncoding('utf8');
 
 	let data = '';

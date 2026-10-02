@@ -22,11 +22,11 @@ import process from 'node:process';
 import meow, {type Options, type Result} from 'meow';
 
 /*
-The commands of the `usage` group. Only the Claude record command is wired so
-far — `record-opencode` and the two Backfills land with their own tickets — but
-the group is the argv surface they slot into, so it is named once here.
+The commands of the `usage` group. The two live record commands are wired; the
+two Backfills land with their own tickets, and the group is the argv surface
+they slot into, so it is named once here.
 */
-export type UsageCommand = 'record-claude-hook';
+export type UsageCommand = 'record-claude-hook' | 'record-opencode';
 
 export type Command =
 	| {readonly kind: 'dashboard'}
@@ -44,6 +44,7 @@ export const HELP_TEXT = `
 	  $ jwoo-cli collect                   collect input and Flush it, without the dashboard
 	  $ jwoo-cli permissions               report the macOS grants collection needs
 	  $ jwoo-cli usage record-claude-hook  Ingest a Claude Code hook's turns, from stdin
+	  $ jwoo-cli usage record-opencode     Ingest one OpenCode message, from stdin
 
 	Options
 	  --help     Show this help
@@ -123,7 +124,8 @@ function usageCommandFor(
 	}
 
 	switch (command) {
-		case 'record-claude-hook': {
+		case 'record-claude-hook':
+		case 'record-opencode': {
 			return {kind: 'usage', command};
 		}
 

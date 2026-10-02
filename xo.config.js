@@ -2,6 +2,16 @@ import reactHooks from 'eslint-plugin-react-hooks';
 
 export default [
 	{
+		/*
+		The OpenCode Shim is outside the gate, like the Swift helper source and
+		for the same reason: the gate cannot load it — OpenCode's plugin loader is
+		what runs it — and its shape is that loader's rather than this repo's. What
+		the gate exercises is everything behind it, which is the CLI command and
+		the projection.
+		*/
+		ignores: ['opencode-plugin/**'],
+	},
+	{
 		prettier: true,
 	},
 	{

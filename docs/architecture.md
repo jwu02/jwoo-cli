@@ -10,8 +10,8 @@ each section names the invariants its module must hold.
 helper, the wire format, the Key Label tables — `key-labels.ts` pins what a keycode is called,
 `key-character.ts` what a key event produces — and the Collectors), `store/` (the Local Store,
 the Pusher and its sibling Usage Push seam, the Range arithmetic, the Pricing table, config),
-`usage/` (the Harness artifact projections — the Claude transcript walk so far, with the
-OpenCode reader and projection to come), `views/` (the Ink layer). What
+`usage/` (the Harness artifact projections — the Claude transcript walk and the OpenCode
+message projection, with the OpenCode database reader to come), `views/` (the Ink layer). What
 is left at the root is
 the run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`
 and `format.ts` — each reads across the groups, so filing one under a group would move a
@@ -102,12 +102,14 @@ holding the permission source and a logger — the two things that command reads
 collection type satisfies structurally, so one object can be handed to either. The two that
 collect resolve with the `Shutdown`, which is how the run ended rather than only that it did;
 `runPermissions` answers with the `PermissionReport` it was asked for, because it has no run to
-report on. `runRecordClaudeHook` is the usage command's: it reads one Hook payload from stdin,
-Ingests the turns its transcript holds, and Drains the Usage Backlog at the end of the
-invocation. Its dependencies are its own narrow options — a stdin reader, a stderr sink, the
-clock, and factories for the store and the one-shot Usage Push — and it resolves with nothing at
-all, because ADR-0016 makes every path of its own a clean exit that `cli.tsx` must not read a
-code off; its failures are stderr lines instead.
+report on. `runRecordClaudeHook` and `runRecordOpencode` are the usage commands': each reads one
+Harness artifact from stdin, Ingests what it projects, and Drains the Usage Backlog at the end of
+the invocation. Their dependencies are the same narrow options — a stdin reader, a stderr sink,
+the clock, and factories for the store and the one-shot Usage Push — and they resolve with
+nothing at all, because ADR-0016 makes every path of their own a clean exit that `cli.tsx` must
+not read a code off; their failures are stderr lines instead. Both hand that shared machinery one
+callback — the transcript walk, or the OpenCode projection — to `runUsageRecord`, which is the
+whole of the difference between them.
 
 `cli.tsx` is the entry point above them all: it parses argv, dispatches to the one
 the command names, turns how that run ended into the process exit code — non-zero when the
@@ -165,16 +167,28 @@ key because the collector must not be reachable only through the TUI (ADR-0001).
 **`usage` is the third group, and the commands that Ingest AI usage live under it.** A group
 rather than four more top-level commands because they share a shape — each reads a Harness's own
 artifact and Ingests through the same store face — and because `usage` alone names nothing, so a
-bare `usage` is rejected the way a bare `dashboard` is. Only `record-claude-hook` is wired so
-far: it reads a raw Claude Code hook payload on stdin, walks the transcript it names (always the
-transcript, never the proxy's non-standard `input.usage` shortcut), and Ingests the turns it
-finds with the Harness literal the command owns. `record-opencode` and the two Backfills land
-beside it, which is what the group is for. The record command is also the one command that never
-throws: ADR-0016 makes exit 0 on every path of its own a contract, so `cli.tsx` reads no code off
-it and its diagnostics are stderr lines — "Recorded." or "Duplicate.", one unpriced line per
-record that needed one, and the Usage Backlog's count when a Drain was attempted and left
-something behind. `MONGO_URI` is optional for it: the Ingest lands in the Local Store either
-way, and a config without one builds no Push seam and drains nothing.
+bare `usage` is rejected the way a bare `dashboard` is. The two live record commands are wired:
+`record-claude-hook` reads a raw Claude Code hook payload on stdin and walks the transcript it
+names (always the transcript, never the proxy's non-standard `input.usage` shortcut), and
+`record-opencode` reads one `info` blob the Shim delivers and projects it into the single Usage
+Record it represents. Each Ingests with the Harness literal the command owns, and both run the
+same Ingest-then-Drain path — `main.tsx`'s `runUsageRecord` — so only the projection differs. The
+two Backfills land beside them, which is what the group is for. The record commands are also the
+ones that never throw: ADR-0016 makes exit 0 on every path of their own a contract, so `cli.tsx`
+reads no code off them and their diagnostics are stderr lines — "Recorded." or "Duplicate.", one
+unpriced line per record that needed one, and the Usage Backlog's count when a Drain was
+attempted and left something behind. `MONGO_URI` is optional for them: the Ingest lands in the
+Local Store either way, and a config without one builds no Push seam and drains nothing.
+
+**The Shim is the OpenCode half of that wiring, and it lives outside the gate.**
+`opencode-plugin/jwoo.mjs` is plain JS — no `@opencode-ai/plugin` import, because the installed
+type package lags the binary — observing `message.updated` with the `assistant` + `time.completed`
+guard (`opencode-plugin/README.md` has the symlink install). The guard lives there rather than in
+the command because the event fires on every message-row write and the command is handed one
+blob. Its whole handler is a catch-all and its one spawn is un-awaited: the plugin runs inside
+OpenCode's own process, so ADR-0016's contract is stronger there — at least as quiet as the
+command it spawns. Like `helper/eventtap.swift`, it is excluded from the gate (`xo.config.js`,
+`.prettierignore`); what the gate exercises is the command and the projection behind it.
 
 **The dashboard collects too.** It runs the same preflight and the same Session `collect` does,
 and mounts the view over the run; `collect` is the way to run without a view, not the way to

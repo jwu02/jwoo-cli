@@ -36,10 +36,11 @@ import for the same reason.
     $ jwoo-cli collect    collect input and Flush it, without the dashboard
     $ jwoo-cli permissions  report the macOS grants collection needs
     $ jwoo-cli usage record-claude-hook  Ingest a Claude Code hook's turns, from stdin
+    $ jwoo-cli usage record-opencode  Ingest one OpenCode message, from stdin
 
 Nothing here sets an exit code for a usage command, and that is ADR-0016 rather
-than an omission: the hook command exits 0 on every path of its own, so it
-resolves with nothing and the process's default code stands. Its failures are
+than an omission: the record commands exit 0 on every path of their own, so they
+resolve with nothing and the process's default code stands. Their failures are
 stderr lines, which is the whole point — a non-zero code would surface inside
 the agent session the command observes.
 */
@@ -51,6 +52,7 @@ import {
 	runDashboard,
 	runPermissions,
 	runRecordClaudeHook,
+	runRecordOpencode,
 } from './main.js';
 import {HelperPermissionSource} from './capture/permissions.js';
 import {type Shutdown} from './session.js';
@@ -87,11 +89,22 @@ try {
 
 		case 'usage': {
 			/*
-			No exit code is read off this one: the hook contract makes every
-			path of its own a clean exit, and the command reports through stderr
+			No exit code is read off either: the hook contract makes every path
+			of its own a clean exit, and each command reports through stderr
 			instead.
 			*/
-			await runRecordClaudeHook();
+			switch (command.command) {
+				case 'record-claude-hook': {
+					await runRecordClaudeHook();
+					break;
+				}
+
+				case 'record-opencode': {
+					await runRecordOpencode();
+					break;
+				}
+			}
+
 			break;
 		}
 	}

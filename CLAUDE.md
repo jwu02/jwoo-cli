@@ -36,10 +36,12 @@ export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 Run lines carry `--disable-warning=ExperimentalWarning --env-file=.env` and need `MONGO_URI` —
 for example, the dashboard is `node --disable-warning=ExperimentalWarning --env-file=.env
 dist/cli.js`, which collects while it is open. `collect` after that runs collection headlessly;
-`permissions` reports the macOS grants and exits. `usage record-claude-hook` is the one run line
-that is not that shape: it reads a Claude Code hook payload on stdin, Ingests it, drains the
-Usage Backlog, and exits 0 on every path of its own (ADR-0016) — no `.env` needed, so a
-`MONGO_URI` in the environment is the only thing an offline run has to avoid.
+`permissions` reports the macOS grants and exits. The `usage record-claude-hook` and
+`usage record-opencode` lines are the ones that are not that shape: each reads one Harness
+artifact on stdin (a Claude Code hook payload, or one OpenCode `info` blob the Shim delivers),
+Ingests it, drains the Usage Backlog, and exits 0 on every path of its own (ADR-0016) — no
+`.env` needed, so a `MONGO_URI` in the environment is the only thing an offline run has to
+avoid.
 
 The flag is on every run line because `node:sqlite` is experimental and says so on stderr the
 moment it is imported — and `main.tsx` imports the Local Store on every path, whichever
@@ -50,6 +52,11 @@ The helper's `.swift` source is outside the gate — `prettier` and `xo` do not 
 gate exercises is the binary committed beside it (`helper.test.ts` spawns it for `--self-check`,
 `--preflight`, and to watch `stop()` kill it). So a rebuild left uncommitted passes the gate it
 should have failed: build by hand after changing the source and commit the binary with it.
+
+The OpenCode Shim (`opencode-plugin/jwoo.mjs`) is outside the gate the same way, excluded by
+`xo.config.js` and `.prettierignore`: OpenCode's plugin loader is what runs it, and what the gate
+exercises is the command and projection behind it. `npm run build` before the Shim can spawn
+anything — `dist/` is gitignored.
 
 No test reaches the network or another installation, and none may start a server: the `ava` step
 has to pass on a clone of this repo alone. The exception is `local-store.ts`, tested against real
@@ -66,7 +73,8 @@ set of variables per test. No `loadEnvFile` call inside it.
 `source/` is grouped by the import graph rather than by a generic layering: `capture/` (the
 helper, the wire format, the Key Label tables, the Collectors), `store/` (the Local Store, the
 Pusher and the Usage Push seam, the Range arithmetic, the Pricing table, config), `usage/` (the
-Harness artifact projections — the Claude transcript walk so far), `views/` (the Ink layer).
+Harness artifact projections — the Claude transcript walk and the OpenCode message projection),
+`views/` (the Ink layer).
 What is left at the root is the
 run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`,
 `format.ts` — each reads across the groups, so filing one under a group would move a boundary

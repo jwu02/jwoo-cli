@@ -19,13 +19,14 @@ import {
 	type CollectorFactory,
 	type DashboardView,
 	type Logger,
-	type RecordClaudeHookOptions,
+	type RecordUsageOptions,
 	type RunOptions,
 	type RunStore,
 	runCollect,
 	runDashboard,
 	runPermissions,
 	runRecordClaudeHook,
+	runRecordOpencode,
 	type UsagePush,
 	type UsageStore,
 } from './main.js';
@@ -2298,7 +2299,7 @@ async function runHook(
 	const written: string[] = [];
 	let pusherBuilt = 0;
 
-	const options: RecordClaudeHookOptions = {
+	const options: RecordUsageOptions = {
 		config,
 		stdin: async () =>
 			typeof input === 'string' ? input : JSON.stringify(input),
@@ -2643,4 +2644,130 @@ test('a Push seam that cannot be built is a stderr line, not a throw', async t =
 	t.is(store.records.length, 1, 'the Ingest still landed');
 	t.true(written.some(line => line.includes('Invalid scheme')));
 	t.false(written.some(line => line.includes('await Push')));
+});
+
+/*
+`usage record-opencode`, and what it adds to the Claude command's shape
+------------------------------------------------------------------------------
+
+The same store, seam and reporting, over one OpenCode `info` blob instead of a
+transcript. The projection itself is `usage-opencode.test.ts`'s subject; what is
+driven here is the command around it — the harness literal it owns, the one
+record a payload becomes, and the ADR-0016 paths it shares with the Claude
+command but must reach through its own entry point.
+*/
+
+/* eslint-disable @typescript-eslint/naming-convention -- the OpenCode message's own field names, the same exception `usage-opencode.test.ts` makes. */
+function opencodeMessage(overrides: Record<string, unknown> = {}): string {
+	return JSON.stringify({
+		role: 'assistant',
+		time: {created: 1_755_500_000_000, completed: 1_755_500_001_000},
+		modelID: 'kimi-k2.7-code',
+		path: {cwd: '/projects/site', root: '/projects/site'},
+		cost: 0.42,
+		tokens: {
+			input: 100,
+			output: 50,
+			reasoning: 10,
+			cache: {read: 20, write: 5},
+		},
+		...overrides,
+	});
+}
+/* eslint-enable @typescript-eslint/naming-convention */
+
+async function runOpencode(
+	input: unknown,
+	{
+		config = CONFIG,
+		store = new FakeUsageStore(),
+		pusher = new FakeUsagePusher(),
+	}: {
+		readonly config?: Config;
+		readonly store?: FakeUsageStore;
+		readonly pusher?: FakeUsagePusher;
+	} = {},
+): Promise<UsageRun> {
+	const written: string[] = [];
+	let pusherBuilt = 0;
+
+	await runRecordOpencode({
+		config,
+		stdin: async () =>
+			typeof input === 'string' ? input : JSON.stringify(input),
+		stderr(message) {
+			written.push(message);
+		},
+		createUsageStore: () => store,
+		createUsagePusher(backlog, onAttempt) {
+			pusherBuilt += 1;
+			pusher.attach(onAttempt, backlog);
+			return pusher;
+		},
+	});
+
+	return {store, pusher, written, pusherBuilt};
+}
+
+/*
+The demoable path: one Shim payload in, one OpenCode-attributed record out. The
+Harness literal is the command's, not the payload's — OpenCode's message carries
+no harness field.
+*/
+test('one OpenCode message is projected, Ingested and reported Recorded.', async t => {
+	const {store, pusher, written, pusherBuilt} =
+		await runOpencode(opencodeMessage());
+
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.harness, 'OpenCode');
+	t.is(store.records[0]?.model, 'kimi-k2.7-code');
+	t.is(store.records[0]?.cwd, '/projects/site');
+	t.is(store.records[0]?.prompt_tokens, 135, 'reasoning bills as miss-input');
+	t.is(store.records[0]?.prompt_cache_hit_tokens, 20);
+	t.is(store.records[0]?.prompt_cache_miss_tokens, 115);
+	t.is(store.records[0]?.completion_tokens, 50);
+	t.is(store.records[0]?.total_tokens, 185, 'prompt + completion');
+	t.is(
+		store.records[0]?.recordedAt.getTime(),
+		1_755_500_000_000,
+		'time.created, not the completed instant the Shim fires at',
+	);
+	t.deepEqual(written, ['Recorded.']);
+	t.is(pusherBuilt, 1);
+	t.is(pusher.drains, 1, 'the invocation touches the Backlog');
+	t.is(store.closes, 1);
+});
+
+test('the same OpenCode message again is Duplicate., and still drains', async t => {
+	const store = new FakeUsageStore();
+
+	await runOpencode(opencodeMessage(), {store});
+	const second = await runOpencode(opencodeMessage(), {store});
+
+	t.deepEqual(second.written, ['Duplicate.']);
+	t.is(second.store.records.length, 1);
+	t.is(second.pusher.drains, 1);
+});
+
+/*
+The no-token skip: an aborted generation is a no-op run, not a zero-cost record
+— and the Backlog it may carry is still drained, as on every record-command
+invocation.
+*/
+test('a message with no tokens is a no-op run that still drains', async t => {
+	const {store, written, pusher} = await runOpencode(
+		opencodeMessage({tokens: {}}),
+	);
+
+	t.deepEqual(store.records, []);
+	t.deepEqual(written, []);
+	t.is(pusher.drains, 1);
+});
+
+test('an unreadable OpenCode payload is a stderr line, and still drains', async t => {
+	const {store, written, pusher} = await runOpencode('not json');
+
+	t.deepEqual(store.records, []);
+	t.regex(written[0] ?? '', /Could not read the OpenCode input/v);
+	t.is(pusher.drains, 1);
 });
