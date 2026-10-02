@@ -35,6 +35,18 @@ Both faces are synchronous, because `node:sqlite` has no promise in it, so the h
 during render with no loading state to draw. The Push is the one seam here that really does wait
 — `Pusher.drain()` is async because a round trip to Atlas is.
 
+**Beside the era family sits the Usage Record family, written through an Ingest face.** A
+Usage Record is Ingested from a coding Harness — priced once at its own `recorded_at` and never
+recomputed (ADR-0014) — and the face is **classify then insert**: `duplicatesExisting(record)`
+is its SELECT half and `ingest(record)` its write, which drops a record whose fingerprint —
+the model plus the five token buckets, within ±5s of the record's own instant — is already
+stored rather than overwriting it (ADR-0013). The columns are named as the wire fields, so the
+Push seam maps a stored row to a document without renaming. The family has its own backlog
+query beside the era one: `usageBacklog()` is `pushed_at IS NULL` ordered by oldest
+`recorded_at` first with the rowid breaking ties, and `markUsagePushed(id, at)` acknowledges
+one. The file is schema version 2; a version-1 store migrates in place, inside the one migrate
+transaction, and `busy_timeout` is set so a hook process and a dashboard run can share it.
+
 **Opening the store is the one thing in a run that fails fast** — in `main.tsx`, before the
 preflight and before anything is drawn, because the Local Store is the only write a Flush is
 required to reach. The Pusher built over it is the opposite case: a run carries on when Atlas is

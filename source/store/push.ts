@@ -17,7 +17,7 @@ lies about that cannot catch a Pusher that forgets to await.
 */
 
 import {MongoClient} from 'mongodb';
-import {type Config} from './config.js';
+import {type Config, requireMongoUri} from './config.js';
 import {type Era} from './local-store.js';
 
 /*
@@ -204,10 +204,12 @@ Pushes the Push Backlog to MongoDB.
 
 Single-flight: a Drain asked for while one is running joins it rather than
 starting a second, so a hanging Atlas costs one attempt in flight however many
-Flushes land behind it. Never throws — every way it can fail, a write or a store
-that will not answer, is caught and reported through `onAttempt`, because a Drain
-is fired from a Flush path that must not be brought down by a network the
-website's copy depends on.
+Flushes land behind it. No Drain throws — every way one can fail, a write or a
+store that will not answer, is caught and reported through `onAttempt`, because a
+Drain is fired from a Flush path that must not be brought down by a network the
+website's copy depends on. Construction is the exception: a Pusher built with no
+`MONGO_URI` throws a `ConfigError` (`requireMongoUri`), which is how a dashboard
+or `collect` run refuses to start without one (ADR-0016).
 */
 export class Pusher {
 	readonly #config: Config;
@@ -229,7 +231,7 @@ export class Pusher {
 			database,
 			logger = console,
 			onAttempt,
-			createClient = () => new MongoClient(config.mongoUri),
+			createClient = () => new MongoClient(requireMongoUri(config)),
 		}: PusherOptions = {},
 	) {
 		this.#config = config;

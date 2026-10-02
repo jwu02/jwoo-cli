@@ -17,10 +17,22 @@ export class ConfigError extends Error {
 }
 
 export type Config = {
-	readonly mongoUri: string;
+	/*
+	Optional, because the CLI's two faces disagree about needing it. A dashboard
+	or `collect` run Pushes and cannot start without it — `requireMongoUri` is
+	where that refusal lives — while a Usage Record Ingests to the Local Store
+	whether or not Atlas is reachable (ADR-0012, ADR-0016).
+	*/
+	readonly mongoUri: string | undefined;
 	readonly dbName: string;
 	readonly collectionName: string;
 	readonly heatmapCollectionName: string;
+	/*
+	Where Usage Records Push to, beside the telemetry and heatmap collections.
+	Named for the website's own `ai_usage` collection, so no website change is
+	needed for the write path to move to this CLI (spec #53).
+	*/
+	readonly aiUsageCollectionName: string;
 	readonly flushIntervalSeconds: number;
 	readonly mouseDpi: number;
 	readonly collectionTtlSeconds: number;
@@ -77,16 +89,12 @@ function positiveInteger(
 }
 
 export function loadConfig(env: Environment = process.env): Config {
-	const mongoUri = env['MONGO_URI'];
-	if (mongoUri === undefined || mongoUri === '') {
-		throw new ConfigError('Missing MONGO_URI in environment');
-	}
-
 	return {
-		mongoUri,
+		mongoUri: mongoUriFrom(env),
 		dbName: env['ACTIVITY_DB_NAME'] ?? 'activity-telemetry',
 		collectionName: 'telemetry',
 		heatmapCollectionName: 'keyboard_heatmap',
+		aiUsageCollectionName: 'ai_usage',
 		flushIntervalSeconds: positiveInteger(
 			env['FLUSH_INTERVAL_SECONDS'],
 			300,
@@ -98,6 +106,31 @@ export function loadConfig(env: Environment = process.env): Config {
 		timeZone: resolveTimeZone(env),
 		localStorePath: resolveLocalStorePath(env),
 	};
+}
+
+/*
+The URI, or `undefined` when it is unset. Empty counts as unset, the rule
+`LOCAL_STORE_PATH` already follows: `MONGO_URI=` in a shell profile is a mistake
+rather than an instruction to connect to nothing.
+*/
+function mongoUriFrom(env: Environment): string | undefined {
+	const declared = env['MONGO_URI'];
+
+	return declared === undefined || declared === '' ? undefined : declared;
+}
+
+/*
+The URI a pushing run must have, asserted at the seam that needs it rather than
+in the loader — so a usage path, which tolerates its absence, can call
+`loadConfig` without tripping this. The message is the loader's old one, so a
+run refused for a missing `MONGO_URI` still reads exactly as it did.
+*/
+export function requireMongoUri(config: Config): string {
+	if (config.mongoUri === undefined) {
+		throw new ConfigError('Missing MONGO_URI in environment');
+	}
+
+	return config.mongoUri;
 }
 
 /*

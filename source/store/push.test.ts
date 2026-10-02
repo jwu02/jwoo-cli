@@ -1,6 +1,6 @@
 import test from 'ava';
 import {type MongoClient} from 'mongodb';
-import {type Config} from './config.js';
+import {ConfigError, type Config} from './config.js';
 import {type Era} from './local-store.js';
 import {
 	type Collection,
@@ -206,6 +206,7 @@ const config: Config = {
 	dbName: 'test',
 	collectionName: 'telemetry',
 	heatmapCollectionName: 'keyboard_heatmap',
+	aiUsageCollectionName: 'ai_usage',
 	flushIntervalSeconds: 300,
 	mouseDpi: 72,
 	collectionTtlSeconds: 31_536_000,
@@ -734,6 +735,22 @@ test('without an injected database the Pusher builds one from MongoClient', asyn
 
 	await pusher.drain();
 	t.is(database.collection('telemetry').documents.length, 1);
+});
+
+/*
+`mongoUri` is optional in Config because the usage paths tolerate its absence
+(ADR-0016), so the refusal moves here, to the seam that actually needs it. This
+is what makes a dashboard or `collect` run refuse to start without a URI — both
+build a Pusher — with the loader's old message. Throws before `MongoClient` is
+constructed, so nothing reaches the network.
+*/
+test('a Pusher with no MONGO_URI refuses to start', t => {
+	const error = t.throws(
+		() => new Pusher({...config, mongoUri: undefined}, new FakeBacklog([])),
+		{instanceOf: ConfigError},
+	);
+
+	t.regex(error.message, /MONGO_URI/v);
 });
 
 test('close() closes a client the Pusher owns, and twice is survivable', async t => {

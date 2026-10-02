@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/naming-convention -- environment variable names are SCREAMING_SNAKE_CASE by definition. */
 import {isAbsolute} from 'node:path';
 import test from 'ava';
-import {ConfigError, loadConfig} from './config.js';
+import {ConfigError, loadConfig, requireMongoUri} from './config.js';
 import {isValidTimeZone} from './local-time.js';
 
 /*
@@ -20,6 +20,7 @@ test('loadConfig reads env and applies defaults', t => {
 	t.is(config.dbName, 'activity-telemetry');
 	t.is(config.collectionName, 'telemetry');
 	t.is(config.heatmapCollectionName, 'keyboard_heatmap');
+	t.is(config.aiUsageCollectionName, 'ai_usage');
 	t.is(config.flushIntervalSeconds, 300);
 	t.is(config.mouseDpi, 72);
 	t.is(config.collectionTtlSeconds, 31_536_000);
@@ -101,14 +102,27 @@ test('loadConfig treats an empty LOCAL_STORE_PATH as unset', t => {
 	t.is(loadConfig(env({LOCAL_STORE_PATH: ''})).localStorePath, fallback);
 });
 
-test('loadConfig throws a ConfigError when MONGO_URI is missing', t => {
-	const error = t.throws(() => loadConfig({}), {instanceOf: ConfigError});
-
-	t.regex(error.message, /MONGO_URI/v);
+/*
+Missing is not an error at load time any more. A usage Ingest must land whether
+or not Atlas is reachable (ADR-0012, ADR-0016), so the loader tolerates absence
+and the seam that actually Pushes is where the refusal lives — see
+`requireMongoUri`. Empty counts as unset, the rule `LOCAL_STORE_PATH` follows.
+*/
+test('loadConfig leaves mongoUri undefined when MONGO_URI is missing or empty', t => {
+	t.is(loadConfig({}).mongoUri, undefined);
+	t.is(loadConfig({MONGO_URI: ''}).mongoUri, undefined);
 });
 
-test('loadConfig throws a ConfigError when MONGO_URI is empty', t => {
-	t.throws(() => loadConfig({MONGO_URI: ''}), {instanceOf: ConfigError});
+test('requireMongoUri returns the URI when present and refuses when absent', t => {
+	const config = loadConfig(env());
+	t.is(requireMongoUri(config), 'mongodb://localhost/test');
+
+	// The dashboard and `collect` build a Pusher, so this is where they refuse
+	// to start — with the loader's old message, so the UX is unchanged.
+	const error = t.throws(() => requireMongoUri(loadConfig({})), {
+		instanceOf: ConfigError,
+	});
+	t.regex(error.message, /MONGO_URI/v);
 });
 
 /*

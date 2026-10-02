@@ -20,10 +20,12 @@ import {type Config} from './config.js';
 import {instantFromLocalFields, type LocalFields} from './local-time.js';
 import {
 	type HistoryData,
+	type IngestResult,
 	LocalStore,
 	type LoadResult,
 	type ReadWarning,
 	type TimeSeriesPoint,
+	type UsageRecord,
 } from './local-store.js';
 import {type Range} from './ranges.js';
 
@@ -35,6 +37,7 @@ function configAt(localStorePath: string, timeZone = ZONE): Config {
 		dbName: 'test',
 		collectionName: 'telemetry',
 		heatmapCollectionName: 'keyboard_heatmap',
+		aiUsageCollectionName: 'ai_usage',
 		flushIntervalSeconds: 300,
 		mouseDpi: 72,
 		collectionTtlSeconds: 31_536_000,
@@ -765,29 +768,41 @@ test('a file this CLI did not write fails at open', t => {
 test('a file from a newer CLI fails at open', t => {
 	const path = storePath(t);
 	const db = new DatabaseSync(path);
-	db.exec('PRAGMA user_version = 2');
+	db.exec('PRAGMA user_version = 3');
 	db.close();
 
 	t.throws(() => new LocalStore(configAt(path)), {
-		message: /schema version 2/v,
+		message: /schema version 3/v,
 	});
 });
 
 test('a file whose version lies about its tables fails at open', t => {
 	const path = storePath(t);
 	const db = new DatabaseSync(path);
-	// The version this CLI writes, and none of the tables it writes it with, so
-	// `migrate` has no reason to look further and the schema is never created.
+	// A version the CLI knows and none of the tables it writes that version with.
 	db.exec('PRAGMA user_version = 1');
 	db.close();
 
-	// The failure is the prepared statement that names `eras`, not `migrate` —
-	// and it still has to arrive as the store's error rather than as a bare
-	// "no such table" from three frames down. A file is no more openable for
-	// having lied about its version.
+	// The failure is the drift guard's own "no such table", and it still has to
+	// arrive as the store's error rather than as a bare one from three frames
+	// down. A file is no more openable for having lied about its version.
 	t.throws(() => new LocalStore(configAt(path)), {
 		message: /Could not open the Local Store at .*no such table/v,
 	});
+
+	/*
+	And it is left exactly as it was. The probe runs inside the migration
+	transaction, so a version-1 file with no era family is refused instead of
+	being half-migrated to version 2 with a usage table and no eras — which
+	would be a file this CLI could then never open again.
+	*/
+	t.is(
+		query(path, 'SELECT user_version FROM pragma_user_version')[0]?.[
+			'user_version'
+		],
+		1,
+	);
+	t.deepEqual(query(path, 'SELECT name FROM sqlite_master'), []);
 });
 
 test('the store creates the directory its file lives in', t => {
@@ -818,4 +833,361 @@ test('closing twice is survivable', t => {
 	t.notThrows(() => {
 		store.close();
 	});
+});
+
+/*
+The second family: Usage Records Ingested through the store's own face, tested
+on a real file for the reason the era tests are — durability is the one thing a
+fake of SQLite cannot stand in for.
+*/
+
+/*
+One Usage Record as a Harness would hand it over. The buckets are chosen so a
+price is exact: `kimi-k2.5` is flat (miss 4, hit 0.7, out 21), and 500 fresh +
+300 miss + 200 hit + 100 out is 0.00544 CNY.
+*/
+function usageRecord(overrides: Partial<UsageRecord> = {}): UsageRecord {
+	return {
+		harness: 'Claude Code',
+		recordedAt: new Date(1_000_000),
+		prompt_tokens: 1000,
+		completion_tokens: 100,
+		total_tokens: 1100,
+		prompt_cache_hit_tokens: 200,
+		prompt_cache_miss_tokens: 300,
+		...overrides,
+	};
+}
+
+function idOf(result: IngestResult): number {
+	if (result.status !== 'ingested') {
+		throw new Error('expected an ingested record');
+	}
+
+	return result.id;
+}
+
+test('an Ingest writes one usage row, priced from its own tokens', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	const result = store.ingest(
+		usageRecord({model: 'kimi-k2.5', recordedAt: new Date(1_000_000)}),
+	);
+	store.close();
+
+	t.deepEqual(result, {status: 'ingested', id: 1, costYuan: 0.00544});
+	t.deepEqual(query(path, 'SELECT * FROM usage_records'), [
+		{
+			id: 1,
+			recorded_at: 1_000_000,
+			harness: 'Claude Code',
+			// No caller-supplied cwd or model: both nullable columns, both NULL.
+			cwd: null,
+			model: 'kimi-k2.5',
+			cost_yuan: 0.00544,
+			prompt_tokens: 1000,
+			completion_tokens: 100,
+			total_tokens: 1100,
+			prompt_cache_hit_tokens: 200,
+			prompt_cache_miss_tokens: 300,
+			// NULL until a Push acknowledges the record.
+			pushed_at: null,
+		},
+	]);
+});
+
+test('a caller cannot supply a cost: the model is canonicalized and priced here', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	// A relay id the alias table maps to a priced name. The alias is an identity
+	// mechanism as well as a pricing one: the canonical name is what is stored
+	// and what the fingerprint carries (ADR-0013, ADR-0015).
+	const result = store.ingest(usageRecord({model: 'deepseek/deepseek-flash'}));
+	store.close();
+
+	t.is(result.status, 'ingested');
+	t.is(
+		query(path, 'SELECT model FROM usage_records')[0]?.['model'],
+		'deepseek-v4.1-flash',
+	);
+	// Priced rather than Unpriced, which is the whole point of the alias.
+	t.not(
+		query(path, 'SELECT cost_yuan FROM usage_records')[0]?.['cost_yuan'],
+		null,
+	);
+});
+
+test("an Ingest prices at the record's own instant, peak or off-peak", t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	const buckets = {
+		prompt_tokens: 1000,
+		completion_tokens: 100,
+		prompt_cache_hit_tokens: 200,
+		prompt_cache_miss_tokens: 300,
+	} as const;
+
+	// 01:00Z is 09:00 Beijing, the peak window opening; 12:00Z is 20:00 Beijing,
+	// off-peak, and the same record prices at half. A wall clock at Ingest would
+	// price both the same.
+	const peak = store.ingest(
+		usageRecord({
+			model: 'deepseek-v4-flash',
+			recordedAt: new Date('2026-01-01T01:00:00.000Z'),
+			...buckets,
+		}),
+	);
+	const offpeak = store.ingest(
+		usageRecord({
+			model: 'deepseek-v4-flash',
+			recordedAt: new Date('2026-01-01T12:00:00.000Z'),
+			...buckets,
+		}),
+	);
+	store.close();
+
+	// Peak is exactly double off-peak for this model, and the two records differ
+	// only in their instant.
+	t.deepEqual(peak, {status: 'ingested', id: 1, costYuan: 0.00332});
+	t.deepEqual(offpeak, {status: 'ingested', id: 2, costYuan: 0.00166});
+});
+
+test('an Unpriced model still Ingests, with a null cost', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	const result = store.ingest(usageRecord({model: 'mystery-1'}));
+	store.close();
+
+	// Unpriced is the accepted state, not a defect: the record lands, its cost is
+	// the marker (ADR-0015).
+	t.deepEqual(result, {status: 'ingested', id: 1, costYuan: undefined});
+	t.is(
+		query(path, 'SELECT cost_yuan FROM usage_records')[0]?.['cost_yuan'],
+		null,
+	);
+});
+
+test("a re-Ingest inside the window drops, leaving the first writer's row", t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	const first = store.ingest(
+		usageRecord({
+			model: 'kimi-k2.5',
+			recordedAt: new Date(1_000_000),
+			cwd: '/first',
+		}),
+	);
+	/*
+	A different Harness and cwd, one second later, same model and buckets. The
+	fingerprint excludes both — two Harnesses producing identical counts within
+	the window collapse into one record — which is the accepted ceiling ADR-0013
+	marks (and the code comment beside the comparison repeats).
+	*/
+	const second = store.ingest(
+		usageRecord({
+			model: 'kimi-k2.5',
+			recordedAt: new Date(1_001_000),
+			cwd: '/second',
+			harness: 'OpenCode',
+		}),
+	);
+	store.close();
+
+	t.is(first.status, 'ingested');
+	t.deepEqual(second, {status: 'duplicate'});
+
+	// Dropped, not overwritten: the row is the first writer's, cwd and harness
+	// and all (ADR-0013).
+	t.deepEqual(query(path, 'SELECT cwd, harness FROM usage_records'), [
+		{cwd: '/first', harness: 'Claude Code'},
+	]);
+});
+
+test('the dedup window is symmetric and closed at five seconds', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+	const at = 1_000_000;
+	store.ingest(usageRecord({model: 'kimi-k2.5', recordedAt: new Date(at)}));
+
+	const isDuplicateAt = (offset: number) =>
+		store.duplicatesExisting(
+			usageRecord({model: 'kimi-k2.5', recordedAt: new Date(at + offset)}),
+		);
+
+	t.true(isDuplicateAt(5000));
+	t.true(isDuplicateAt(-5000));
+	t.false(isDuplicateAt(5001));
+	t.false(isDuplicateAt(-5001));
+	store.close();
+});
+
+test('a differing bucket or model is a different record, not a duplicate', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+	store.ingest(usageRecord({model: 'kimi-k2.5'}));
+
+	t.false(
+		store.duplicatesExisting(
+			usageRecord({model: 'kimi-k2.5', completion_tokens: 101}),
+		),
+	);
+	t.false(store.duplicatesExisting(usageRecord({model: 'kimi-k2.6'})));
+	store.close();
+});
+
+test('the classify face writes nothing', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	t.false(store.duplicatesExisting(usageRecord()));
+	store.close();
+
+	// The SELECT half of Ingest, which is what makes it safe for `--dry-run`.
+	t.is(query(path, 'SELECT * FROM usage_records').length, 0);
+});
+
+test('the Usage Backlog is every unacknowledged record, oldest recorded_at first', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	/*
+	Inserted out of order, and two at the same instant, so the order is the
+	query's rather than insertion's: oldest `recorded_at`, rowid breaking ties.
+	The differing completion counts keep the four fingerprints distinct.
+	*/
+	const late = store.ingest(
+		usageRecord({recordedAt: new Date(3_000_000), completion_tokens: 1}),
+	);
+	const early = store.ingest(
+		usageRecord({recordedAt: new Date(1_000_000), completion_tokens: 2}),
+	);
+	const tieA = store.ingest(
+		usageRecord({recordedAt: new Date(2_000_000), completion_tokens: 3}),
+	);
+	const tieB = store.ingest(
+		usageRecord({recordedAt: new Date(2_000_000), completion_tokens: 4}),
+	);
+
+	const backlog = store.usageBacklog();
+	store.close();
+
+	t.deepEqual(
+		backlog.map(record => record.id),
+		[idOf(early), idOf(tieA), idOf(tieB), idOf(late)],
+	);
+	// Whole records: the Push builds the wire documents from these.
+	t.deepEqual(backlog[0], {
+		id: idOf(early),
+		recordedAt: new Date(1_000_000),
+		harness: 'Claude Code',
+		cwd: undefined,
+		model: undefined,
+		costYuan: undefined,
+		prompt_tokens: 1000,
+		completion_tokens: 2,
+		total_tokens: 1100,
+		prompt_cache_hit_tokens: 200,
+		prompt_cache_miss_tokens: 300,
+	});
+});
+
+test('an acknowledgement takes a record out of the Usage Backlog', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	const first = store.ingest(
+		usageRecord({recordedAt: new Date(1_000_000), completion_tokens: 1}),
+	);
+	const middle = store.ingest(
+		usageRecord({recordedAt: new Date(2_000_000), completion_tokens: 2}),
+	);
+	const last = store.ingest(
+		usageRecord({recordedAt: new Date(3_000_000), completion_tokens: 3}),
+	);
+
+	store.markUsagePushed(idOf(middle), new Date(4_000_000));
+
+	// An id the store never handed out acknowledges nothing, which is the right
+	// answer for a Pusher that somehow names one.
+	t.notThrows(() => {
+		store.markUsagePushed(999, new Date(4_000_000));
+	});
+
+	const remaining = store.usageBacklog().map(record => record.id);
+	store.close();
+
+	t.deepEqual(remaining, [idOf(first), idOf(last)]);
+	t.is(
+		query(
+			path,
+			`SELECT pushed_at FROM usage_records WHERE id = ${idOf(middle)}`,
+		)[0]?.['pushed_at'],
+		4_000_000,
+	);
+});
+
+test('a v1 store is migrated in place, keeping the era family', t => {
+	const path = storePath(t);
+	const db = new DatabaseSync(path);
+	/*
+	The version-1 schema, written out as history rather than imported: this is
+	the file a user has on disk from the CLI that wrote version 1, and the
+	migration has to meet it as it is.
+	*/
+	db.exec(`
+		CREATE TABLE eras (
+			stamp           INTEGER PRIMARY KEY NOT NULL,
+			left_clicks     INTEGER NOT NULL,
+			right_clicks    INTEGER NOT NULL,
+			movement_meters REAL    NOT NULL,
+			press_total     INTEGER NOT NULL,
+			pushed_at       INTEGER
+		);
+		CREATE TABLE era_key_counts (
+			era_stamp INTEGER NOT NULL REFERENCES eras(stamp),
+			label     TEXT    NOT NULL,
+			count     INTEGER NOT NULL,
+			PRIMARY KEY (era_stamp, label)
+		);
+		INSERT INTO eras VALUES (1000, 1, 2, 0.5, 3, NULL);
+		INSERT INTO era_key_counts VALUES (1000, 'A', 3);
+		PRAGMA user_version = 1;
+	`);
+	db.close();
+
+	const store = new LocalStore(configAt(path));
+	const result = store.ingest(usageRecord({recordedAt: new Date(1_000_000)}));
+	const backlog = store.usageBacklog();
+	store.close();
+
+	// The usage family exists now, and the store is at the version this CLI
+	// writes.
+	t.is(result.status, 'ingested');
+	t.is(backlog.length, 1);
+	t.is(
+		query(path, 'SELECT user_version FROM pragma_user_version')[0]?.[
+			'user_version'
+		],
+		2,
+	);
+
+	// The era family is exactly as it was: nothing aged out and nothing moved.
+	t.deepEqual(query(path, 'SELECT * FROM eras'), [
+		{
+			stamp: 1000,
+			left_clicks: 1,
+			right_clicks: 2,
+			movement_meters: 0.5,
+			press_total: 3,
+			pushed_at: null,
+		},
+	]);
+	t.deepEqual(query(path, 'SELECT * FROM era_key_counts'), [
+		{era_stamp: 1000, label: 'A', count: 3},
+	]);
 });

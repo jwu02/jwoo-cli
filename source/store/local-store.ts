@@ -23,6 +23,7 @@ import {dirname} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {type Snapshot} from '../state.js';
 import {type Config} from './config.js';
+import {canonicalModelName, computeCostYuan} from './pricing.js';
 import {bucketBoundaries, type Range} from './ranges.js';
 
 /*
@@ -54,6 +55,24 @@ function stringAt(row: Row, column: string): string {
 }
 
 /*
+A nullable TEXT column: the string, or `undefined` for the driver's NULL. Unlike
+`stringAt` it does not stringify, because `undefined` and `'undefined'` are very
+different answers for a column whose whole contract is that it may be absent.
+*/
+function optionalStringAt(row: Row, column: string): string | undefined {
+	const value = row[column];
+	return typeof value === 'string' ? value : undefined;
+}
+
+/*
+The dedup window, in milliseconds: a record whose model and five token buckets
+match one already stored within this distance of its own `recorded_at` is the
+same point event arriving again (ADR-0013). Symmetric and inclusive, the window
+`ai-usage/usage-lib.mjs` always used.
+*/
+const DEDUP_WINDOW_MS = 5000;
+
+/*
 An error's own sentence, which is worth showing: "file is not a database" tells
 the user more than "something went wrong".
 
@@ -70,13 +89,22 @@ One transaction, so that a write which fails partway leaves nothing behind. A
 rollback that fails is swallowed on purpose: if the transaction never opened —
 a closed database, say — there is nothing to undo, and SQLite's "no transaction
 is active" would replace the error that actually went wrong.
+
+`IMMEDIATE` takes the write lock at `BEGIN` rather than at the first write, which
+is what lets Ingest hold the lock across a read *and* a write — see `ingest`. The
+default is `DEFERRED`, what a write that is the whole transaction wants.
 */
-function inTransaction(db: DatabaseSync, work: () => void): void {
-	db.exec('BEGIN');
+function inTransaction<T>(
+	db: DatabaseSync,
+	work: () => T,
+	mode: 'DEFERRED' | 'IMMEDIATE' = 'DEFERRED',
+): T {
+	db.exec(`BEGIN ${mode}`);
 
 	try {
-		work();
+		const value = work();
 		db.exec('COMMIT');
+		return value;
 	} catch (error) {
 		try {
 			db.exec('ROLLBACK');
@@ -88,10 +116,10 @@ function inTransaction(db: DatabaseSync, work: () => void): void {
 	}
 }
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 /*
-The schema models the **era**, not the wire.
+The era family: the schema models the **era**, not the wire.
 
 `stamp` is the primary key, and that is what makes a Flush idempotent: a retry
 under the same stamp replaces its row rather than adding a second one beside it
@@ -106,7 +134,7 @@ step with this one.
 Nothing ages out. This is the record of every era this machine has Flushed;
 MongoDB's TTL indexes remain MongoDB's.
 */
-const SCHEMA = `
+const ERA_SCHEMA = `
 CREATE TABLE eras (
 	stamp           INTEGER PRIMARY KEY NOT NULL,
 	left_clicks     INTEGER NOT NULL,
@@ -125,13 +153,57 @@ CREATE TABLE era_key_counts (
 `;
 
 /*
+The Usage Record family, added at version 2.
+
+Its columns are named exactly as the wire fields, so the Push seam maps a stored
+row to a document without renaming. `id` is the implicit rowid and nothing more:
+a point event has no natural stamp, so there is no content-derived local key and
+none of the era's outstanding-stamp machinery. `cost_yuan` is priced once at
+Ingest and never recomputed (ADR-0014); NULL is the Unpriced marker (ADR-0015).
+
+This table carries no `IF NOT EXISTS`, for the era schema's reason: a file this
+module did not make is a file it cannot safely write to. It is created only when
+the version says it is absent, so the guard is the version itself.
+*/
+const USAGE_SCHEMA = `
+CREATE TABLE usage_records (
+	id                       INTEGER PRIMARY KEY,
+	recorded_at              INTEGER NOT NULL,
+	harness                  TEXT    NOT NULL,
+	cwd                      TEXT,
+	model                    TEXT,
+	cost_yuan                REAL,
+	prompt_tokens            INTEGER NOT NULL,
+	completion_tokens        INTEGER NOT NULL,
+	total_tokens             INTEGER NOT NULL,
+	prompt_cache_hit_tokens  INTEGER NOT NULL,
+	prompt_cache_miss_tokens INTEGER NOT NULL,
+	pushed_at                INTEGER
+);
+
+CREATE INDEX usage_records_fingerprint ON usage_records (
+	model,
+	prompt_tokens,
+	completion_tokens,
+	total_tokens,
+	prompt_cache_hit_tokens,
+	prompt_cache_miss_tokens,
+	recorded_at
+);
+`;
+
+/*
 The file's schema version, and the drift guard beside it.
 
 A store this CLI has never written to reports `user_version` 0 — and so does an
-empty file and a foreign one — so the schema is created *without* `IF NOT
+empty file and a foreign one — so each family is created *without* `IF NOT
 EXISTS`. A table of that name already present is an error rather than something
 to build around, because a file that already has an `eras` table this module did
 not make is not a file this module can safely write to.
+
+The step from version 1 to 2 is additive — the era family is untouched, and the
+usage family is created beside it — so the whole migration is one transaction
+and an existing store upgrades in place.
 */
 function migrate(db: DatabaseSync): void {
 	const version = numberAt(
@@ -143,14 +215,31 @@ function migrate(db: DatabaseSync): void {
 		return;
 	}
 
-	if (version !== 0) {
+	if (version > SCHEMA_VERSION) {
 		throw new Error(
 			`the file is schema version ${version}, and this CLI writes version ${SCHEMA_VERSION}`,
 		);
 	}
 
 	inTransaction(db, () => {
-		db.exec(SCHEMA);
+		if (version < 1) {
+			db.exec(ERA_SCHEMA);
+		} else if (version < 2) {
+			/*
+			A file at version 1 says the era family is here, so one without it is
+			not a file this CLI wrote — the drift the missing `IF NOT EXISTS`
+			catches for a fresh file. Probe inside the transaction, so the write
+			lock is held and the failure rolls back rather than leaving a
+			half-migrated file behind. SQLite's own "no such table" is the report,
+			exactly as it is when a prepared statement names a table that is gone.
+			*/
+			db.prepare('SELECT 1 FROM eras').get();
+		}
+
+		if (version < 2) {
+			db.exec(USAGE_SCHEMA);
+		}
+
 		db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 	});
 }
@@ -177,6 +266,11 @@ function openDatabase(path: string): DatabaseSync {
 	// WAL, so the write's fsync lands in the log rather than in the file the
 	// frame is being drawn from.
 	db.exec('PRAGMA journal_mode = WAL');
+	// A hook process and a dashboard run can write this one file at once — Stop
+	// and SubagentStop may even fire together — so a writer waits for the lock
+	// rather than failing on the first collision. Every write here is a handful
+	// of rows, so a second is already generous.
+	db.exec('PRAGMA busy_timeout = 1000');
 	migrate(db);
 	return db;
 }
@@ -204,6 +298,56 @@ export type Era = {
 	readonly pressTotal: number;
 	readonly keyCounts: Readonly<Record<string, number>>;
 };
+
+/*
+One Usage Record as a caller hands it to Ingest.
+
+The five token buckets keep the wire's own names, because they are the wire's —
+the columns are named as the fields, and `pricing.ts` already names them this
+way, so one spelling runs from the Harness through the store to the document.
+
+`costYuan` is deliberately absent. The face prices the record from its own
+tokens at its own `recordedAt` (ADR-0014); a caller that could supply a cost
+could supply one that contradicts them.
+
+`recordedAt` is a `Date` at this boundary and epoch milliseconds in the schema —
+the same split the era stamp makes.
+*/
+export type UsageRecord = {
+	readonly harness: string;
+	readonly cwd?: string | undefined;
+	readonly model?: string | undefined;
+	readonly recordedAt: Date;
+	readonly prompt_tokens: number;
+	readonly completion_tokens: number;
+	readonly total_tokens: number;
+	readonly prompt_cache_hit_tokens: number;
+	readonly prompt_cache_miss_tokens: number;
+};
+
+/*
+A stored Usage Record, as the Usage Backlog hands it out: the record that was
+Ingested, plus the id its row was written under and the cost the face priced for
+it — `undefined` when Unpriced.
+*/
+export type BackloggedUsage = UsageRecord & {
+	readonly id: number;
+	readonly costYuan: number | undefined;
+};
+
+/*
+What Ingest did: wrote the record, reporting the row it wrote and the cost it
+priced, or found the record already present and dropped it (ADR-0013). A
+duplicate is a reported outcome rather than an error — the two are told apart by
+the tag, and neither is a failure.
+*/
+export type IngestResult =
+	| {
+			readonly status: 'ingested';
+			readonly id: number;
+			readonly costYuan: number | undefined;
+	  }
+	| {readonly status: 'duplicate'};
 
 export type Totals = {
 	readonly leftClicks: number;
@@ -328,6 +472,10 @@ export class LocalStore implements HistorySource {
 	readonly #clearKeyCounts;
 	readonly #insertKeyCount;
 	readonly #markPushed;
+	readonly #classifyUsage;
+	readonly #insertUsage;
+	readonly #selectUsageBacklog;
+	readonly #markUsagePushed;
 
 	#closed = false;
 
@@ -427,6 +575,48 @@ export class LocalStore implements HistorySource {
 			);
 			this.#markPushed = prepare(
 				'UPDATE eras SET pushed_at = ? WHERE stamp = ?',
+			);
+
+			/*
+			The fingerprint compared in SQL, column by column, against the six
+			stored columns inside the ±5s window. `IS` rather than `=` so a NULL
+			model matches a NULL model, the way the fingerprint intends. The
+			`BETWEEN` bounds are inclusive, so the window is closed at ±5s.
+
+			`harness` and `cwd` are deliberately not among the columns: two
+			Harnesses producing identical model and token counts within the window
+			collapse into one record. That is the accepted ceiling ADR-0013 marks,
+			and it is here, at the comparison, rather than in the prose above.
+			*/
+			this.#classifyUsage = prepare(`
+				SELECT 1 AS found
+				FROM usage_records
+				WHERE model IS ?
+					AND prompt_tokens = ?
+					AND completion_tokens = ?
+					AND total_tokens = ?
+					AND prompt_cache_hit_tokens = ?
+					AND prompt_cache_miss_tokens = ?
+					AND recorded_at BETWEEN ? AND ?
+				LIMIT 1
+			`);
+			this.#insertUsage = prepare(`
+				INSERT INTO usage_records (
+					recorded_at, harness, cwd, model, cost_yuan,
+					prompt_tokens, completion_tokens, total_tokens,
+					prompt_cache_hit_tokens, prompt_cache_miss_tokens, pushed_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+			`);
+			this.#selectUsageBacklog = prepare(`
+				SELECT id, recorded_at, harness, cwd, model, cost_yuan,
+					prompt_tokens, completion_tokens, total_tokens,
+					prompt_cache_hit_tokens, prompt_cache_miss_tokens
+				FROM usage_records
+				WHERE pushed_at IS NULL
+				ORDER BY recorded_at, id
+			`);
+			this.#markUsagePushed = prepare(
+				'UPDATE usage_records SET pushed_at = ? WHERE id = ?',
 			);
 
 			/*
@@ -624,6 +814,132 @@ export class LocalStore implements HistorySource {
 	*/
 	markPushed(stamp: Date, at: Date): void {
 		this.#markPushed.run(at.getTime(), stamp.getTime());
+	}
+
+	/*
+	The SELECT half of Ingest: whether a record with this fingerprint — its
+	model, canonicalized, plus its five token buckets — is already stored within
+	±5s of its own `recorded_at`. It writes nothing, which is what lets a
+	Backfill's `--dry-run` classify every candidate against the real store
+	without touching it.
+
+	The comparison deliberately excludes `harness` and `cwd`. Two Harnesses that
+	produce identical model and token counts within the window collapse into one
+	record: the accepted ceiling ADR-0013 names, and the reason the fingerprint is
+	what it is. The known limit rides along — two identical candidates in one
+	scan both classify as new, since neither is stored yet; the real Ingest drops
+	the second.
+
+	The model is canonicalized before it is compared, so a relay id and the name
+	its alias maps to are the same record here — which is what makes the alias
+	table an identity mechanism and not only a pricing one (ADR-0013, ADR-0015).
+	*/
+	duplicatesExisting(record: UsageRecord): boolean {
+		const at = record.recordedAt.getTime();
+		const found = this.#classifyUsage.get(
+			canonicalModelName(record.model) ?? null,
+			record.prompt_tokens,
+			record.completion_tokens,
+			record.total_tokens,
+			record.prompt_cache_hit_tokens,
+			record.prompt_cache_miss_tokens,
+			at - DEDUP_WINDOW_MS,
+			at + DEDUP_WINDOW_MS,
+		);
+
+		return found !== undefined;
+	}
+
+	/*
+	The write face for Usage Records: classify, then insert. A duplicate is
+	dropped and reported rather than written over (ADR-0013), so the first
+	writer's row stands; anything else is INSERTed and its row id handed back.
+
+	Synchronous, and it throws on failure rather than answering with a value:
+	`node:sqlite` has no promise in it, and the command layer owns the error and
+	the exit-code contract (ADR-0016) — a hook command that must never fail its
+	agent catches this, it does not come back as a return value.
+
+	The cost is priced here, not supplied by the caller: the model is
+	canonicalized, then priced from the record's own tokens at the record's own
+	`recordedAt` (ADR-0014). A model the table does not cover stores a NULL cost
+	— Unpriced, still a record (ADR-0015) — and the result says so with
+	`costYuan` undefined.
+	*/
+	ingest(record: UsageRecord): IngestResult {
+		const model = canonicalModelName(record.model);
+		const costYuan = computeCostYuan(model, record, record.recordedAt);
+
+		/*
+		Classify and insert are one transaction, and `IMMEDIATE` so the write lock
+		is held from the start. Stop and SubagentStop fire near-simultaneously and
+		the dashboard may hold the file too, so without this two processes would
+		both read an empty window and both INSERT — the duplicate the drop rule
+		exists to prevent, written by the very concurrency `busy_timeout` was set
+		for. With the lock taken before the classify, the second writer waits and
+		then sees the first's committed row, and drops.
+		*/
+		return inTransaction(
+			this.#db,
+			(): IngestResult => {
+				if (this.duplicatesExisting(record)) {
+					return {status: 'duplicate'};
+				}
+
+				const {lastInsertRowid} = this.#insertUsage.run(
+					record.recordedAt.getTime(),
+					record.harness,
+					record.cwd ?? null,
+					model ?? null,
+					costYuan ?? null,
+					record.prompt_tokens,
+					record.completion_tokens,
+					record.total_tokens,
+					record.prompt_cache_hit_tokens,
+					record.prompt_cache_miss_tokens,
+				);
+
+				return {status: 'ingested', id: Number(lastInsertRowid), costYuan};
+			},
+			'IMMEDIATE',
+		);
+	}
+
+	/*
+	The Usage Backlog: every Ingested record no Push has acknowledged, oldest
+	`recorded_at` first and the rowid breaking ties, so the order is total and a
+	Drain walks a tail rather than a scatter of holes (ADR-0012).
+
+	Same idiom as the era backlog — the query is the backlog, not a second
+	structure to keep in step — and its own query because the two families order
+	by different keys: an era by its stamp, a record by `recorded_at`.
+	*/
+	usageBacklog(): readonly BackloggedUsage[] {
+		/* eslint-disable @typescript-eslint/naming-convention -- the five buckets keep the wire's column names. */
+		return this.#selectUsageBacklog.all().map(row => ({
+			id: numberAt(row, 'id'),
+			recordedAt: new Date(numberAt(row, 'recorded_at')),
+			harness: stringAt(row, 'harness'),
+			cwd: optionalStringAt(row, 'cwd'),
+			model: optionalStringAt(row, 'model'),
+			costYuan:
+				typeof row['cost_yuan'] === 'number' ? row['cost_yuan'] : undefined,
+			prompt_tokens: numberAt(row, 'prompt_tokens'),
+			completion_tokens: numberAt(row, 'completion_tokens'),
+			total_tokens: numberAt(row, 'total_tokens'),
+			prompt_cache_hit_tokens: numberAt(row, 'prompt_cache_hit_tokens'),
+			prompt_cache_miss_tokens: numberAt(row, 'prompt_cache_miss_tokens'),
+		}));
+		/* eslint-enable @typescript-eslint/naming-convention */
+	}
+
+	/*
+	An Ingested record leaves the Usage Backlog when a Push acknowledged it,
+	under the row id `ingest` handed out. An id this store never wrote updates
+	nothing, the right answer for a Pusher that names one.
+	*/
+	markUsagePushed(id: number, at: Date): void {
+		this.#markUsagePushed.run(at.getTime(), id);
 	}
 
 	/*

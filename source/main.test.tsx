@@ -52,6 +52,7 @@ const CONFIG: Config = {
 	dbName: 'test',
 	collectionName: 'telemetry',
 	heatmapCollectionName: 'keyboard_heatmap',
+	aiUsageCollectionName: 'ai_usage',
 	flushIntervalSeconds: 3600,
 	mouseDpi: 72,
 	collectionTtlSeconds: 1,
