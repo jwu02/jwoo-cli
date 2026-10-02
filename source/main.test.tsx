@@ -1,23 +1,33 @@
+import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import process from 'node:process';
-import test from 'ava';
+import test, {type ExecutionContext} from 'ava';
 import {type Config} from './store/config.js';
 import {
+	type BackloggedUsage,
 	type Era,
 	type HistoryData,
+	type IngestResult,
 	type LoadResult,
 	type ReadWarning,
 	type ReadWarningReporter,
 	type Totals,
+	type UsageRecord,
 } from './store/local-store.js';
 import {
 	type CollectorFactory,
 	type DashboardView,
 	type Logger,
+	type RecordClaudeHookOptions,
 	type RunOptions,
 	type RunStore,
 	runCollect,
 	runDashboard,
 	runPermissions,
+	runRecordClaudeHook,
+	type UsagePush,
+	type UsageStore,
 } from './main.js';
 import {type StreamProblem, type StreamSinks} from './capture/helper.js';
 import {KeyboardCollector} from './capture/keyboard.js';
@@ -26,6 +36,7 @@ import {
 	type PermissionSource,
 } from './capture/permissions.js';
 import {type PushAttempt, type PushBacklog} from './store/push.js';
+import {type UsagePushBacklog} from './store/usage-push.js';
 import {
 	type HelperError,
 	keyEventAt,
@@ -2012,3 +2023,624 @@ function data(): HistoryData {
 		timeSeries: [],
 	};
 }
+
+/*
+`usage record-claude-hook`, and the three things it reaches outside itself for
+------------------------------------------------------------------------------
+
+The store's usage faces, the Usage Push seam, and the transcript. The transcript
+is a real file in a temp directory rather than a fake: the walk's own subject is
+`usage-transcript.test.ts`, and a stand-in for `readFileSync` would fake the one
+thing this command hands a path to.
+*/
+
+/*
+The store, standing in: Ingest, the Usage Backlog, and the close. It dedups by
+whole-record equality, which is what a re-walk of one transcript produces — the
+real store compares a fingerprint within ±5s, and what the command does with
+either answer is the same.
+*/
+class FakeUsageStore implements UsageStore {
+	readonly records: UsageRecord[] = [];
+	readonly waiting: BackloggedUsage[] = [];
+	closes = 0;
+	/*
+	A store that will not take a record — a full disk, a file that went away —
+	as `ingest` sees one. It throws, as the real one does, and the command is
+	what turns that into the hook contract's exit 0.
+	*/
+	failIngest?: Error;
+	/*
+	Every Ingested record comes back Unpriced, which is the state the command
+	has a stderr line for (ADR-0015).
+	*/
+	unpriced = false;
+	/*
+	And a store that will not close, which fails *after* the command's catch
+	has already run — the one path a bare `finally` would let escape.
+	*/
+	failClose?: Error;
+
+	ingest(record: UsageRecord): IngestResult {
+		if (this.failIngest) {
+			throw this.failIngest;
+		}
+
+		if (
+			this.records.some(
+				stored => JSON.stringify(stored) === JSON.stringify(record),
+			)
+		) {
+			return {status: 'duplicate'};
+		}
+
+		this.records.push(record);
+		return {
+			status: 'ingested',
+			id: this.records.length,
+			costYuan: this.unpriced ? undefined : 1,
+		};
+	}
+
+	usageBacklog(): readonly BackloggedUsage[] {
+		return this.waiting;
+	}
+
+	/*
+	An acknowledged record leaves the backlog, the way the real store's does —
+	which is what makes "what is left after a Drain" the command's own read
+	rather than something this fake has to be told.
+	*/
+	markUsagePushed(id: number): void {
+		const index = this.waiting.findIndex(record => record.id === id);
+		if (index !== -1) {
+			this.waiting.splice(index, 1);
+		}
+	}
+
+	close(): void {
+		this.closes += 1;
+
+		if (this.failClose) {
+			throw this.failClose;
+		}
+	}
+}
+
+/*
+The Usage Push seam, standing in. A successful pass carries everything and
+acknowledges it, so the count the command reads back afterwards is the count
+this fake left behind; a failed one acknowledges nothing and says so through the
+sink the command built it with.
+*/
+class FakeUsagePusher implements UsagePush {
+	#onAttempt: ((attempt: PushAttempt) => void) | undefined;
+	drains = 0;
+	closes = 0;
+	failsWith?: Error;
+	backlog: UsagePushBacklog | undefined;
+
+	attach(
+		onAttempt: (attempt: PushAttempt) => void,
+		backlog: UsagePushBacklog,
+	): void {
+		this.#onAttempt = onAttempt;
+		this.backlog = backlog;
+	}
+
+	async drain(): Promise<void> {
+		this.drains += 1;
+
+		if (this.failsWith !== undefined) {
+			this.#onAttempt?.({
+				at: new Date(),
+				ok: false,
+				pushed: 0,
+				error: this.failsWith,
+			});
+			return;
+		}
+
+		const carried = this.backlog?.usageBacklog() ?? [];
+		for (const record of carried) {
+			this.backlog?.markUsagePushed(record.id, new Date());
+		}
+
+		this.#onAttempt?.({at: new Date(), ok: true, pushed: carried.length});
+	}
+
+	async close(): Promise<void> {
+		this.closes += 1;
+	}
+}
+
+/*
+The hook payload, built with camelCase arguments so the tests below do not have
+to spell Claude Code's field names at every call site. `transcript_path` and
+`agent_transcript_path` are written verbatim because they are what the wiring
+sends; a missing one is dropped by `JSON.stringify`, as the real payload would
+have it.
+*/
+function hookPayload({
+	event = 'Stop',
+	transcript,
+	agentTranscript,
+	cwd,
+}: {
+	readonly event?: string;
+	readonly transcript?: string;
+	readonly agentTranscript?: string;
+	readonly cwd?: string;
+}): Record<string, unknown> {
+	/* eslint-disable @typescript-eslint/naming-convention -- the hook JSON's own field names. */
+	return {
+		hook_event_name: event,
+		transcript_path: transcript,
+		agent_transcript_path: agentTranscript,
+		cwd,
+	};
+	/* eslint-enable @typescript-eslint/naming-convention */
+}
+
+/*
+One transcript file a test owns, under the OS's temp directory so nothing a
+fixture writes can be committed by accident — and never `~/.claude`, which the
+gate may not touch.
+*/
+function hookTranscript(
+	t: ExecutionContext,
+	lines: ReadonlyArray<Record<string, unknown>>,
+): string {
+	const directory = mkdtempSync(join(tmpdir(), 'jwoo-cli-hook-test-'));
+	t.teardown(() => {
+		rmSync(directory, {recursive: true, force: true});
+	});
+
+	const file = join(directory, 'session.jsonl');
+	writeFileSync(file, lines.map(line => JSON.stringify(line)).join('\n'));
+	return file;
+}
+
+/* eslint-disable @typescript-eslint/naming-convention -- the transcript's own Anthropic field names, the same exception `usage-transcript.test.ts` makes. */
+const HOOK_TURN = [
+	{
+		type: 'user',
+		message: {role: 'user', content: 'hello'},
+		timestamp: '2026-08-18T07:00:00.000Z',
+	},
+	{
+		type: 'assistant',
+		message: {
+			id: 'req-1',
+			model: 'kimi-k2.7-code',
+			usage: {
+				input_tokens: 100,
+				output_tokens: 50,
+				cache_read_input_tokens: 20,
+			},
+		},
+		timestamp: '2026-08-18T07:00:01.000Z',
+	},
+];
+
+/*
+A second turn with different tokens, so that counting records says which of two
+transcripts was walked.
+*/
+const SECOND_TURN = [
+	{
+		type: 'user',
+		message: {role: 'user', content: 'again'},
+		timestamp: '2026-08-18T07:01:00.000Z',
+	},
+	{
+		type: 'assistant',
+		message: {
+			id: 'req-2',
+			model: 'kimi-k2.7-code',
+			usage: {input_tokens: 7, output_tokens: 3},
+		},
+		timestamp: '2026-08-18T07:01:01.000Z',
+	},
+];
+
+function backloggedUsage(id: number): BackloggedUsage {
+	return {
+		id,
+		recordedAt: new Date('2026-08-18T07:00:00.000Z'),
+		harness: 'Claude Code',
+		cwd: undefined,
+		model: 'kimi-k2.7-code',
+		costYuan: 1,
+		prompt_tokens: 120,
+		completion_tokens: 50,
+		total_tokens: 170,
+		prompt_cache_hit_tokens: 20,
+		prompt_cache_miss_tokens: 100,
+	};
+}
+/* eslint-enable @typescript-eslint/naming-convention */
+
+type UsageRun = {
+	readonly store: FakeUsageStore;
+	readonly pusher: FakeUsagePusher;
+	readonly written: string[];
+	/*
+	How many times the command asked for a Push seam. Zero is the answer "no
+	Pusher without a URI" is asserted with, because a stand-in is always
+	supplied and the command must not reach for it.
+	*/
+	readonly pusherBuilt: number;
+};
+
+/*
+One `usage record-claude-hook` invocation, with everything it reaches outside
+itself stood in for. `input` is the hook payload — an object, stringified, or a
+raw string for the malformed-stdin case.
+*/
+async function runHook(
+	input: unknown,
+	{
+		/*
+		A whole Config rather than a URI, because a destructuring default cannot
+		tell "this config has no `MONGO_URI`" from "the caller did not say" — and
+		the URI-free case is one of the things a test has to be able to ask for.
+		*/
+		config = CONFIG,
+		store = new FakeUsageStore(),
+		pusher = new FakeUsagePusher(),
+	}: {
+		readonly config?: Config;
+		readonly store?: FakeUsageStore;
+		readonly pusher?: FakeUsagePusher;
+	} = {},
+): Promise<UsageRun> {
+	const written: string[] = [];
+	let pusherBuilt = 0;
+
+	const options: RecordClaudeHookOptions = {
+		config,
+		stdin: async () =>
+			typeof input === 'string' ? input : JSON.stringify(input),
+		stderr(message) {
+			written.push(message);
+		},
+		createUsageStore: () => store,
+		createUsagePusher(backlog, onAttempt) {
+			pusherBuilt += 1;
+			pusher.attach(onAttempt, backlog);
+			return pusher;
+		},
+	};
+
+	await runRecordClaudeHook(options);
+
+	return {store, pusher, written, pusherBuilt};
+}
+
+/*
+The whole of the demoable path: a Stop payload, a transcript, a record out the
+other end. The Harness literal and the cwd come from the command and the
+payload, which is what says this is the Claude command rather than a Backfill.
+*/
+test('a Stop hook walks the transcript, Ingests its turns and reports Recorded.', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+
+	const {store, pusher, written, pusherBuilt} = await runHook(
+		hookPayload({transcript, cwd: '/projects/site'}),
+	);
+
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.harness, 'Claude Code');
+	t.is(store.records[0]?.cwd, '/projects/site');
+	t.is(store.records[0]?.prompt_tokens, 120, 'input + cache');
+	t.is(store.records[0]?.completion_tokens, 50);
+	t.deepEqual(written, ['Recorded.']);
+	t.is(pusherBuilt, 1);
+	t.is(pusher.drains, 1, 'the invocation touches the Backlog');
+	t.is(store.closes, 1, 'and closes the store it opened');
+});
+
+/*
+The second pipe of the demo, and the rule that makes every Stop safe: the walk
+re-visits the whole transcript, and the drop rule turns the re-visit into
+Duplicates rather than a second copy.
+*/
+test('the same hook again is Duplicate., and still drains', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+
+	await runHook(hookPayload({transcript}), {store});
+	const second = await runHook(hookPayload({transcript}), {store});
+
+	t.deepEqual(second.written, ['Duplicate.']);
+	t.is(second.store.records.length, 1);
+	t.is(second.pusher.drains, 1, 'the invocation touched the Backlog anyway');
+	t.is(second.pusher.closes, 1);
+});
+
+test('agent_transcript_path wins, and transcript_path is the fallback', async t => {
+	const main = hookTranscript(t, HOOK_TURN);
+	const agent = hookTranscript(t, [...HOOK_TURN, ...SECOND_TURN]);
+
+	const viaMain = await runHook(hookPayload({transcript: main}));
+	t.is(
+		viaMain.store.records.length,
+		1,
+		'transcript_path is walked when no agent one was sent',
+	);
+
+	const viaAgent = await runHook(
+		hookPayload({transcript: main, agentTranscript: agent}),
+	);
+	t.is(viaAgent.store.records.length, 2, 'and the agent transcript wins');
+});
+
+/*
+ApiReqDone is dead and is not ported (spec #53), so an event outside the two the
+wiring sends Ingests nothing — but the invocation still happens, and the
+Backlog it may carry is still drained.
+*/
+test('an event outside Stop and SubagentStop is a no-op that still drains', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+	store.waiting.push(backloggedUsage(1));
+
+	const {written, pusher} = await runHook(
+		hookPayload({event: 'ApiReqDone', transcript}),
+		{store},
+	);
+
+	t.deepEqual(store.records, []);
+	t.deepEqual(written, []);
+	t.is(pusher.drains, 1);
+});
+
+test('a missing transcript is a no-op run that still drains', async t => {
+	const gone = join(tmpdir(), 'no-such-transcript.jsonl');
+	const {store, written, pusher} = await runHook(
+		hookPayload({transcript: gone}),
+	);
+
+	t.deepEqual(store.records, []);
+	t.deepEqual(written, []);
+	t.is(pusher.drains, 1);
+	t.is(store.closes, 1);
+});
+
+test('an unreadable hook payload is a stderr line, and still drains', async t => {
+	const {store, written, pusher} = await runHook('not json');
+
+	t.deepEqual(store.records, []);
+	t.regex(written[0] ?? '', /Could not read the hook input/v);
+	t.is(pusher.drains, 1);
+});
+
+/*
+The rule that separates the two failures: a store that could not take a record
+is not one to hand the Backlog to, so the tail waits for the next invocation
+(ADR-0012) — and the run still ends clean, because a hook that failed loudly
+would surface inside the agent (ADR-0016).
+*/
+test('a failed Ingest skips the drain, and reports rather than throws', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+	store.failIngest = new Error('database is locked');
+
+	const {pusher, written} = await runHook(hookPayload({transcript}), {store});
+
+	t.true(written.some(line => line.includes('database is locked')));
+	t.is(pusher.drains, 0);
+	t.is(store.closes, 1);
+});
+
+test('a store that cannot be opened is a stderr line, not a throw', async t => {
+	const written: string[] = [];
+
+	await runRecordClaudeHook({
+		config: CONFIG,
+		stdin: async () => JSON.stringify(hookPayload({})),
+		stderr(message) {
+			written.push(message);
+		},
+		createUsageStore() {
+			throw new Error('Could not open the Local Store: file is not a database');
+		},
+		createUsagePusher() {
+			throw new Error('no store, so no Drain');
+		},
+	});
+
+	t.true(written.some(line => line.includes('file is not a database')));
+});
+
+/*
+The Push is best-effort and the Ingest is not (ADR-0016): with no `MONGO_URI`
+there is no seam to build, the records still land, and the Backlog is not even
+mentioned — a config without a URI is a chosen state, not a stuck one.
+*/
+test('no Pusher is built without a MONGO_URI, and the records still land', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+	store.waiting.push(backloggedUsage(1), backloggedUsage(2));
+
+	const {pusher, pusherBuilt, written} = await runHook(
+		hookPayload({transcript}),
+		{store, config: {...CONFIG, mongoUri: undefined}},
+	);
+
+	t.is(store.records.length, 1);
+	t.is(pusherBuilt, 0);
+	t.is(pusher.drains, 0);
+	t.true(written.includes('Recorded.'));
+	t.false(
+		written.some(line => line.includes('await Push')),
+		'nothing is said about a Backlog nobody was asked to drain',
+	);
+});
+
+/*
+What the count is for: a Drain that could not happen leaves its records where
+they were, and the number is what the operator sees when they look. A Drain that
+did happen leaves nothing to say.
+*/
+test('a surviving Usage Backlog is a stderr line, and a carried one is not', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const stranded = new FakeUsageStore();
+	stranded.waiting.push(backloggedUsage(1), backloggedUsage(2));
+	const strandedPusher = new FakeUsagePusher();
+	strandedPusher.failsWith = new Error('connect ECONNREFUSED 127.0.0.1');
+
+	const failed = await runHook(hookPayload({transcript}), {
+		store: stranded,
+		pusher: strandedPusher,
+	});
+
+	t.true(
+		failed.written.some(line => line.includes('connect ECONNREFUSED')),
+		'what happened',
+	);
+	t.is(
+		failed.written.at(-1),
+		'2 usage records await Push.',
+		'and how much is left',
+	);
+
+	const carried = new FakeUsageStore();
+	carried.waiting.push(backloggedUsage(1));
+	const clean = await runHook(hookPayload({transcript}), {store: carried});
+
+	t.false(
+		clean.written.some(line => line.includes('await Push')),
+		'a Backlog that drained says nothing',
+	);
+});
+
+test('one stranded record is spelled as one', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+	store.waiting.push(backloggedUsage(1));
+	const pusher = new FakeUsagePusher();
+	pusher.failsWith = new Error('down');
+
+	const {written} = await runHook(hookPayload({transcript}), {store, pusher});
+
+	t.is(written.at(-1), '1 usage record awaits Push.');
+});
+
+/*
+The Drain happens on every record-command run, even one that Ingested nothing:
+the Backlog may hold older records, and this invocation is a chance to carry
+them. A transcript with no turns is that run.
+*/
+test('an invocation that Ingested nothing still drains', async t => {
+	const empty = hookTranscript(t, []);
+	const store = new FakeUsageStore();
+	store.waiting.push(backloggedUsage(1));
+
+	const {pusher} = await runHook(hookPayload({transcript: empty}), {store});
+
+	t.deepEqual(store.records, []);
+	t.is(pusher.drains, 1);
+	t.is(store.waiting.length, 0, 'and the older record was carried');
+});
+
+test('an Unpriced record is a per-record stderr line, and the run still lands it', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+	store.unpriced = true;
+
+	const {written} = await runHook(hookPayload({transcript}), {store});
+
+	t.true(
+		written.includes('no pricing for kimi-k2.7-code; cost left null'),
+		'ADR-0015: absent pricing is not an absent record',
+	);
+	t.true(written.includes('Recorded.'));
+	t.is(store.records.length, 1);
+});
+
+/*
+The half of the hook contract a Run Log cannot show and an exit code cannot
+either: the agent's stdout stays clean. The entry point is handed a stderr sink
+and no stdout one, so this is the assertion that nothing crept in through a
+`console.log` somewhere on the path.
+*/
+test('nothing reaches stdout on any path', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const written: string[] = [];
+	const original = process.stdout.write;
+
+	process.stdout.write = function (chunk: string) {
+		written.push(chunk);
+		return original.call(process.stdout, chunk);
+	};
+
+	try {
+		await runHook(hookPayload({transcript}));
+		await runHook('not json');
+	} finally {
+		process.stdout.write = original;
+	}
+
+	t.deepEqual(written, []);
+});
+
+/*
+The other event Claude Code stops on, and the reason the set has two members:
+a SubagentStop is the same walk over the subagent's own transcript.
+*/
+test('a SubagentStop hook records from the subagent transcript too', async t => {
+	const transcript = hookTranscript(t, SECOND_TURN);
+
+	const {store, written} = await runHook(
+		hookPayload({event: 'SubagentStop', transcript}),
+	);
+
+	t.is(store.records.length, 1);
+	t.true(written.includes('Recorded.'));
+});
+
+/*
+The last thing that can fail, and the one a bare `finally` lets past the catch
+that was meant to hold it. It is a line, like every other problem, and the run
+still ends clean (ADR-0016).
+*/
+test('a store that will not close is a stderr line, not a throw', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+	store.failClose = new Error('database is locked');
+
+	const {written} = await runHook(hookPayload({transcript}), {store});
+
+	t.true(written.some(line => line.includes('database is locked')));
+	t.is(store.closes, 1);
+});
+
+/*
+And the Push seam that cannot be built at all: a `MONGO_URI` that parses as a
+string but not as a URI throws in the seam's constructor, before any Drain. No
+Drain was attempted, so no count is owed — but the reason reaches stderr.
+*/
+test('a Push seam that cannot be built is a stderr line, not a throw', async t => {
+	const transcript = hookTranscript(t, HOOK_TURN);
+	const store = new FakeUsageStore();
+	const written: string[] = [];
+
+	await runRecordClaudeHook({
+		config: CONFIG,
+		stdin: async () =>
+			JSON.stringify(hookPayload({transcript, cwd: '/projects/site'})),
+		stderr(message) {
+			written.push(message);
+		},
+		createUsageStore: () => store,
+		createUsagePusher() {
+			throw new Error('Invalid scheme, expected connection string to start');
+		},
+	});
+
+	t.is(store.records.length, 1, 'the Ingest still landed');
+	t.true(written.some(line => line.includes('Invalid scheme')));
+	t.false(written.some(line => line.includes('await Push')));
+});

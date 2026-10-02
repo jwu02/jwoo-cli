@@ -19,12 +19,17 @@ hours collecting into a retry that can never succeed. The Pusher's half of the
 same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
 it, or cannot be built at all, is a run that carries on.
 
-Three entry points stand at the top of it — `runCollect`, `runDashboard` and
-`runPermissions` — one per command, each taking no more than the command reads
-and each named for what it runs. Which one a command line means is decided a
-module up, in `cli.tsx`, which is also the only caller that supplies the real
-permissions source: nothing here imports the command type, so a pairing of
-command and entry point cannot be stated twice and drift.
+Four entry points stand at the top of it — `runCollect`, `runDashboard`,
+`runPermissions` and `runRecordClaudeHook` — one per command, each taking no
+more than the command reads and each named for what it runs. Which one a command
+line means is decided a module up, in `cli.tsx`, which is also the only caller
+that supplies the real permissions source: nothing here imports the command
+type, so a pairing of command and entry point cannot be stated twice and drift.
+
+The usage command is the one that does not collect: it reads one Hook payload
+from stdin, Ingests its turns and Drains the Usage Backlog, and owns none of the
+run skeleton above — which is why its section is its own, and why its store type
+is a narrower slice of the same file.
 
 The pieces arrive as options rather than being reached for directly: this module
 is where permission, store, state and Collector meet, and a test that had to
@@ -36,6 +41,7 @@ collection, and the entry point is a module that runs the CLI on import — so a
 switch kept there was reached by no test at all.
 */
 
+import process from 'node:process';
 import {COUNT_FORMAT} from './format.js';
 import {type Config, loadConfig} from './store/config.js';
 import {
@@ -48,11 +54,19 @@ import {
 } from './capture/helper.js';
 import {
 	defaultReadWarningReporter,
-	LocalStore,
 	type HistorySource,
+	type IngestResult,
+	LocalStore,
+	messageOf,
 	type ReadWarningReporter,
+	type UsageRecord,
 } from './store/local-store.js';
 import {KeyboardCollector} from './capture/keyboard.js';
+import {
+	UsagePusher as MongoUsagePusher,
+	type UsagePushBacklog,
+} from './store/usage-push.js';
+import {walkTranscript} from './usage/usage-transcript.js';
 import {MouseCollector} from './capture/mouse.js';
 import {
 	type PermissionReport,
@@ -456,6 +470,369 @@ export async function runPermissions(
 	logger.log(report.message);
 
 	return report;
+}
+
+/*
+The store faces a usage command reaches: Ingest, and the close that ends the
+invocation's lifetime around the Backlog the Push seam is handed. Narrower than
+`RunStore` on purpose — nothing here opens a Session, Flushes an era or reads
+history — and the Local Store is the only implementation.
+
+The Backlog half is `UsagePushBacklog` rather than a second spelling of it: the
+store is what the seam is built over, so the two member signatures are one
+declaration, and the command itself never acknowledges a write.
+*/
+export type UsageStore = UsagePushBacklog & {
+	ingest(record: UsageRecord): IngestResult;
+	close(): void;
+};
+
+/*
+The Usage Push seam as a usage command reaches it: one pass over the Usage
+Backlog, and the close that ends the connection it was made through. `store/`'s
+`UsagePusher` is the only implementation, and a stand-in satisfies this — the
+same split `session.ts`'s `Pusher` makes.
+
+Two of the seam's methods rather than the class, because those are the two the
+command calls: it neither reads the backlog nor acknowledges a write itself, so
+both stay the seam's business.
+*/
+export type UsagePush = Pick<MongoUsagePusher, 'drain' | 'close'>;
+
+/*
+What `usage record-claude-hook` is handed, each an option for the reason the
+collecting commands' are: a test that could not stand these in would open a
+store, a connection and a terminal, and the ADR-0016 contract is exactly what a
+test has to be able to drive down every path of.
+
+`stdin` and `stderr` are the two ends of that contract: the payload arrives on
+one and every diagnostic leaves on the other. Stdout is never written, and that
+is a property of the code below rather than of a sink it could be handed.
+*/
+export type RecordClaudeHookOptions = {
+	readonly stdin?: () => Promise<string>;
+	readonly stderr?: (message: string) => void;
+	readonly clock?: () => Date;
+	readonly config?: Config;
+	readonly createUsageStore?: () => UsageStore;
+	/*
+	Built over the store's Usage Backlog and with the one thing it reports
+	through: each Drain attempt. The default is the real seam, and it is built
+	only when there is a `MONGO_URI` — so a caller supplying this is always a
+	test, and "no Pusher without a URI" is asserted by this never being called.
+	*/
+	readonly createUsagePusher?: (
+		backlog: UsagePushBacklog,
+		onAttempt: (attempt: PushAttempt) => void,
+	) => UsagePush;
+};
+
+/*
+The hook events this command answers: Stop and SubagentStop only. ApiReqDone is
+dead — wired nowhere, present in no transcript — and is not ported (spec #53),
+so any other event is a no-op run that still drains.
+*/
+const HOOK_EVENTS = new Set(['Stop', 'SubagentStop']);
+
+/*
+The Harness literal, owned here because a Harness never self-reports its name:
+the hook JSON carries no harness field, and the command that Ingests decides the
+string (CONTEXT.md).
+*/
+const CLAUDE_HARNESS = 'Claude Code';
+
+/*
+The fields of the hook JSON this command reads. Every one optional and read
+defensively, because the payload is Claude Code's rather than ours: a field that
+is missing or is not a string is absent rather than an error, which is what lets
+a partial payload still Ingest the turns its transcript does hold.
+*/
+type HookInput = {
+	readonly hook_event_name?: string | undefined;
+	readonly cwd?: string | undefined;
+	readonly transcript_path?: string | undefined;
+	readonly agent_transcript_path?: string | undefined;
+};
+
+/*
+The `usage record-claude-hook` entry point.
+
+It runs inside Claude Code's wiring, so ADR-0016 decides its whole shape: exit 0
+on every path of its own, stdout silent, every problem on stderr. Nothing here
+throws, and that is the contract rather than a style — `cli.tsx` turns a throw
+into a non-zero code, and a hook that failed loudly would surface an error into
+the session it was hired to observe.
+
+The store is opened and closed here, as a collecting run's is: it is the one
+write an Ingest must reach. The Usage Push is the opposite case — best-effort,
+built only when there is a `MONGO_URI`, and closed with the store.
+
+The Drain is attempted on every run, even one that Ingested nothing: the Usage
+Backlog may hold older records, and this invocation is a chance to carry them.
+It is skipped only by a failed Ingest — a store that could not take a record is
+not one to hand the backlog to — which leaves the tail where it was.
+*/
+export async function runRecordClaudeHook(
+	options: RecordClaudeHookOptions = {},
+): Promise<void> {
+	const report = options.stderr ?? writeStderr;
+
+	/*
+	The first thing that can fail, and it is already inside the contract: a
+	`ConfigError` — a `FLUSH_INTERVAL_SECONDS` that is not a number — would
+	otherwise leave this module as a throw, and a hook that failed loudly is
+	the one thing ADR-0016 forbids. An unreadable config costs the records of
+	this invocation and nothing else.
+	*/
+	let config: Config;
+	try {
+		config = options.config ?? loadConfig();
+	} catch (error) {
+		report(messageOf(error));
+		return;
+	}
+
+	let store: UsageStore;
+	try {
+		store = (options.createUsageStore ?? (() => new LocalStore(config)))();
+	} catch (error) {
+		report(messageOf(error));
+		return;
+	}
+
+	try {
+		await recordHookInput(options, config, store, report);
+	} catch (error) {
+		/*
+		The contract again: whatever went wrong after the store opened — a
+		backlog that would not read, a connection that would not close — is a
+		line on stderr and an exit 0, never a throw.
+		*/
+		report(messageOf(error));
+	} finally {
+		/*
+		Closing is the last thing that can fail, and it fails after the catch
+		above has already run — so it needs its own, or a store that would not
+		close would take the exit code with it.
+		*/
+		try {
+			store.close();
+		} catch (error) {
+			report(messageOf(error));
+		}
+	}
+}
+
+/*
+One hook payload, end to end: read it, Ingest its turns, drain.
+
+A payload that cannot be read is a no-op run rather than a failure — the same
+shape as a missing transcript — and it still drains, because the invocation is a
+chance to carry the backlog whatever arrived on stdin.
+*/
+async function recordHookInput(
+	options: RecordClaudeHookOptions,
+	config: Config,
+	store: UsageStore,
+	report: (message: string) => void,
+): Promise<void> {
+	let input: HookInput | undefined;
+	try {
+		input = parseHookInput(await (options.stdin ?? readHookStdin)());
+	} catch (error) {
+		report(`Could not read the hook input: ${messageOf(error)}`);
+	}
+
+	if (input !== undefined && HOOK_EVENTS.has(input.hook_event_name ?? '')) {
+		/*
+		A throw from here is a failed Ingest, and the caller catches it: the
+		Drain below is skipped, because a store that could not take a record is
+		not one to hand the backlog to — and the tail survives to the next
+		invocation, which is the two-tail rule (ADR-0012) doing the work the
+		contract needs here.
+		*/
+		ingestTurns(input, options, store, report);
+	}
+
+	await drainUsageBacklog(options, config, store, report);
+}
+
+/*
+Ingest one payload's turns, reporting each outcome. Synchronous, and it throws
+on the one failure it can meet — a store that would not take a record — with the
+caller's catch doing the reporting that a failed Ingest is due; what it must not
+do is return as if the run had gone well.
+*/
+function ingestTurns(
+	input: HookInput,
+	options: RecordClaudeHookOptions,
+	store: UsageStore,
+	report: (message: string) => void,
+): void {
+	/*
+	The transcript is always walked — the retired hook's `input.usage` shortcut
+	is not ported (spec #53): the walk sees every turn, gives each its own
+	`recorded_at`, and re-walking is safe because Ingest drops duplicates. A
+	missing or unreadable transcript is no turns, not a failure.
+	*/
+	const candidates = walkTranscript(
+		input.agent_transcript_path ?? input.transcript_path,
+		{cwd: input.cwd, clock: options.clock},
+	);
+
+	let ingested = 0;
+	let duplicates = 0;
+
+	for (const candidate of candidates) {
+		const result = store.ingest({...candidate, harness: CLAUDE_HARNESS});
+
+		if (result.status === 'duplicate') {
+			duplicates += 1;
+			continue;
+		}
+
+		ingested += 1;
+
+		/*
+		Unpriced is the accepted state rather than a defect (ADR-0015), so the
+		record stands and this is the line that makes it visible. Per record,
+		not per invocation: which model went uncovered is the useful part.
+		*/
+		if (result.costYuan === undefined) {
+			report(
+				`no pricing for ${candidate.model ?? 'an unnamed model'}; cost left null`,
+			);
+		}
+	}
+
+	/*
+	One line for the invocation rather than one per record. Every Stop re-walks
+	the whole transcript, so a per-record line would print a duplicate per turn
+	on every turn and grow without bound over a session. An invocation that
+	Ingested anything says "Recorded."; one that only dropped duplicates says
+	"Duplicate."; one with no turns at all says nothing.
+	*/
+	if (ingested > 0) {
+		report('Recorded.');
+	} else if (duplicates > 0) {
+		report('Duplicate.');
+	}
+}
+
+/*
+One pass over the Usage Backlog at the end of the invocation (CONTEXT.md,
+Drain).
+
+Skipped only when there is no `MONGO_URI`: Ingest is the required write and Push
+is best-effort (ADR-0016), so a deliberately URI-free config still lands its
+records. How much is left is read back from the store afterwards — a Push that
+failed leaves its records there, and that count is what the next invocation
+starts from.
+*/
+async function drainUsageBacklog(
+	options: RecordClaudeHookOptions,
+	config: Config,
+	store: UsageStore,
+	report: (message: string) => void,
+): Promise<void> {
+	if (config.mongoUri === undefined) {
+		report('No MONGO_URI; nothing was Pushed.');
+		return;
+	}
+
+	const buildPusher =
+		options.createUsagePusher ??
+		((backlog: UsagePushBacklog, onAttempt: (attempt: PushAttempt) => void) =>
+			new MongoUsagePusher(config, backlog, {onAttempt}));
+
+	let pusher: UsagePush;
+	try {
+		pusher = buildPusher(store, attempt => {
+			/*
+			A failed Drain is said here, because the seam reports attempts and
+			this is the only thing that knows where a usage command's stderr is.
+			A successful one says nothing: the records it carried are gone from
+			the backlog, and that absence is the report.
+			*/
+			if (!attempt.ok) {
+				report(messageOf(attempt.error));
+			}
+		});
+	} catch (error) {
+		/*
+		A URI that is present but unparseable throws here rather than in
+		`drain()` — the seam builds its client up front. No Drain was
+		attempted, so no count is owed, but the reason has to reach stderr
+		(ADR-0016).
+		*/
+		report(messageOf(error));
+		return;
+	}
+
+	try {
+		await pusher.drain();
+	} finally {
+		await pusher.close();
+	}
+
+	const remaining = store.usageBacklog().length;
+	if (remaining > 0) {
+		report(
+			remaining === 1
+				? '1 usage record awaits Push.'
+				: `${COUNT_FORMAT.format(remaining)} usage records await Push.`,
+		);
+	}
+}
+
+/*
+The hook payload, as far as this command trusts it: only the four fields it
+reads are taken, and each only when it is a string.
+*/
+function parseHookInput(raw: string): HookInput {
+	const parsed: unknown = JSON.parse(raw);
+	if (typeof parsed !== 'object' || parsed === null) {
+		throw new Error('the hook input was not a JSON object');
+	}
+
+	const record = parsed as Record<string, unknown>;
+	const text = (key: string): string | undefined => {
+		const value = record[key];
+		return typeof value === 'string' ? value : undefined;
+	};
+
+	/* eslint-disable @typescript-eslint/naming-convention -- the hook JSON's own field names, which Claude Code writes. */
+	return {
+		hook_event_name: text('hook_event_name'),
+		cwd: text('cwd'),
+		transcript_path: text('transcript_path'),
+		agent_transcript_path: text('agent_transcript_path'),
+	};
+	/* eslint-enable @typescript-eslint/naming-convention */
+}
+
+/*
+All of stdin, which is where the wiring delivers the one JSON payload. Decoded
+as UTF-8 while it is read rather than after concatenation, so a multi-byte
+character split across two chunks cannot come out as replacement characters.
+*/
+async function readHookStdin(): Promise<string> {
+	process.stdin.setEncoding('utf8');
+
+	let data = '';
+	for await (const chunk of process.stdin) {
+		data += chunk as string;
+	}
+
+	return data;
+}
+
+/*
+The hook contract's one output: a line per diagnostic, on stderr, so the agent's
+stdout stays clean and an operator who looks can still see what happened.
+*/
+function writeStderr(message: string): void {
+	process.stderr.write(`${message}\n`);
 }
 
 /*

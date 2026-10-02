@@ -64,6 +64,47 @@ test('permissions reports the grants on their own', t => {
 });
 
 /*
+The third command group: `usage`, and the command it names. The group is not a
+command of its own — `usage` alone names nothing — so the command line has to
+name one of the group's commands.
+*/
+test('usage names the command it runs', t => {
+	t.deepEqual(parseArguments(['usage', 'record-claude-hook']), {
+		kind: 'usage',
+		command: 'record-claude-hook',
+	});
+});
+
+test('the usage group alone is rejected', t => {
+	const {calls, showHelp} = rejecting();
+
+	t.throws(() => commandFor({input: ['usage']}, showHelp), {
+		message: 'showHelp',
+	});
+	t.deepEqual(calls, [2]);
+});
+
+test('an unknown usage command is rejected rather than ignored', t => {
+	const {calls, showHelp} = rejecting();
+
+	t.throws(() => commandFor({input: ['usage', 'record-nothing']}, showHelp), {
+		message: 'showHelp',
+	});
+	t.deepEqual(calls, [2]);
+});
+
+test('a usage command with a stray argument is rejected', t => {
+	const {calls, showHelp} = rejecting();
+
+	t.throws(
+		() =>
+			commandFor({input: ['usage', 'record-claude-hook', 'extra']}, showHelp),
+		{message: 'showHelp'},
+	);
+	t.deepEqual(calls, [2]);
+});
+
+/*
 A bare `dashboard` is not a second spelling of the default. Accepting both would
 let them drift apart, and the help text names only one of them.
 */
@@ -102,6 +143,19 @@ test here that says the CLI starts at all.
 */
 test('an unknown flag is refused with a usage exit code', async t => {
 	const result = await runCli(['collect', '--dry-run']);
+
+	t.is(result.code, 2);
+	t.regex(result.stderr, /dry-run|Unknown flag|--help/v);
+});
+
+/*
+And on the group whose commands take no flags either. The hook command reads a
+payload on stdin, so a flag it does not know is a typo rather than something to
+forward — and it has to be refused before the command runs, which is what the
+child process shows: the entry point never reads stdin, so the test cannot hang.
+*/
+test('an unknown flag on a usage command is refused too', async t => {
+	const result = await runCli(['usage', 'record-claude-hook', '--dry-run']);
 
 	t.is(result.code, 2);
 	t.regex(result.stderr, /dry-run|Unknown flag|--help/v);

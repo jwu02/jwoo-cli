@@ -9,7 +9,9 @@ each section names the invariants its module must hold.
 `source/` is grouped by the import graph rather than by a generic layering: `capture/` (the
 helper, the wire format, the Key Label tables — `key-labels.ts` pins what a keycode is called,
 `key-character.ts` what a key event produces — and the Collectors), `store/` (the Local Store,
-the Pusher, the Range arithmetic, the Pricing table, config), `views/` (the Ink layer). What
+the Pusher and its sibling Usage Push seam, the Range arithmetic, the Pricing table, config),
+`usage/` (the Harness artifact projections — the Claude transcript walk so far, with the
+OpenCode reader and projection to come), `views/` (the Ink layer). What
 is left at the root is
 the run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`
 and `format.ts` — each reads across the groups, so filing one under a group would move a
@@ -100,7 +102,14 @@ holding the permission source and a logger — the two things that command reads
 collection type satisfies structurally, so one object can be handed to either. The two that
 collect resolve with the `Shutdown`, which is how the run ended rather than only that it did;
 `runPermissions` answers with the `PermissionReport` it was asked for, because it has no run to
-report on. `cli.tsx` is the entry point above them all: it parses argv, dispatches to the one
+report on. `runRecordClaudeHook` is the usage command's: it reads one Hook payload from stdin,
+Ingests the turns its transcript holds, and Drains the Usage Backlog at the end of the
+invocation. Its dependencies are its own narrow options — a stdin reader, a stderr sink, the
+clock, and factories for the store and the one-shot Usage Push — and it resolves with nothing at
+all, because ADR-0016 makes every path of its own a clean exit that `cli.tsx` must not read a
+code off; its failures are stderr lines instead.
+
+`cli.tsx` is the entry point above them all: it parses argv, dispatches to the one
 the command names, turns how that run ended into the process exit code — non-zero when the
 final Flush failed, and the only place that code is set — and reports a failure's message
 rather than its stack. The dispatch is the whole of the pairing between a command and the entry
@@ -140,10 +149,11 @@ view by the `--self-check` pin in `helper.test.ts`; the delivery tests in `main.
 what execute the ownership for every type the format carries. The helper's failure line is
 delivered like any other event, owned by nobody, and reported by that wiring.
 
-## Three subcommands, and no others
+## Four subcommands, in three groups
 
-`args.ts` parses argv into exactly three commands: no argument opens the dashboard, `collect`
-runs collection headlessly, `permissions` reports the macOS grants. Parsing is a pure function of
+`args.ts` parses argv into exactly four commands, in three groups: no argument opens the
+dashboard, `collect` runs collection headlessly, `permissions` reports the macOS grants, and
+`usage` names one of its own commands. Parsing is a pure function of
 argv, so what a command line means is testable without a process — `cli.tsx` hands it the real
 `process.argv` and lets meow exit on a bad one, which is why the one test covering that runs the
 entry point in a child process: in-process it would take the runner down with it.
@@ -151,6 +161,20 @@ entry point in a child process: in-process it would take the runner down with it
 A bare `dashboard` is not a second spelling of the default, and `allowUnknownFlags` is off, so a
 typo'd `--dry-run` is refused rather than silently ignored. `collect` is a subcommand and not a
 key because the collector must not be reachable only through the TUI (ADR-0001).
+
+**`usage` is the third group, and the commands that Ingest AI usage live under it.** A group
+rather than four more top-level commands because they share a shape — each reads a Harness's own
+artifact and Ingests through the same store face — and because `usage` alone names nothing, so a
+bare `usage` is rejected the way a bare `dashboard` is. Only `record-claude-hook` is wired so
+far: it reads a raw Claude Code hook payload on stdin, walks the transcript it names (always the
+transcript, never the proxy's non-standard `input.usage` shortcut), and Ingests the turns it
+finds with the Harness literal the command owns. `record-opencode` and the two Backfills land
+beside it, which is what the group is for. The record command is also the one command that never
+throws: ADR-0016 makes exit 0 on every path of its own a contract, so `cli.tsx` reads no code off
+it and its diagnostics are stderr lines — "Recorded." or "Duplicate.", one unpriced line per
+record that needed one, and the Usage Backlog's count when a Drain was attempted and left
+something behind. `MONGO_URI` is optional for it: the Ingest lands in the Local Store either
+way, and a config without one builds no Push seam and drains nothing.
 
 **The dashboard collects too.** It runs the same preflight and the same Session `collect` does,
 and mounts the view over the run; `collect` is the way to run without a view, not the way to

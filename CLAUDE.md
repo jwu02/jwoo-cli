@@ -36,7 +36,10 @@ export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 Run lines carry `--disable-warning=ExperimentalWarning --env-file=.env` and need `MONGO_URI` —
 for example, the dashboard is `node --disable-warning=ExperimentalWarning --env-file=.env
 dist/cli.js`, which collects while it is open. `collect` after that runs collection headlessly;
-`permissions` reports the macOS grants and exits.
+`permissions` reports the macOS grants and exits. `usage record-claude-hook` is the one run line
+that is not that shape: it reads a Claude Code hook payload on stdin, Ingests it, drains the
+Usage Backlog, and exits 0 on every path of its own (ADR-0016) — no `.env` needed, so a
+`MONGO_URI` in the environment is the only thing an offline run has to avoid.
 
 The flag is on every run line because `node:sqlite` is experimental and says so on stderr the
 moment it is imported — and `main.tsx` imports the Local Store on every path, whichever
@@ -62,10 +65,12 @@ set of variables per test. No `loadEnvFile` call inside it.
 
 `source/` is grouped by the import graph rather than by a generic layering: `capture/` (the
 helper, the wire format, the Key Label tables, the Collectors), `store/` (the Local Store, the
-Pusher, the Range arithmetic, the Pricing table, config), `views/` (the Ink layer). What is
-left at the root is the
+Pusher and the Usage Push seam, the Range arithmetic, the Pricing table, config), `usage/` (the
+Harness artifact projections — the Claude transcript walk so far), `views/` (the Ink layer).
+What is left at the root is the
 run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`,
-`format.ts` — each reads across the groups, which is why the split is three and not four. Tests
+`format.ts` — each reads across the groups, so filing one under a group would move a boundary
+edge rather than remove it. Tests
 sit beside their subject and moved with it; ava's default globs find them there and read the
 directory as the test name's prefix.
 
