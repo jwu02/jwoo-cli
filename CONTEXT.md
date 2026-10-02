@@ -117,6 +117,12 @@ the harness — the command that Ingests decides the string; a Harness never sel
 its own name. DSH stays out of scope, in `ai-usage/` — see Deliberately absent.
 _Avoid_: tool, client, agent (ADR-0001), provider, self-reported
 
+**Shim**:
+The OpenCode-side plugin file that observes OpenCode's `message.updated` and Ingests each
+completed assistant message by spawning the CLI command. Source lives in this repo, installed
+into OpenCode's plugin directory; it owns the guard and the spawn, nothing else.
+_Avoid_: plugin, hook (Claude Code's term), bridge, adapter, watcher
+
 **Usage Record**:
 One LLM usage event as the Harness reports it — a turn's summed tokens or a single request's
 — with its cost and its own `recorded_at`. A point event: identity is content, so a
@@ -151,6 +157,21 @@ Ingested Usage Records not yet Pushed. It drains at the end of the CLI invocatio
 touched it — the usage commands, and nothing else, write usage — oldest `recorded_at` first,
 stopping at the first failure so the tail stays a tail.
 _Avoid_: queue, pending writes, failed Ingests
+
+**Backfill**:
+Ingesting Usage Records for turns that predate their Harness's live hook, by re-reading the
+Harness's own artifacts — Claude Code's transcript files, OpenCode's SQLite database. A
+Backfill Ingests through the same face as a live hook, and the same drop rule makes it
+idempotent: re-running adds nothing. A scan of the past, not a second kind of record.
+_Avoid_: import, migration, replay, bulk load, sync (and Drain — a Backfill's records join
+the Usage Backlog, whose Drain still happens at the invocation's end)
+
+**Cutover**:
+The switch from scripts writing Usage Records straight to MongoDB to the CLI's
+Ingest-then-Push path. It ends with the scripts' ObjectId-keyed documents cleared once the
+re-backfill has Pushed.
+_Avoid_: migration, cutover date (there is no single date — the wipe follows the first
+successful backfill, not the calendar)
 
 ### The reader
 

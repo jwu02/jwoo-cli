@@ -2,6 +2,8 @@
 
 > Grilled in #48 (2026-09-30 → 2026-10-01); recorded before the first `usage`
 > command lands.
+> Amended in #51 (2026-10-02): the contract extends to the OpenCode Shim — the plugin is
+> at least as quiet as the command it spawns.
 
 `usage record-claude-hook` runs inside Claude Code's own wiring — Stop and
 SubagentStop fire it as a child process of the agent's session. Its exit code
@@ -31,6 +33,17 @@ pull, a node too old for `node:sqlite` — exit non-zero and surface as visible
 non-blocking hook errors. That is accepted, and useful: those are install
 problems rather than telemetry problems, and invisible telemetry is the
 failure mode this contract otherwise risks.
+
+## The Shim
+
+`usage record-opencode` is spawned by the Shim — the OpenCode-side plugin (CONTEXT.md) —
+which, unlike Claude's hook wiring, runs _inside_ the agent's own process. The command holds
+the same contract as above: exit 0 on every path of its own, stdout silent, problems on
+stderr. The Shim holds it one notch stronger: its whole `event` handler is wrapped in a
+catch-all, so no exception escapes into OpenCode — the plugin is at least as quiet as the
+command it spawns. Failures before either runs — a missing `dist/cli.js` — still exit
+non-zero and surface as visible non-blocking errors, as before; the spawn line's pinned node
+keeps the too-old-node case out.
 
 ## Consequences
 
