@@ -19,18 +19,19 @@ hours collecting into a retry that can never succeed. The Pusher's half of the
 same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
 it, or cannot be built at all, is a run that carries on.
 
-Five entry points stand at the top of it — `runCollect`, `runDashboard`,
-`runPermissions`, `runRecordClaudeHook` and `runRecordOpencode` — one per command,
-each taking no more than the command reads and each named for what it runs. Which
-one a command line means is decided a module up, in `cli.tsx`, which is also the
-only caller that supplies the real permissions source: nothing here imports the
-command type, so a pairing of command and entry point cannot be stated twice and
-drift.
+Six entry points stand at the top of it — `runCollect`, `runDashboard`,
+`runPermissions`, `runRecordClaudeHook`, `runRecordOpencode` and
+`runBackfillClaude` — one per command, each taking no more than the command reads
+and each named for what it runs. Which one a command line means is decided a
+module up, in `cli.tsx`, which is also the only caller that supplies the real
+permissions source: nothing here imports the command type, so a pairing of
+command and entry point cannot be stated twice and drift.
 
 The usage commands are the ones that do not collect: each reads one Harness's
-artifact from stdin, Ingests what it projects and Drains the Usage Backlog, and
-owns none of the run skeleton above — which is why their section is its own, and
-why their store type is a narrower slice of the same file.
+artifact — from stdin, or from the projects directory a Backfill walks — Ingests
+what it projects and Drains the Usage Backlog, and owns none of the run skeleton
+above — which is why their section is its own, and why their store type is a
+narrower slice of the same file.
 
 The pieces arrive as options rather than being reached for directly: this module
 is where permission, store, state and Collector meet, and a test that had to
@@ -42,6 +43,9 @@ collection, and the entry point is a module that runs the CLI on import — so a
 switch kept there was reached by no test at all.
 */
 
+import {statSync} from 'node:fs';
+import {homedir} from 'node:os';
+import {join} from 'node:path';
 import process from 'node:process';
 import {COUNT_FORMAT} from './format.js';
 import {type Config, loadConfig} from './store/config.js';
@@ -68,7 +72,7 @@ import {
 	type UsagePushBacklog,
 } from './store/usage-push.js';
 import {projectOpencodeMessage} from './usage/usage-opencode.js';
-import {walkTranscript} from './usage/usage-transcript.js';
+import {findTranscripts, walkTranscript} from './usage/usage-transcript.js';
 import {MouseCollector} from './capture/mouse.js';
 import {
 	type PermissionReport,
@@ -502,6 +506,16 @@ both stay the seam's business.
 export type UsagePush = Pick<MongoUsagePusher, 'drain' | 'close'>;
 
 /*
+How a usage command builds its Push seam, when it builds one at all. One
+spelling for the record commands and the Backfill, so the two `createUsagePusher`
+options cannot drift apart.
+*/
+type UsagePusherFactory = (
+	backlog: UsagePushBacklog,
+	onAttempt: (attempt: PushAttempt) => void,
+) => UsagePush;
+
+/*
 What a `usage` record command is handed, each an option for the reason the
 collecting commands' are: a test that could not stand these in would open a
 store, a connection and a terminal, and the ADR-0016 contract is exactly what a
@@ -528,10 +542,50 @@ export type RecordUsageOptions = {
 	only when there is a `MONGO_URI` — so a caller supplying this is always a
 	test, and "no Pusher without a URI" is asserted by this never being called.
 	*/
-	readonly createUsagePusher?: (
-		backlog: UsagePushBacklog,
-		onAttempt: (attempt: PushAttempt) => void,
-	) => UsagePush;
+	readonly createUsagePusher?: UsagePusherFactory;
+};
+
+/*
+The store faces a Backfill reaches, which are the record commands' plus the
+classify half of Ingest. `--dry-run` is exactly that SELECT: every candidate
+classed against the real store, nothing written. A caller supplying this is a
+test, and the Local Store is the only implementation.
+*/
+export type BackfillStore = UsageStore & {
+	duplicatesExisting(record: UsageRecord): boolean;
+};
+
+/*
+What `usage backfill-claude` is handed.
+
+Most of it is the record commands' set — config, store, seam, stderr, clock —
+and the differences are what makes a Backfill the operator's command rather than
+a hook: a root to scan and a `--since` to bound it, a stdout to carry the
+summary, and a `dryRun` that turns the whole thing into a classify-only preview.
+The two sinks are the two faces of an operator run: the summary on stdout, every
+diagnostic on stderr.
+*/
+export type BackfillOptions = {
+	readonly root?: string;
+	readonly since?: Date;
+	readonly dryRun?: boolean;
+	readonly stdout?: (message: string) => void;
+	readonly stderr?: (message: string) => void;
+	readonly clock?: () => Date;
+	readonly config?: Config;
+	readonly createUsageStore?: () => BackfillStore;
+	readonly createUsagePusher?: UsagePusherFactory;
+};
+
+/*
+How a Backfill ended, as a value rather than a throw — the shape `Shutdown` has,
+and for the same reason: `cli.tsx` is the only place an exit code is set, so it
+reads this rather than the module ending the process itself. `failed` is the
+Backfill's own failure — a scan or a store it could not reach; a Usage Backlog
+that survived is not that, because a Push is best-effort.
+*/
+export type BackfillResult = {
+	readonly failed: boolean;
 };
 
 /*
@@ -691,8 +745,10 @@ async function runUsageRecord(
 	}
 
 	try {
-		ingestCandidates(await candidatesFor(report), harness, store, report);
-		await drainUsageBacklog(options, config, store, report);
+		const candidates = await candidatesFor(report);
+		reportIngested(ingestAll(candidates, harness, store), report);
+		const drain = await drainUsageBacklog(options, config, store, report);
+		reportUsageBacklog(drain, report);
 	} catch (error) {
 		/*
 		The contract again: whatever went wrong after the store opened — a store
@@ -711,19 +767,36 @@ async function runUsageRecord(
 }
 
 /*
-Ingest one payload's candidates, reporting each outcome. Synchronous, and it
-throws on the one failure it can meet — a store that would not take a record —
-with the caller's catch doing the reporting that a failed Ingest is due; what it
-must not do is return as if the run had gone well.
+What an Ingest pass did, as the two callers read it. A record command reports
+each unpriced model as it goes and one line for the invocation; a Backfill
+aggregates the models and folds the counts into its summary. One loop serves
+both, because both come through the same Ingest face.
 */
-function ingestCandidates(
+type IngestTally = {
+	readonly ingested: number;
+	readonly duplicates: number;
+	/*
+	The model of each Ingested record that priced null, in order; `undefined`
+	for a record with no model at all. A list rather than a count so the record
+	command can say one line per record, and a Backfill can aggregate it.
+	*/
+	readonly unpricedModels: ReadonlyArray<string | undefined>;
+};
+
+/*
+Ingest one payload's candidates. Synchronous, and it throws on the one failure
+it can meet — a store that would not take a record — with the caller's catch
+doing the reporting that a failed Ingest is due; what it must not do is return
+as if the run had gone well.
+*/
+function ingestAll(
 	candidates: readonly UsageCandidate[],
 	harness: string,
 	store: UsageStore,
-	report: Reporter,
-): void {
+): IngestTally {
 	let ingested = 0;
 	let duplicates = 0;
+	const unpricedModels: Array<string | undefined> = [];
 
 	for (const candidate of candidates) {
 		const result = store.ingest({...candidate, harness});
@@ -735,32 +808,62 @@ function ingestCandidates(
 
 		ingested += 1;
 
-		/*
-		Unpriced is the accepted state rather than a defect (ADR-0015), so the
-		record stands and this is the line that makes it visible. Per record,
-		not per invocation: which model went uncovered is the useful part.
-		*/
 		if (result.costYuan === undefined) {
-			report(
-				`no pricing for ${candidate.model ?? 'an unnamed model'}; cost left null`,
-			);
+			unpricedModels.push(candidate.model);
 		}
 	}
 
-	/*
-	One line for the invocation rather than one per record. Every Stop re-walks
-	the whole transcript, so a per-record line would print a duplicate per turn
-	on every turn and grow without bound over a session — and an OpenCode payload
-	is one record, so the two commands' lines mean the same thing. An invocation
-	that Ingested anything says "Recorded."; one that only dropped duplicates
-	says "Duplicate."; one with no candidates at all says nothing.
-	*/
+	return {ingested, duplicates, unpricedModels};
+}
+
+/*
+What a record command owes about an Ingest pass.
+
+Unpriced is the accepted state rather than a defect (ADR-0015), so the record
+stands and one line per unpriced record makes it visible — which model went
+uncovered is the useful part. Then one line for the invocation rather than one
+per record: every Stop re-walks the whole transcript, so a per-record line would
+grow without bound over a session, and an OpenCode payload is one record, so the
+two commands' lines mean the same thing. An invocation that Ingested anything
+says "Recorded."; one that only dropped duplicates says "Duplicate."; one with
+no candidates at all says nothing.
+*/
+function reportIngested(
+	{ingested, duplicates, unpricedModels}: IngestTally,
+	report: Reporter,
+): void {
+	for (const model of unpricedModels) {
+		report(`no pricing for ${modelName(model)}; cost left null`);
+	}
+
 	if (ingested > 0) {
 		report('Recorded.');
 	} else if (duplicates > 0) {
 		report('Duplicate.');
 	}
 }
+
+/*
+The model a record names, or the name used for one that named none. An unnamed
+model is Unpriced like any other (ADR-0015: absent pricing is not an absent
+record), and neither report may print an empty key for it.
+*/
+function modelName(model: string | undefined): string {
+	return model ?? 'an unnamed model';
+}
+
+/*
+How a Drain went, as the two commands that run one read it: whether one was
+attempted at all, how much it carried, and what is left in the Usage Backlog.
+
+A record command says the remainder on stderr; a Backfill folds it into its
+stdout summary. Both read the same numbers rather than one re-reading the store.
+*/
+type DrainOutcome = {
+	readonly attempted: boolean;
+	readonly pushed: number;
+	readonly remaining: number;
+};
 
 /*
 One pass over the Usage Backlog at the end of the invocation (CONTEXT.md,
@@ -770,33 +873,44 @@ Skipped only when there is no `MONGO_URI`: Ingest is the required write and Push
 is best-effort (ADR-0016), so a deliberately URI-free config still lands its
 records. How much is left is read back from the store afterwards — a Push that
 failed leaves its records there, and that count is what the next invocation
-starts from.
+starts from, and what a Backfill reports as `remaining`.
+
+A failed Drain is said through `report`, because the seam reports attempts and
+this is the only thing that knows where a usage command's stderr is. A
+successful one says nothing here: the records it carried are gone from the
+backlog, and that absence is the report.
 */
 async function drainUsageBacklog(
-	options: RecordUsageOptions,
+	{createUsagePusher}: Pick<RecordUsageOptions, 'createUsagePusher'>,
 	config: Config,
-	store: UsageStore,
+	backlog: UsagePushBacklog,
 	report: Reporter,
-): Promise<void> {
+): Promise<DrainOutcome> {
 	if (config.mongoUri === undefined) {
 		report('No MONGO_URI; nothing was Pushed.');
-		return;
+		return noDrain(backlog);
 	}
 
 	const buildPusher =
-		options.createUsagePusher ??
-		((backlog: UsagePushBacklog, onAttempt: (attempt: PushAttempt) => void) =>
-			new MongoUsagePusher(config, backlog, {onAttempt}));
+		createUsagePusher ??
+		((
+			forBacklog: UsagePushBacklog,
+			onAttempt: (attempt: PushAttempt) => void,
+		) => new MongoUsagePusher(config, forBacklog, {onAttempt}));
+
+	/*
+	What the seam last reported. A failed attempt still carries the count it
+	acknowledged before it failed, so this is taken on both paths: a partial
+	Drain has Pushed some records, and the summary owes that number rather than
+	zero. The unacknowledged tail stays in the backlog and is counted below.
+	*/
+	let pushed = 0;
 
 	let pusher: UsagePush;
 	try {
-		pusher = buildPusher(store, attempt => {
-			/*
-			A failed Drain is said here, because the seam reports attempts and
-			this is the only thing that knows where a usage command's stderr is.
-			A successful one says nothing: the records it carried are gone from
-			the backlog, and that absence is the report.
-			*/
+		pusher = buildPusher(backlog, attempt => {
+			pushed = attempt.pushed;
+
 			if (!attempt.ok) {
 				report(messageOf(attempt.error));
 			}
@@ -804,12 +918,11 @@ async function drainUsageBacklog(
 	} catch (error) {
 		/*
 		A URI that is present but unparseable throws here rather than in
-		`drain()` — the seam builds its client up front. No Drain was
-		attempted, so no count is owed, but the reason has to reach stderr
-		(ADR-0016).
+		`drain()` — the seam builds its client up front. No Drain was attempted,
+		so no count is owed, but the reason has to reach stderr (ADR-0016).
 		*/
 		report(messageOf(error));
-		return;
+		return noDrain(backlog);
 	}
 
 	try {
@@ -818,14 +931,327 @@ async function drainUsageBacklog(
 		await pusher.close();
 	}
 
-	const remaining = store.usageBacklog().length;
-	if (remaining > 0) {
-		report(
-			remaining === 1
-				? '1 usage record awaits Push.'
-				: `${COUNT_FORMAT.format(remaining)} usage records await Push.`,
-		);
+	return {attempted: true, pushed, remaining: backlog.usageBacklog().length};
+}
+
+/*
+No Drain was attempted, so nothing was carried and everything is still waiting.
+*/
+function noDrain(backlog: UsagePushBacklog): DrainOutcome {
+	return {
+		attempted: false,
+		pushed: 0,
+		remaining: backlog.usageBacklog().length,
+	};
+}
+
+/*
+What a record command owes about a Drain: the count still waiting, and nothing
+when none was attempted. A URI-free config is a chosen state, so a command that
+never had a seam to build says nothing about the Backlog — the records it just
+landed simply wait for the next run that has a URI.
+*/
+function reportUsageBacklog(
+	{attempted, remaining}: DrainOutcome,
+	report: Reporter,
+): void {
+	if (!attempted || remaining === 0) {
+		return;
 	}
+
+	report(
+		remaining === 1
+			? '1 usage record awaits Push.'
+			: `${COUNT_FORMAT.format(remaining)} usage records await Push.`,
+	);
+}
+
+/*
+`usage backfill-claude`: Claude Code's projects directory through the same
+Ingest face the live hook uses.
+
+A Backfill is the operator's command, not a hook's, so it keeps the operator
+convention rather than ADR-0016: its own failure — a scan it could not make, a
+store it could not reach — comes back as `failed`, with the reason on stderr,
+and `cli.tsx` is what turns that into exit 1. A surviving Usage Backlog is
+neither: a Push is best-effort, so the run comes back clean with the remainder
+in its summary.
+
+No bulk variant and no transaction around the scan: every candidate goes through
+`store.ingest` one at a time, which is what makes a re-run idempotent — a second
+pass over the same transcripts drops as duplicates by the same rule that makes a
+live hook dedup-safe, so a crash mid-Backfill is healed by running it again.
+
+`--dry-run` drives the classify face instead of the write face: every candidate
+is compared against the real store and nothing is written or Pushed. Its known
+limit rides along — two identical candidates in one scan both report a
+would-Ingest, because neither is stored yet to be found (spec #53).
+
+`--since` is applied twice, to the same end. A file whose mtime is older than
+the bound is skipped before it is read at all, which is sound because a
+transcript's mtime is at least its last turn's time; and each surviving
+candidate's own `recorded_at` is checked, so a file touched recently enough to
+read still yields only turns at or after the bound.
+*/
+export async function runBackfillClaude(
+	options: BackfillOptions = {},
+): Promise<BackfillResult> {
+	const report = options.stderr ?? writeStderr;
+	const writeSummary = options.stdout ?? writeStdout;
+
+	let config: Config;
+	try {
+		config = options.config ?? loadConfig();
+	} catch (error) {
+		report(messageOf(error));
+		return {failed: true};
+	}
+
+	let store: BackfillStore;
+	try {
+		store = (options.createUsageStore ?? (() => new LocalStore(config)))();
+	} catch (error) {
+		report(messageOf(error));
+		return {failed: true};
+	}
+
+	try {
+		const root = options.root ?? defaultProjectsDirectory();
+
+		let files: readonly string[];
+		try {
+			files = findTranscripts(root);
+		} catch (error) {
+			report(`Could not scan ${root}: ${messageOf(error)}`);
+			return {failed: true};
+		}
+
+		const scanned = files.filter(file => !isOlderThan(file, options.since));
+		const candidates = candidatesFrom(scanned, options);
+
+		if (options.dryRun === true) {
+			const classified = classifyCandidates(candidates, store);
+			writeSummary(
+				summaryLine({
+					scanned: scanned.length,
+					candidates: candidates.length,
+					ingested: classified.wouldIngest,
+					duplicates: classified.duplicates,
+					pushed: 0,
+					remaining: 0,
+					dryRun: true,
+				}),
+			);
+			return {failed: false};
+		}
+
+		const {ingested, duplicates, unpricedModels} = ingestAll(
+			candidates,
+			CLAUDE_HARNESS,
+			store,
+		);
+		const unpriced = countUnpriced(unpricedModels);
+		const {pushed, remaining} = await drainUsageBacklog(
+			options,
+			config,
+			store,
+			report,
+		);
+
+		writeSummary(
+			summaryLine({
+				scanned: scanned.length,
+				candidates: candidates.length,
+				ingested,
+				duplicates,
+				pushed,
+				remaining,
+				dryRun: false,
+			}),
+		);
+
+		/*
+		The per-record line the record commands emit is suppressed here — a
+		thousand-record scan would spam one per record — and distinct unpriced
+		models are reported once each with their count (spec #53).
+		*/
+		for (const [model, count] of unpriced) {
+			writeSummary(unpricedLine(model, count));
+		}
+
+		return {failed: false};
+	} catch (error) {
+		report(messageOf(error));
+		return {failed: true};
+	} finally {
+		try {
+			store.close();
+		} catch (error) {
+			report(messageOf(error));
+		}
+	}
+}
+
+/*
+Where a Backfill scans when the operator names no root: Claude Code's own
+directory. Tests always name one, so nothing in the gate reaches `~/.claude`.
+*/
+function defaultProjectsDirectory(): string {
+	return join(homedir(), '.claude', 'projects');
+}
+
+/*
+Whether a transcript is too old to hold a turn at or after `since`. The bound
+holds for a file's mtime and its last turn's `recorded_at`; a file that fails
+this is skipped before it is read, which is the whole point of the pre-skip.
+*/
+function isOlderThan(file: string, since: Date | undefined): boolean {
+	if (since === undefined) {
+		return false;
+	}
+
+	try {
+		return statSync(file).mtime.getTime() < since.getTime();
+	} catch {
+		/*
+		A file that went away between the walk and this stat is not the scan
+		failing: the pre-skip is best-effort for exactly this reason, and the walk
+		that follows degrades an unreadable transcript to zero candidates on its
+		own.
+		*/
+		return false;
+	}
+}
+
+/*
+Every candidate the scanned files hold, with `--since` applied to each record's
+own `recorded_at`. A turn the bound excludes is not a candidate; the file it
+lived in was still scanned.
+*/
+function candidatesFrom(
+	files: readonly string[],
+	{since, clock}: BackfillOptions,
+): readonly UsageCandidate[] {
+	return files.flatMap(file =>
+		walkTranscript(file, {clock}).filter(
+			candidate =>
+				since === undefined ||
+				candidate.recordedAt.getTime() >= since.getTime(),
+		),
+	);
+}
+
+/*
+The SELECT half of the Backfill: whether the store already holds each candidate,
+and nothing else. `--dry-run`'s whole body, and the reason it can be trusted as
+a preview — it is the same classify `ingest` would run, only read.
+*/
+function classifyCandidates(
+	candidates: readonly UsageCandidate[],
+	store: BackfillStore,
+): {readonly wouldIngest: number; readonly duplicates: number} {
+	let wouldIngest = 0;
+	let duplicates = 0;
+
+	for (const candidate of candidates) {
+		if (store.duplicatesExisting({...candidate, harness: CLAUDE_HARNESS})) {
+			duplicates += 1;
+		} else {
+			wouldIngest += 1;
+		}
+	}
+
+	return {wouldIngest, duplicates};
+}
+
+/*
+A Backfill's unpriced models, counted by name. The record commands' per-record
+line is suppressed here — a thousand-record scan would spam one per record — so
+each distinct model is named once with its count (ADR-0015: absent pricing is
+not an absent record). A record with no model at all counts under one name, so
+the summary does not print an unreadable key.
+*/
+function countUnpriced(
+	models: ReadonlyArray<string | undefined>,
+): ReadonlyMap<string, number> {
+	const counts = new Map<string, number>();
+
+	for (const model of models) {
+		const name = modelName(model);
+		counts.set(name, (counts.get(name) ?? 0) + 1);
+	}
+
+	return counts;
+}
+
+/*
+A Backfill's summary, as one line on stdout. The field order is the spec's:
+scanned, candidates, ingested, duplicates dropped, pushed, remaining. A dry run
+has no Drain to report, so its line ends at the two counts it can know —
+would-Ingest and duplicates found — and says nothing about a Push it never
+attempted.
+
+`scanned` is transcripts actually read: the `--since` pre-skip is a file not
+read, and so not scanned, which is what makes the pre-skip visible in the
+summary rather than only in the candidates it saved.
+*/
+type BackfillSummary = {
+	readonly scanned: number;
+	readonly candidates: number;
+	readonly ingested: number;
+	readonly duplicates: number;
+	readonly pushed: number;
+	readonly remaining: number;
+	readonly dryRun: boolean;
+};
+
+function summaryLine({
+	scanned,
+	candidates,
+	ingested,
+	duplicates,
+	pushed,
+	remaining,
+	dryRun,
+}: BackfillSummary): string {
+	const counts = dryRun
+		? [
+				`${COUNT_FORMAT.format(ingested)} would-ingest`,
+				`${COUNT_FORMAT.format(duplicates)} duplicates found`,
+			]
+		: [
+				`${COUNT_FORMAT.format(ingested)} ingested`,
+				`${COUNT_FORMAT.format(duplicates)} duplicates dropped`,
+				`${COUNT_FORMAT.format(pushed)} pushed`,
+				`${COUNT_FORMAT.format(remaining)} remaining`,
+			];
+
+	return [
+		`scanned ${COUNT_FORMAT.format(scanned)} transcripts`,
+		`${COUNT_FORMAT.format(candidates)} candidates`,
+		...counts,
+	].join(', ');
+}
+
+/*
+One distinct unpriced model, with how many records it left null. The record
+commands' line, aggregated: same sentence, with the count a Backfill's volume
+needs.
+*/
+function unpricedLine(model: string, count: number): string {
+	const records =
+		count === 1 ? '1 record' : `${COUNT_FORMAT.format(count)} records`;
+
+	return `no pricing for ${model}; cost left null (${records})`;
+}
+
+/*
+Where a Backfill's summary goes: stdout, because it is the answer to a question
+the operator asked rather than a diagnostic. Every problem still goes to
+stderr, so a script reading the summary line is not confused by it.
+*/
+function writeStdout(message: string): void {
+	process.stdout.write(`${message}\n`);
 }
 
 /*

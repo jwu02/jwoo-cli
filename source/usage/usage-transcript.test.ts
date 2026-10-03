@@ -9,11 +9,11 @@ test. The retired `usage-lib.test.mjs` is the fixture basis; the sidechain,
 isMeta, zero-token and fallback cases are new.
 */
 
-import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {mkdirSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test, {type ExecutionContext} from 'ava';
-import {walkTranscript} from './usage-transcript.js';
+import {findTranscripts, walkTranscript} from './usage-transcript.js';
 
 /*
 A directory one test owns and gives back, under the OS's temp directory so
@@ -304,4 +304,30 @@ test('malformed and non-object lines are skipped, not thrown', t => {
 	const file = transcript(t, [user(), '{not json', '', 'null', assistant()]);
 
 	t.is(walkTranscript(file).length, 1);
+});
+
+/*
+The projects-directory walk: every `.jsonl` under the root, `subagents/`
+included, and nothing else. Sorted, so a Backfill's summary and its Ingest order
+do not depend on the order the filesystem hands files back.
+*/
+test('findTranscripts walks every nested .jsonl, subagents included', t => {
+	const root = temporaryDirectory(t);
+	mkdirSync(join(root, 'project-a', 'subagents'), {recursive: true});
+	mkdirSync(join(root, 'project-b'), {recursive: true});
+
+	const wanted = [
+		join(root, 'project-a', 'session.jsonl'),
+		join(root, 'project-a', 'subagents', 'agent-1.jsonl'),
+		join(root, 'project-b', 'session.jsonl'),
+	].toSorted();
+	for (const file of wanted) {
+		writeFileSync(file, '');
+	}
+
+	// Not transcripts, so not returned.
+	writeFileSync(join(root, 'project-a', 'notes.txt'), '');
+	writeFileSync(join(root, 'README.md'), '');
+
+	t.deepEqual(findTranscripts(root), wanted);
 });

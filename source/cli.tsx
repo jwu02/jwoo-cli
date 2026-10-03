@@ -37,17 +37,21 @@ import for the same reason.
     $ jwoo-cli permissions  report the macOS grants collection needs
     $ jwoo-cli usage record-claude-hook  Ingest a Claude Code hook's turns, from stdin
     $ jwoo-cli usage record-opencode  Ingest one OpenCode message, from stdin
+    $ jwoo-cli usage backfill-claude [root]  Ingest Claude Code transcripts from a projects dir
 
-Nothing here sets an exit code for a usage command, and that is ADR-0016 rather
+Nothing here sets an exit code for a record command, and that is ADR-0016 rather
 than an omission: the record commands exit 0 on every path of their own, so they
 resolve with nothing and the process's default code stands. Their failures are
 stderr lines, which is the whole point — a non-zero code would surface inside
-the agent session the command observes.
+the agent session the command observes. `backfill-claude` is the operator's
+command and not a hook's, so its own failure is an exit 1 here — and only its
+own, since a Usage Backlog that survives the run is not an error.
 */
 
 import process from 'node:process';
 import {parseArguments} from './args.js';
 import {
+	runBackfillClaude,
 	runCollect,
 	runDashboard,
 	runPermissions,
@@ -88,12 +92,12 @@ try {
 		}
 
 		case 'usage': {
-			/*
-			No exit code is read off either: the hook contract makes every path
-			of its own a clean exit, and each command reports through stderr
-			instead.
-			*/
 			switch (command.command) {
+				/*
+				No exit code is read off either record command: the hook contract
+				makes every path of its own a clean exit, and each reports through
+				stderr instead.
+				*/
 				case 'record-claude-hook': {
 					await runRecordClaudeHook();
 					break;
@@ -101,6 +105,27 @@ try {
 
 				case 'record-opencode': {
 					await runRecordOpencode();
+					break;
+				}
+
+				/*
+				The Backfill is the operator's, so its failure is an exit code: a
+				scan or store it could not make comes back with `failed` set, and
+				this is the only place that can say so to a shell. A surviving
+				Usage Backlog is not that — it comes back clean, with the
+				remainder in the summary.
+				*/
+				case 'backfill-claude': {
+					const {failed} = await runBackfillClaude({
+						root: command.root,
+						dryRun: command.dryRun,
+						since: command.since,
+					});
+
+					if (failed) {
+						process.exitCode = 1;
+					}
+
 					break;
 				}
 			}

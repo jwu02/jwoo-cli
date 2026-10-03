@@ -8,10 +8,11 @@ runnable without a rendered Ink tree, so it cannot be something that only exists
 inside one.
 
 `usage` is the third group: it holds the commands that Ingest AI usage (spec
-#53), and a group rather than four more top-level commands because they share a
+#53), and a group rather than three more top-level commands because they share a
 shape — each reads a Harness's own artifact and Ingests through the same store
-face — and because `usage` alone names nothing. Only `record-claude-hook` is
-wired so far; the record and Backfill siblings land beside it.
+face — and because `usage` alone names nothing. The two record commands take
+their payload on stdin and nothing else; `backfill-claude` is the operator's,
+and carries the flags a scan takes.
 
 Parsing is a pure function of argv, so what a given command line means is
 testable without a process. `cli.tsx` is what passes in the real `process.argv`
@@ -21,18 +22,31 @@ and lets meow exit on a bad one; nothing here does.
 import process from 'node:process';
 import meow, {type Options, type Result} from 'meow';
 
-/*
-The commands of the `usage` group. The two live record commands are wired; the
-two Backfills land with their own tickets, and the group is the argv surface
-they slot into, so it is named once here.
-*/
-export type UsageCommand = 'record-claude-hook' | 'record-opencode';
-
 export type Command =
 	| {readonly kind: 'dashboard'}
 	| {readonly kind: 'collect'}
 	| {readonly kind: 'permissions'}
-	| {readonly kind: 'usage'; readonly command: UsageCommand};
+	| {readonly kind: 'usage'; readonly command: 'record-claude-hook'}
+	| {readonly kind: 'usage'; readonly command: 'record-opencode'}
+	| {
+			readonly kind: 'usage';
+			readonly command: 'backfill-claude';
+			/*
+			The projects directory to scan; absent means Claude Code's own, which
+			the entry point resolves rather than this module.
+			*/
+			readonly root: string | undefined;
+			/*
+			Classify every candidate against the real store without writing — the
+			preview the retired script offered (spec #53).
+			*/
+			readonly dryRun: boolean;
+			/*
+			Only turns at or after this instant, resolved from `--since`; absent
+			means no bound.
+			*/
+			readonly since: Date | undefined;
+	  };
 
 /*
 No leading description: meow prints `package.json`'s, and stating it here too
@@ -45,23 +59,41 @@ export const HELP_TEXT = `
 	  $ jwoo-cli permissions               report the macOS grants collection needs
 	  $ jwoo-cli usage record-claude-hook  Ingest a Claude Code hook's turns, from stdin
 	  $ jwoo-cli usage record-opencode     Ingest one OpenCode message, from stdin
+	  $ jwoo-cli usage backfill-claude [root]
+	                                       Ingest Claude Code transcripts from a projects dir
 
 	Options
 	  --help     Show this help
 	  --version  Show the version
 
+	Backfill options
+	  --dry-run  classify every candidate without writing
+	  --since    only turns at or after this ISO instant
+
 	Collection runs in this process and stops when it exits. Ctrl-C Flushes what
 	has accumulated before quitting.
 `;
 
-const MEOW_OPTIONS: Options<Record<never, never>> = {
+const MEOW_OPTIONS: Options<{
+	dryRun: {type: 'boolean'};
+	since: {type: 'string'};
+}> = {
 	importMeta: import.meta,
 	/*
-	A typo'd flag is a mistake worth reporting rather than something to pass
-	through: there are no flags to forward, and a silently ignored one looks the
-	same as one that was honoured.
+	A flag this module does not declare is a typo worth reporting rather than
+	something to pass through: a silently ignored one looks the same as one that
+	was honoured.
 	*/
 	allowUnknownFlags: false,
+	/*
+	The two Backfill flags, declared so meow knows them rather than refusing them
+	outright. Which commands may carry them is this module's decision, not
+	meow's — `commandFor` refuses a flag on any command that does not take one.
+	*/
+	flags: {
+		dryRun: {type: 'boolean'},
+		since: {type: 'string'},
+	},
 };
 
 /*
@@ -69,8 +101,14 @@ One argument or none. A bare `jwoo-cli dashboard` is rejected rather than
 treated as the default, so the two spellings cannot drift apart.
 */
 export function commandFor(
-	{input}: Pick<Result<Record<never, never>>, 'input'>,
+	{input, flags}: Pick<Result<Record<never, never>>, 'input' | 'flags'>,
 	showHelp: (exitCode?: number) => never,
+	/*
+	The line as it was typed, which `flags` cannot always stand in for: meow
+	hands back `false` both for an absent boolean flag and for one written
+	`--dry-run=false`, so only the raw text says whether one was carried.
+	*/
+	argv: readonly string[] = [],
 ): Command {
 	const [subcommand, ...rest] = input;
 
@@ -81,10 +119,15 @@ export function commandFor(
 	for it.
 	*/
 	if (subcommand === 'usage') {
-		return usageCommandFor(rest, showHelp);
+		return usageCommandFor(rest, flags, argv, showHelp);
 	}
 
-	if (rest.length > 0) {
+	/*
+	No top-level command takes a flag, so meow knowing the Backfill's two is not
+	the same as them being accepted everywhere: `collect --dry-run` is the same
+	mistake it always was.
+	*/
+	if (rest.length > 0 || hasBackfillFlags(flags, argv)) {
 		showHelp(2);
 	}
 
@@ -108,25 +151,44 @@ export function commandFor(
 }
 
 /*
-The command the `usage` group names, and nothing after it. `usage` alone is
-rejected rather than defaulted to any one of its commands, for the reason a bare
-`dashboard` is: a spelling that means something only by convention is the one
-that drifts.
+The command the `usage` group names. `usage` alone is rejected rather than
+defaulted to any one of its commands, for the reason a bare `dashboard` is: a
+spelling that means something only by convention is the one that drifts.
+
+The two record commands take no flags — their payload arrives on stdin — so a
+flag on one is a typo, refused here rather than passed through.
 */
 function usageCommandFor(
 	args: readonly string[],
+	flags: Record<string, unknown>,
+	argv: readonly string[],
 	showHelp: (exitCode?: number) => never,
 ): Command {
 	const [command, ...rest] = args;
 
-	if (rest.length > 0) {
-		showHelp(2);
-	}
-
 	switch (command) {
 		case 'record-claude-hook':
 		case 'record-opencode': {
+			if (rest.length > 0 || hasBackfillFlags(flags, argv)) {
+				showHelp(2);
+			}
+
 			return {kind: 'usage', command};
+		}
+
+		case 'backfill-claude': {
+			const [root, ...extra] = rest;
+			if (extra.length > 0) {
+				showHelp(2);
+			}
+
+			return {
+				kind: 'usage',
+				command,
+				root,
+				dryRun: flags['dryRun'] === true,
+				since: sinceFrom(flags['since'], showHelp),
+			};
 		}
 
 		case undefined:
@@ -136,10 +198,61 @@ function usageCommandFor(
 	}
 }
 
+/*
+Whether a line carried any of the Backfill's flags. Both halves are needed and
+neither is redundant: the parsed flags carry `--since`'s value, which the text
+does not have to hand, while the text is the only thing that knows about a flag
+written `--dry-run=false` — meow parses that to `false`, the same value it gives
+an absent one. What the operator typed is the question either way.
+*/
+function hasBackfillFlags(
+	flags: Record<string, unknown>,
+	argv: readonly string[],
+): boolean {
+	return (
+		flags['dryRun'] === true ||
+		flags['since'] !== undefined ||
+		argv.some(argument => BACKFILL_FLAG.test(argument))
+	);
+}
+
+/*
+A bare `--dry-run`, a negated `--no-dry-run`, or either flag with a value:
+`\b` keeps `--since` from matching a word that merely starts with it.
+*/
+const BACKFILL_FLAG = /^--(?:no-)?(?:dry-run|since)\b/v;
+
+/*
+`--since`, as an instant. An unparseable one is a bad command line rather than a
+filter that silently matches nothing, so it is refused with the same code a typo
+is.
+*/
+function sinceFrom(
+	value: unknown,
+	showHelp: (exitCode?: number) => never,
+): Date | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+
+	// A string flag's value arrives as a string; anything else is a shape this
+	// command never declared, so it is refused like a bad instant.
+	if (typeof value !== 'string') {
+		showHelp(2);
+	}
+
+	const since = new Date(value);
+	if (Number.isNaN(since.getTime())) {
+		showHelp(2);
+	}
+
+	return since;
+}
+
 export function parseArguments(
 	argv: readonly string[] = process.argv.slice(2),
 ): Command {
 	const cli = meow(HELP_TEXT, {...MEOW_OPTIONS, argv: [...argv]});
 
-	return commandFor(cli, cli.showHelp);
+	return commandFor(cli, cli.showHelp, argv);
 }

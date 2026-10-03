@@ -26,7 +26,8 @@ not ported. The walk is the superset: it sees every turn, gives each its own rea
 `recorded_at`, and re-walks safely because Ingest drops duplicates.
 */
 
-import {readFileSync} from 'node:fs';
+import {readdirSync, readFileSync} from 'node:fs';
+import {join} from 'node:path';
 import {type UsageRecord} from '../store/local-store.js';
 
 /*
@@ -167,6 +168,37 @@ export function walkTranscript(
 	}
 
 	return candidates;
+}
+
+/*
+Every transcript file under a projects directory, in a stable order.
+
+The whole tree, `subagents/` included: a subagent's turns are usage like any
+other, and they sit in their own `.jsonl` files beside their session's. The walk
+is recursive because Claude Code lays sessions out by project, and each project
+directory holds its own transcripts and its own `subagents/`.
+
+Sorted, so a Backfill's summary and the order it Ingests in do not depend on the
+order the filesystem happens to hand files back. A directory that cannot be read
+throws: a scan the operator asked for but could not make is the Backfill's own
+failure, and the command is what turns it into exit 1.
+*/
+export function findTranscripts(root: string): string[] {
+	const found: string[] = [];
+
+	const walk = (directory: string): void => {
+		for (const entry of readdirSync(directory, {withFileTypes: true})) {
+			const path = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				walk(path);
+			} else if (entry.isFile() && path.endsWith('.jsonl')) {
+				found.push(path);
+			}
+		}
+	};
+
+	walk(root);
+	return found.toSorted();
 }
 
 /*

@@ -113,8 +113,9 @@ whole of the difference between them.
 
 `cli.tsx` is the entry point above them all: it parses argv, dispatches to the one
 the command names, turns how that run ended into the process exit code — non-zero when the
-final Flush failed, and the only place that code is set — and reports a failure's message
-rather than its stack. The dispatch is the whole of the pairing between a command and the entry
+final Flush failed, or when a Backfill returns `failed` for a scan or store it could not
+reach, and the only place that code is set — and reports a failure's message rather than its
+stack. The dispatch is the whole of the pairing between a command and the entry
 point that runs it, and it lives there rather than here so the pairing is stated once — which is
 why the composition root imports no command type at all, and why the `permissions` command is
 the one that announces a grant: it is the one that was asked.
@@ -173,12 +174,26 @@ names (always the transcript, never the proxy's non-standard `input.usage` short
 `record-opencode` reads one `info` blob the Shim delivers and projects it into the single Usage
 Record it represents. Each Ingests with the Harness literal the command owns, and both run the
 same Ingest-then-Drain path — `main.tsx`'s `runUsageRecord` — so only the projection differs. The
-two Backfills land beside them, which is what the group is for. The record commands are also the
-ones that never throw: ADR-0016 makes exit 0 on every path of their own a contract, so `cli.tsx`
-reads no code off them and their diagnostics are stderr lines — "Recorded." or "Duplicate.", one
-unpriced line per record that needed one, and the Usage Backlog's count when a Drain was
-attempted and left something behind. `MONGO_URI` is optional for them: the Ingest lands in the
-Local Store either way, and a config without one builds no Push seam and drains nothing.
+record commands are also the ones that never throw: ADR-0016 makes exit 0 on every path of their
+own a contract, so `cli.tsx` reads no code off them and their diagnostics are stderr lines —
+"Recorded." or "Duplicate.", one unpriced line per record that needed one, and the Usage Backlog's
+count when a Drain was attempted and left something behind. `MONGO_URI` is optional for them: the
+Ingest lands in the Local Store either way, and a config without one builds no Push seam and
+drains nothing.
+
+**`backfill-claude` is the group's third command, and the operator's rather than a hook's.**
+It walks Claude Code's whole projects directory — `subagents/` included, since a subagent's turns
+are usage like any other — and hands every candidate to the same Ingest face the live hook uses,
+one record at a time: no bulk variant and no transaction around the scan, so a crash re-runs into
+the drop rule and a re-run adds nothing. `main.tsx`'s `runBackfillClaude` drives the store's
+classify face for `--dry-run` (nothing written, no Push attempted), and applies `--since` twice to
+the same end — a file older than the bound is skipped before it is read, because a transcript's
+mtime is at least its last turn's time, and each surviving candidate's own `recorded_at` is
+checked too. Because it is not a hook, it keeps the operator convention instead of ADR-0016: its
+own failure — a scan or store it could not reach — resolves `false` and `cli.tsx` turns that into
+exit 1, while a surviving Usage Backlog is not a failure at all. Its report is on stdout as one
+summary line — scanned, candidates, ingested, duplicates dropped, pushed, remaining — with the
+distinct unpriced models named once each beneath it, and only diagnostics on stderr.
 
 **The Shim is the OpenCode half of that wiring, and it lives outside the gate.**
 `opencode-plugin/jwoo.mjs` is plain JS — no `@opencode-ai/plugin` import, because the installed

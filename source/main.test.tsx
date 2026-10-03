@@ -1,6 +1,12 @@
-import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	utimesSync,
+	writeFileSync,
+} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
 import process from 'node:process';
 import test, {type ExecutionContext} from 'ava';
 import {type Config} from './store/config.js';
@@ -22,6 +28,7 @@ import {
 	type RecordUsageOptions,
 	type RunOptions,
 	type RunStore,
+	runBackfillClaude,
 	runCollect,
 	runDashboard,
 	runPermissions,
@@ -2083,6 +2090,17 @@ class FakeUsageStore implements UsageStore {
 		};
 	}
 
+	/*
+	The classify half `--dry-run` drives. Whole-record equality — the same key
+	`ingest` dedups on above — so a preview and a real run agree on what is
+	already there.
+	*/
+	duplicatesExisting(record: UsageRecord): boolean {
+		return this.records.some(
+			stored => JSON.stringify(stored) === JSON.stringify(record),
+		);
+	}
+
 	usageBacklog(): readonly BackloggedUsage[] {
 		return this.waiting;
 	}
@@ -2111,14 +2129,21 @@ class FakeUsageStore implements UsageStore {
 /*
 The Usage Push seam, standing in. A successful pass carries everything and
 acknowledges it, so the count the command reads back afterwards is the count
-this fake left behind; a failed one acknowledges nothing and says so through the
-sink the command built it with.
+this fake left behind; a failed one acknowledges what it did carry first — none
+by default, or `pushesBeforeFailing` — and says so through the sink the command
+built it with.
 */
 class FakeUsagePusher implements UsagePush {
 	#onAttempt: ((attempt: PushAttempt) => void) | undefined;
 	drains = 0;
 	closes = 0;
 	failsWith?: Error;
+	/*
+	How many records a failing Drain carries and acknowledges before it fails,
+	modeling the real seam's partial batch. Zero is a Drain that fails before
+	anything lands.
+	*/
+	pushesBeforeFailing = 0;
 	backlog: UsagePushBacklog | undefined;
 
 	attach(
@@ -2133,16 +2158,29 @@ class FakeUsagePusher implements UsagePush {
 		this.drains += 1;
 
 		if (this.failsWith !== undefined) {
+			/*
+			Copied before it is acknowledged. `usageBacklog()` hands back the
+			store's own live array, and `markUsagePushed` splices it — iterating
+			that same array would skip every record after the first.
+			*/
+			const carried = [...(this.backlog?.usageBacklog() ?? [])].slice(
+				0,
+				this.pushesBeforeFailing,
+			);
+			for (const record of carried) {
+				this.backlog?.markUsagePushed(record.id, new Date());
+			}
+
 			this.#onAttempt?.({
 				at: new Date(),
 				ok: false,
-				pushed: 0,
+				pushed: carried.length,
 				error: this.failsWith,
 			});
 			return;
 		}
 
-		const carried = this.backlog?.usageBacklog() ?? [];
+		const carried = [...(this.backlog?.usageBacklog() ?? [])];
 		for (const record of carried) {
 			this.backlog?.markUsagePushed(record.id, new Date());
 		}
@@ -2770,4 +2808,397 @@ test('an unreadable OpenCode payload is a stderr line, and still drains', async 
 	t.deepEqual(store.records, []);
 	t.regex(written[0] ?? '', /Could not read the OpenCode input/v);
 	t.is(pusher.drains, 1);
+});
+
+/*
+`usage backfill-claude`, and the projects directory it walks
+------------------------------------------------------------
+
+The same store, seam and transcript walk the record commands use, over a tree of
+fixture `.jsonl` files instead of one path. The walk itself is
+`usage-transcript.test.ts`'s subject; what is driven here is the command around
+it — the whole directory scanned (subagents included), every candidate through
+the one Ingest face, `--dry-run` against the classify face, `--since` twice
+over, and the operator's exit-1 contract.
+*/
+
+/*
+The store the Backfill tests drive, which is the record commands' fake plus the
+one thing their tests never needed: an Ingested record joins the Usage Backlog.
+
+The real store's backlog is exactly its unpushed rows, so the summary's `pushed`
+and `remaining` are only meaningful against a store that models that. The shared
+fake keeps `waiting` and `records` apart because the record commands' tests seed
+a backlog by hand; this one closes the gap for the Backfill, where the records
+that await Push are the records the run just wrote.
+*/
+class FakeBackfillStore extends FakeUsageStore {
+	override ingest(record: UsageRecord): IngestResult {
+		const result = super.ingest(record);
+
+		if (result.status === 'ingested') {
+			this.waiting.push({
+				...record,
+				id: result.id,
+				costYuan: result.costYuan,
+			});
+		}
+
+		return result;
+	}
+}
+
+/*
+One fixture projects directory, under the OS's temp directory so nothing a test
+writes can be committed by accident — and never `~/.claude`, which the gate may
+not touch. Keys are paths relative to the root, so `subagents/` nests the way it
+does on disk.
+*/
+function transcriptTree(
+	t: ExecutionContext,
+	files: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>>,
+): string {
+	const root = mkdtempSync(join(tmpdir(), 'jwoo-cli-backfill-test-'));
+	t.teardown(() => {
+		rmSync(root, {recursive: true, force: true});
+	});
+
+	for (const [relative, lines] of Object.entries(files)) {
+		const file = join(root, relative);
+		mkdirSync(dirname(file), {recursive: true});
+		writeFileSync(file, lines.map(line => JSON.stringify(line)).join('\n'));
+	}
+
+	return root;
+}
+
+type BackfillRun = {
+	readonly store: FakeBackfillStore;
+	readonly pusher: FakeUsagePusher;
+	readonly stdout: string[];
+	readonly stderr: string[];
+	/*
+	Whether the Backfill resolved clean, which `cli.tsx` reads as exit 0.
+	*/
+	readonly ok: boolean;
+	readonly pusherBuilt: number;
+};
+
+/*
+One `usage backfill-claude` invocation, with everything it reaches outside
+itself stood in for.
+*/
+async function runBackfill({
+	root,
+	since,
+	dryRun = false,
+	config = CONFIG,
+	store = new FakeBackfillStore(),
+	pusher = new FakeUsagePusher(),
+}: {
+	readonly root: string;
+	readonly since?: Date;
+	readonly dryRun?: boolean;
+	readonly config?: Config;
+	readonly store?: FakeBackfillStore;
+	readonly pusher?: FakeUsagePusher;
+}): Promise<BackfillRun> {
+	const stdout: string[] = [];
+	const stderr: string[] = [];
+	let pusherBuilt = 0;
+
+	const result = await runBackfillClaude({
+		root,
+		since,
+		dryRun,
+		config,
+		stdout(message) {
+			stdout.push(message);
+		},
+		stderr(message) {
+			stderr.push(message);
+		},
+		createUsageStore: () => store,
+		createUsagePusher(backlog, onAttempt) {
+			pusherBuilt += 1;
+			pusher.attach(onAttempt, backlog);
+			return pusher;
+		},
+	});
+
+	return {store, pusher, stdout, stderr, ok: !result.failed, pusherBuilt};
+}
+
+/*
+The demoable path: a projects directory in, its turns Ingested with the Harness
+literal the command owns. `subagents/` is walked like any other directory, so
+the subagent's turn is a record too.
+*/
+test('a Backfill walks the whole tree, including subagents, and summarizes it', async t => {
+	const root = transcriptTree(t, {
+		'project-a/session.jsonl': HOOK_TURN,
+		'project-a/subagents/agent-1.jsonl': SECOND_TURN,
+	});
+
+	const {store, pusher, stdout, ok} = await runBackfill({root});
+
+	t.true(ok);
+	t.is(store.records.length, 2);
+	t.true(store.records.every(record => record.harness === 'Claude Code'));
+	t.is(pusher.drains, 1);
+	t.is(store.closes, 1);
+	t.deepEqual(stdout, [
+		'scanned 2 transcripts, 2 candidates, 2 ingested, 0 duplicates dropped, 2 pushed, 0 remaining',
+	]);
+});
+
+/*
+The drop rule is what makes a Backfill idempotent: a second pass over the same
+transcripts adds nothing, so a crash mid-scan is healed by running it again.
+*/
+test('re-running a Backfill adds nothing', async t => {
+	const root = transcriptTree(t, {
+		'project-a/session.jsonl': HOOK_TURN,
+	});
+	const store = new FakeBackfillStore();
+
+	const first = await runBackfill({root, store});
+	const second = await runBackfill({root, store});
+
+	t.is(first.store.records.length, 1);
+	t.is(second.store.records.length, 1, 'the drop rule held');
+	t.deepEqual(second.stdout, [
+		'scanned 1 transcripts, 1 candidates, 0 ingested, 1 duplicates dropped, 0 pushed, 0 remaining',
+	]);
+});
+
+/*
+`--dry-run` is the classify face, so the store is read and never written and no
+Push is attempted at all.
+*/
+test('a dry run classifies every candidate and writes nothing', async t => {
+	const root = transcriptTree(t, {
+		'project-a/session.jsonl': HOOK_TURN,
+		'project-a/subagents/agent-1.jsonl': SECOND_TURN,
+	});
+
+	const {store, pusher, stdout, pusherBuilt, ok} = await runBackfill({
+		root,
+		dryRun: true,
+	});
+
+	t.true(ok);
+	t.deepEqual(store.records, [], 'nothing was Ingested');
+	t.is(pusherBuilt, 0, 'and no seam was built');
+	t.is(pusher.drains, 0);
+	t.is(store.closes, 1, 'the store it read from is still closed');
+	t.deepEqual(stdout, [
+		'scanned 2 transcripts, 2 candidates, 2 would-ingest, 0 duplicates found',
+	]);
+});
+
+/*
+The documented limit of a dry run: two identical candidates in one scan both
+report a would-ingest, because neither is stored yet for the second to find. The
+real run below drops the second.
+*/
+test('two identical candidates both report a would-ingest in a dry run', async t => {
+	const root = transcriptTree(t, {
+		'project-a/session.jsonl': HOOK_TURN,
+		'project-b/session.jsonl': HOOK_TURN,
+	});
+
+	const dry = await runBackfill({root, dryRun: true});
+	t.deepEqual(dry.stdout, [
+		'scanned 2 transcripts, 2 candidates, 2 would-ingest, 0 duplicates found',
+	]);
+
+	const real = await runBackfill({root});
+	t.is(real.store.records.length, 1, 'the real run drops the second');
+	t.deepEqual(real.stdout, [
+		'scanned 2 transcripts, 2 candidates, 1 ingested, 1 duplicates dropped, 1 pushed, 0 remaining',
+	]);
+});
+
+/*
+`--since` is applied to each record's own `recorded_at`: a file touched recently
+enough to read still yields only turns at or after the bound.
+*/
+test('--since filters each candidate on its own recorded_at', async t => {
+	const root = transcriptTree(t, {
+		'project-a/session.jsonl': HOOK_TURN,
+		'project-a/later.jsonl': SECOND_TURN,
+	});
+
+	const since = new Date('2026-08-18T07:01:00.000Z');
+	const {store, stdout} = await runBackfill({root, since});
+
+	/*
+	Both files are scanned — their mtimes are now — but only the later turn,
+	timestamped at the bound itself, survives the per-record filter.
+	*/
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.completion_tokens, 3);
+	t.deepEqual(stdout, [
+		'scanned 2 transcripts, 1 candidates, 1 ingested, 0 duplicates dropped, 1 pushed, 0 remaining',
+	]);
+});
+
+/*
+The pre-skip: a file whose mtime is older than the bound cannot hold a turn at
+or after it, so it is not read at all — and `scanned` counts what was read.
+*/
+test('--since skips a file older than the bound without reading it', async t => {
+	const root = transcriptTree(t, {
+		'project-a/old.jsonl': HOOK_TURN,
+		'project-a/new.jsonl': SECOND_TURN,
+	});
+
+	const old = new Date('2026-08-18T07:00:01.000Z');
+	utimesSync(join(root, 'project-a/old.jsonl'), old, old);
+
+	const since = new Date('2026-08-18T07:01:00.000Z');
+	const {stdout} = await runBackfill({root, since});
+
+	t.deepEqual(stdout, [
+		'scanned 1 transcripts, 1 candidates, 1 ingested, 0 duplicates dropped, 1 pushed, 0 remaining',
+	]);
+});
+
+/*
+A root the scan cannot read is the Backfill's own failure, so it resolves false
+— which `cli.tsx` turns into exit 1 — and says why on stderr.
+*/
+test('a root that cannot be scanned fails the Backfill', async t => {
+	const root = join(tmpdir(), 'jwoo-cli-no-such-projects-dir');
+
+	const {ok, stderr, store} = await runBackfill({root});
+
+	t.false(ok);
+	t.regex(stderr[0] ?? '', /Could not scan/v);
+	t.is(store.closes, 1, 'the store is still closed on the failing path');
+});
+
+test('a store that cannot be opened fails the Backfill', async t => {
+	const root = transcriptTree(t, {'project-a/session.jsonl': HOOK_TURN});
+	const stderr: string[] = [];
+
+	const result = await runBackfillClaude({
+		root,
+		config: CONFIG,
+		stderr(message) {
+			stderr.push(message);
+		},
+		createUsageStore() {
+			throw new Error('Could not open the Local Store: file is not a database');
+		},
+	});
+
+	t.true(result.failed);
+	t.true(stderr.some(line => line.includes('file is not a database')));
+});
+
+/*
+A store that will not take a record is the other half of the Backfill's own
+failure: the run stops and resolves false rather than reporting a partial scan
+as if it were whole.
+*/
+test('an Ingest that throws fails the Backfill', async t => {
+	const root = transcriptTree(t, {'project-a/session.jsonl': HOOK_TURN});
+	const store = new FakeBackfillStore();
+	store.failIngest = new Error('database is locked');
+
+	const {ok, stderr, pusher} = await runBackfill({root, store});
+
+	t.false(ok);
+	t.true(stderr.some(line => line.includes('database is locked')));
+	t.is(pusher.drains, 0, 'a run that failed did not reach the Drain');
+	t.is(store.closes, 1);
+});
+
+/*
+A surviving Usage Backlog is not the Backfill's failure (the operator
+convention): the Push is best-effort, so the run resolves clean with the
+remainder in its summary.
+*/
+test('a surviving Usage Backlog is reported, not a failure', async t => {
+	const root = transcriptTree(t, {'project-a/session.jsonl': HOOK_TURN});
+	const store = new FakeBackfillStore();
+	store.waiting.push(backloggedUsage(1));
+	const pusher = new FakeUsagePusher();
+	pusher.failsWith = new Error('connect ECONNREFUSED 127.0.0.1');
+
+	const {ok, stdout, stderr} = await runBackfill({root, store, pusher});
+
+	t.true(ok, 'a Push is best-effort');
+	t.true(stderr.some(line => line.includes('connect ECONNREFUSED')));
+	t.deepEqual(stdout, [
+		'scanned 1 transcripts, 1 candidates, 1 ingested, 0 duplicates dropped, 0 pushed, 2 remaining',
+	]);
+});
+
+/*
+A Drain that fails part-way still Pushed what it carried, and the summary owes
+that count rather than zero: the two fields have to agree with each other.
+*/
+test('a partial Drain reports the records it did Push', async t => {
+	const root = transcriptTree(t, {
+		'project-a/session.jsonl': HOOK_TURN,
+		'project-a/later.jsonl': SECOND_TURN,
+	});
+	const pusher = new FakeUsagePusher();
+	pusher.failsWith = new Error('server selection timed out');
+	pusher.pushesBeforeFailing = 1;
+
+	const {ok, stdout, stderr} = await runBackfill({root, pusher});
+
+	t.true(ok);
+	t.true(stderr.some(line => line.includes('server selection timed out')));
+	t.deepEqual(stdout, [
+		'scanned 2 transcripts, 2 candidates, 2 ingested, 0 duplicates dropped, 1 pushed, 1 remaining',
+	]);
+});
+
+/*
+No `MONGO_URI` is a chosen state: the records still land, no seam is built, and
+the summary says nothing was Pushed.
+*/
+test('no Backfill Push without a MONGO_URI, and the records still land', async t => {
+	const root = transcriptTree(t, {'project-a/session.jsonl': HOOK_TURN});
+	const store = new FakeBackfillStore();
+
+	const {ok, stdout, stderr, pusherBuilt, pusher} = await runBackfill({
+		root,
+		store,
+		config: {...CONFIG, mongoUri: undefined},
+	});
+
+	t.true(ok);
+	t.is(store.records.length, 1);
+	t.is(pusherBuilt, 0);
+	t.is(pusher.drains, 0);
+	t.true(stderr.includes('No MONGO_URI; nothing was Pushed.'));
+	t.deepEqual(stdout, [
+		'scanned 1 transcripts, 1 candidates, 1 ingested, 0 duplicates dropped, 0 pushed, 1 remaining',
+	]);
+});
+
+/*
+The per-record unpriced line is suppressed on a Backfill, and each distinct
+unpriced model is named once with its count (spec #53).
+*/
+test('Unpriced models are aggregated once each in the summary', async t => {
+	const root = transcriptTree(t, {
+		'project-a/session.jsonl': HOOK_TURN,
+		'project-a/later.jsonl': SECOND_TURN,
+	});
+	const store = new FakeBackfillStore();
+	store.unpriced = true;
+
+	const {stdout} = await runBackfill({root, store});
+
+	t.deepEqual(stdout, [
+		'scanned 2 transcripts, 2 candidates, 2 ingested, 0 duplicates dropped, 2 pushed, 0 remaining',
+		'no pricing for kimi-k2.7-code; cost left null (2 records)',
+	]);
 });

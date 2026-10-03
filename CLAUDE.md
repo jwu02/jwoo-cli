@@ -36,12 +36,14 @@ export PATH="$HOME/.nvm/versions/node/v22.23.2/bin:$PATH"   # or: nvm use
 Run lines carry `--disable-warning=ExperimentalWarning --env-file=.env` and need `MONGO_URI` —
 for example, the dashboard is `node --disable-warning=ExperimentalWarning --env-file=.env
 dist/cli.js`, which collects while it is open. `collect` after that runs collection headlessly;
-`permissions` reports the macOS grants and exits. The `usage record-claude-hook` and
-`usage record-opencode` lines are the ones that are not that shape: each reads one Harness
+`permissions` reports the macOS grants and exits. The `usage` lines are the ones that are not
+that shape. `usage record-claude-hook` and `usage record-opencode` each read one Harness
 artifact on stdin (a Claude Code hook payload, or one OpenCode `info` blob the Shim delivers),
-Ingests it, drains the Usage Backlog, and exits 0 on every path of its own (ADR-0016) — no
+Ingest it, drain the Usage Backlog, and exit 0 on every path of their own (ADR-0016) — no
 `.env` needed, so a `MONGO_URI` in the environment is the only thing an offline run has to
-avoid.
+avoid. `usage backfill-claude [root]` takes the operator convention instead: it reads nothing on
+stdin, needs no `.env`, and exits 1 when its own scan or store fails, while a surviving Usage
+Backlog is not a failure.
 
 The flag is on every run line because `node:sqlite` is experimental and says so on stderr the
 moment it is imported — and `main.tsx` imports the Local Store on every path, whichever
