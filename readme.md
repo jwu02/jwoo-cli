@@ -82,6 +82,47 @@ A missing macOS permission degrades collection rather than stopping the CLI: the
 affects are disabled and named, and everything else carries on. `permissions` reports the same
 preflight on its own, as a question you can ask without collecting anything.
 
+## Claude Code hook
+
+`usage record-claude-hook` runs as a `Stop`/`SubagentStop` hook: it reads the hook payload on
+stdin, Ingests the turns its transcript names into the Local Store, and Drains the Usage Backlog
+(ADR-0016 — it exits 0 on every path of its own). Wire both events in `~/.claude/settings.json`
+to the absolute `dist/cli.js` build under the pinned node:
+
+```json
+{
+	"hooks": {
+		"Stop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "/Users/jwu02/.nvm/versions/node/v22.23.2/bin/node --disable-warning=ExperimentalWarning --env-file-if-exists=/Users/jwu02/Developer/PersonalProjects/personal-website/jwoo-cli/.env /Users/jwu02/Developer/PersonalProjects/personal-website/jwoo-cli/dist/cli.js usage record-claude-hook"
+					}
+				],
+				"matcher": ""
+			}
+		],
+		"SubagentStop": [
+			{
+				"hooks": [
+					{
+						"type": "command",
+						"command": "/Users/jwu02/.nvm/versions/node/v22.23.2/bin/node --disable-warning=ExperimentalWarning --env-file-if-exists=/Users/jwu02/Developer/PersonalProjects/personal-website/jwoo-cli/.env /Users/jwu02/Developer/PersonalProjects/personal-website/jwoo-cli/dist/cli.js usage record-claude-hook"
+					}
+				],
+				"matcher": ""
+			}
+		]
+	}
+}
+```
+
+`--env-file-if-exists` is what carries `MONGO_URI` to the Push: the checkout's `.env`, never
+Claude Code's own `env` block. Drop it and records still Ingest to the Local Store, but nothing
+Pushes to Atlas. `dist/` is gitignored, so the wiring dies quietly until the next
+`npm run build`.
+
 ## Native helper
 
 Input capture is a small Swift binary owning a listen-only `CGEventTap`, because Node cannot
