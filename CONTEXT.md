@@ -112,7 +112,7 @@ _Avoid_: catch-up, retry loop, sync
 ### AI usage
 
 **Harness**:
-The coding agent whose usage a record attributes: Claude Code or OpenCode. The CLI names
+The coding agent whose usage a record attributes: Claude Code, OpenCode or Pi. The CLI names
 the harness — the command that Ingests decides the string; a Harness never self-reports
 its own name. DSH stays out of scope, in `ai-usage/` — see Deliberately absent.
 _Avoid_: tool, client, agent (ADR-0001), provider, self-reported
@@ -160,7 +160,7 @@ _Avoid_: queue, pending writes, failed Ingests
 
 **Backfill**:
 Ingesting Usage Records for turns that predate their Harness's live hook, by re-reading the
-Harness's own artifacts — Claude Code's transcript files, OpenCode's SQLite database. A
+Harness's own artifacts — Claude Code's transcript files, OpenCode's SQLite database, Pi's session logs. A
 Backfill Ingests through the same face as a live hook, and the same drop rule makes it
 idempotent: re-running adds nothing. A scan of the past, not a second kind of record.
 _Avoid_: import, migration, replay, bulk load, sync (and Drain — a Backfill's records join
@@ -277,4 +277,7 @@ These are not gaps. They are out of scope, and the vocabulary should not drift b
   only it; a second machine would Push a union to MongoDB that this CLI never shows. If it
   returns, it returns with an answer for whose era is whose.
 - **DSH usage.** The DeepSeek Harness stays behind in the retired `ai-usage/` scripts. If it
-  returns, it returns as a third Harness.
+  returns, it returns as a fourth Harness.
+- **Pi worker transcripts.** pi-subagents records its workers' usage in its own artifacts, not in
+  sessions, and the Pi Backfill reads sessions only. If that usage is wanted, it returns as its own
+  projection.
