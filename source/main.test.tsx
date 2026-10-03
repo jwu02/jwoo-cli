@@ -8,6 +8,7 @@ import {
 import {tmpdir} from 'node:os';
 import {dirname, join} from 'node:path';
 import process from 'node:process';
+import {DatabaseSync} from 'node:sqlite';
 import test, {type ExecutionContext} from 'ava';
 import {type Config} from './store/config.js';
 import {
@@ -29,6 +30,7 @@ import {
 	type RunOptions,
 	type RunStore,
 	runBackfillClaude,
+	runBackfillOpencode,
 	runCollect,
 	runDashboard,
 	runPermissions,
@@ -3201,4 +3203,218 @@ test('Unpriced models are aggregated once each in the summary', async t => {
 		'scanned 2 transcripts, 2 candidates, 2 ingested, 0 duplicates dropped, 2 pushed, 0 remaining',
 		'no pricing for kimi-k2.7-code; cost left null (2 records)',
 	]);
+});
+
+/*
+`usage backfill-opencode`, and the database it reads
+---------------------------------------------------
+
+The same shared runner, the same store and seam, over a fixture OpenCode
+database instead of a tree of transcripts. The DB reader is
+`usage-opencode.test.ts`'s subject; what is driven here is the command around
+it — the OpenCode Harness literal, the message-row scan, `--dry-run`, `--since`,
+and the same operator exit-1 contract.
+*/
+
+/*
+One fixture OpenCode database, built with `node:sqlite` under the OS's temp
+directory — never OpenCode's own — with one session and the assistant messages
+the test names.
+*/
+function opencodeDatabase(
+	t: ExecutionContext,
+	messages: ReadonlyArray<{
+		readonly id: string;
+		readonly data: string;
+		readonly timeCreated?: number;
+	}>,
+): string {
+	const directory = mkdtempSync(join(tmpdir(), 'jwoo-cli-backfill-test-'));
+	t.teardown(() => {
+		rmSync(directory, {recursive: true, force: true});
+	});
+
+	const path = join(directory, 'opencode.db');
+	const db = new DatabaseSync(path);
+	db.exec(`
+		CREATE TABLE session (
+			id TEXT PRIMARY KEY,
+			directory TEXT NOT NULL
+		);
+		CREATE TABLE message (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL REFERENCES session(id),
+			time_created INTEGER NOT NULL,
+			data TEXT NOT NULL
+		);
+		INSERT INTO session (id, directory) VALUES ('ses_1', '/home/me/project');
+	`);
+
+	const insert = db.prepare(
+		'INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)',
+	);
+	for (const message of messages) {
+		insert.run(
+			message.id,
+			'ses_1',
+			message.timeCreated ?? 1_755_500_000_000,
+			message.data,
+		);
+	}
+
+	db.close();
+	return path;
+}
+
+/*
+One `usage backfill-opencode` invocation, with everything it reaches outside
+itself stood in for.
+*/
+async function runOpencodeBackfill({
+	database,
+	since,
+	dryRun = false,
+	config = CONFIG,
+	store = new FakeBackfillStore(),
+	pusher = new FakeUsagePusher(),
+}: {
+	readonly database: string;
+	readonly since?: Date;
+	readonly dryRun?: boolean;
+	readonly config?: Config;
+	readonly store?: FakeBackfillStore;
+	readonly pusher?: FakeUsagePusher;
+}): Promise<BackfillRun> {
+	const stdout: string[] = [];
+	const stderr: string[] = [];
+	let pusherBuilt = 0;
+
+	const result = await runBackfillOpencode({
+		database,
+		since,
+		dryRun,
+		config,
+		stdout(message) {
+			stdout.push(message);
+		},
+		stderr(message) {
+			stderr.push(message);
+		},
+		createUsageStore: () => store,
+		createUsagePusher(backlog, onAttempt) {
+			pusherBuilt += 1;
+			pusher.attach(onAttempt, backlog);
+			return pusher;
+		},
+	});
+
+	return {store, pusher, stdout, stderr, ok: !result.failed, pusherBuilt};
+}
+
+/*
+The demoable path: a database in, one record per assistant message out, with the
+Harness literal the command owns and the summary counting message rows.
+*/
+test('an OpenCode Backfill reads every assistant message and summarizes it', async t => {
+	const database = opencodeDatabase(t, [
+		{id: 'msg_1', data: opencodeMessage()},
+		{
+			id: 'msg_2',
+			data: opencodeMessage({
+				id: 'msg_2',
+				tokens: {input: 5, output: 2, cache: {read: 1, write: 0}},
+			}),
+		},
+		{id: 'msg_3', data: opencodeMessage({id: 'msg_3', role: 'user'})},
+	]);
+
+	const {store, pusher, stdout, ok} = await runOpencodeBackfill({database});
+
+	t.true(ok);
+	t.is(store.records.length, 2, 'the user row is not a message we read');
+	t.true(store.records.every(record => record.harness === 'OpenCode'));
+	t.is(pusher.drains, 1);
+	t.is(store.closes, 1);
+	t.deepEqual(stdout, [
+		'scanned 2 messages, 2 candidates, 2 ingested, 0 duplicates dropped, 2 pushed, 0 remaining',
+	]);
+});
+
+/*
+The drop rule is the same one, so a re-run over the same database adds nothing.
+*/
+test('re-running an OpenCode Backfill adds nothing', async t => {
+	const database = opencodeDatabase(t, [
+		{id: 'msg_1', data: opencodeMessage()},
+	]);
+	const store = new FakeBackfillStore();
+
+	const first = await runOpencodeBackfill({database, store});
+	const second = await runOpencodeBackfill({database, store});
+
+	t.is(first.store.records.length, 1);
+	t.is(second.store.records.length, 1, 'the drop rule held');
+	t.deepEqual(second.stdout, [
+		'scanned 1 messages, 1 candidates, 0 ingested, 1 duplicates dropped, 0 pushed, 0 remaining',
+	]);
+});
+
+/*
+`--dry-run` classifies against the real store and writes nothing, as it does
+for Claude.
+*/
+test('a dry run of the OpenCode Backfill classifies and writes nothing', async t => {
+	const database = opencodeDatabase(t, [
+		{id: 'msg_1', data: opencodeMessage()},
+	]);
+
+	const {store, pusherBuilt, stdout, ok} = await runOpencodeBackfill({
+		database,
+		dryRun: true,
+	});
+
+	t.true(ok);
+	t.deepEqual(store.records, []);
+	t.is(pusherBuilt, 0);
+	t.deepEqual(stdout, [
+		'scanned 1 messages, 1 candidates, 1 would-ingest, 0 duplicates found',
+	]);
+});
+
+/*
+`--since` bounds each message by its own `recorded_at`; the row's `time_created`
+is read either way, so `scanned` still counts it.
+*/
+test('--since filters OpenCode messages on their own recorded_at', async t => {
+	const database = opencodeDatabase(t, [
+		{id: 'msg_1', data: opencodeMessage()}, // 1_755_500_000_000
+		{
+			id: 'msg_2',
+			data: opencodeMessage({id: 'msg_2', time: {created: 1_700_000_000_000}}),
+		},
+	]);
+
+	const {store, stdout} = await runOpencodeBackfill({
+		database,
+		since: new Date(1_750_000_000_000),
+	});
+
+	t.is(store.records.length, 1);
+	t.deepEqual(stdout, [
+		'scanned 2 messages, 1 candidates, 1 ingested, 0 duplicates dropped, 1 pushed, 0 remaining',
+	]);
+});
+
+/*
+A database the reader cannot open is the Backfill's own failure — the same
+operator convention, with a message naming the read rather than the scan.
+*/
+test('a database that cannot be opened fails the OpenCode Backfill', async t => {
+	const database = join(tmpdir(), 'jwoo-cli-no-such-opencode.db');
+
+	const {ok, stderr, store} = await runOpencodeBackfill({database});
+
+	t.false(ok);
+	t.regex(stderr[0] ?? '', /Could not read/v);
+	t.is(store.closes, 1, 'the store is still closed on the failing path');
 });

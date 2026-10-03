@@ -61,9 +61,10 @@ exercises is the command and projection behind it. `npm run build` before the Sh
 anything — `dist/` is gitignored.
 
 No test reaches the network or another installation, and none may start a server: the `ava` step
-has to pass on a clone of this repo alone. The exception is `local-store.ts`, tested against real
-files — a temp directory its test makes and hands back — because a fake of SQLite would fake the
-one component whose whole job is to be durable.
+has to pass on a clone of this repo alone. The exceptions are the Local Store and the OpenCode
+reader, tested against real files — a temp directory their tests make and hand back, never
+`~/.local/share/opencode` — because a fake of SQLite would fake the one thing whose whole job is
+to sit on disk, whether the CLI is writing it or reading OpenCode's.
 
 `.env` is gitignored and loaded by the `--env-file` flag, not by the code. `config.ts` is the
 only place any environment variable is read, and stays a pure function of an injected

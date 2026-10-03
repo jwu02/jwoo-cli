@@ -38,20 +38,22 @@ import for the same reason.
     $ jwoo-cli usage record-claude-hook  Ingest a Claude Code hook's turns, from stdin
     $ jwoo-cli usage record-opencode  Ingest one OpenCode message, from stdin
     $ jwoo-cli usage backfill-claude [root]  Ingest Claude Code transcripts from a projects dir
+    $ jwoo-cli usage backfill-opencode [db]  Ingest OpenCode messages from its own database
 
 Nothing here sets an exit code for a record command, and that is ADR-0016 rather
 than an omission: the record commands exit 0 on every path of their own, so they
 resolve with nothing and the process's default code stands. Their failures are
 stderr lines, which is the whole point — a non-zero code would surface inside
-the agent session the command observes. `backfill-claude` is the operator's
-command and not a hook's, so its own failure is an exit 1 here — and only its
-own, since a Usage Backlog that survives the run is not an error.
+the agent session the command observes. The two Backfills are the operator's
+commands and not a hook's, so their own failure is an exit 1 here — and only
+their own, since a Usage Backlog that survives a run is not an error.
 */
 
 import process from 'node:process';
 import {parseArguments} from './args.js';
 import {
 	runBackfillClaude,
+	runBackfillOpencode,
 	runCollect,
 	runDashboard,
 	runPermissions,
@@ -118,6 +120,20 @@ try {
 				case 'backfill-claude': {
 					const {failed} = await runBackfillClaude({
 						root: command.root,
+						dryRun: command.dryRun,
+						since: command.since,
+					});
+
+					if (failed) {
+						process.exitCode = 1;
+					}
+
+					break;
+				}
+
+				case 'backfill-opencode': {
+					const {failed} = await runBackfillOpencode({
+						database: command.database,
 						dryRun: command.dryRun,
 						since: command.since,
 					});

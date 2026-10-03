@@ -19,19 +19,19 @@ hours collecting into a retry that can never succeed. The Pusher's half of the
 same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
 it, or cannot be built at all, is a run that carries on.
 
-Six entry points stand at the top of it — `runCollect`, `runDashboard`,
-`runPermissions`, `runRecordClaudeHook`, `runRecordOpencode` and
-`runBackfillClaude` — one per command, each taking no more than the command reads
-and each named for what it runs. Which one a command line means is decided a
-module up, in `cli.tsx`, which is also the only caller that supplies the real
-permissions source: nothing here imports the command type, so a pairing of
-command and entry point cannot be stated twice and drift.
+Seven entry points stand at the top of it — `runCollect`, `runDashboard`,
+`runPermissions`, `runRecordClaudeHook`, `runRecordOpencode`,
+`runBackfillClaude` and `runBackfillOpencode` — one per command, each taking no
+more than the command reads and each named for what it runs. Which one a command
+line means is decided a module up, in `cli.tsx`, which is also the only caller
+that supplies the real permissions source: nothing here imports the command
+type, so a pairing of command and entry point cannot be stated twice and drift.
 
 The usage commands are the ones that do not collect: each reads one Harness's
-artifact — from stdin, or from the projects directory a Backfill walks — Ingests
-what it projects and Drains the Usage Backlog, and owns none of the run skeleton
-above — which is why their section is its own, and why their store type is a
-narrower slice of the same file.
+artifact — from stdin, or from the projects directory or database a Backfill
+scans — Ingests what it projects and Drains the Usage Backlog, and owns none of
+the run skeleton above — which is why their section is its own, and why their
+store type is a narrower slice of the same file.
 
 The pieces arrive as options rather than being reached for directly: this module
 is where permission, store, state and Collector meet, and a test that had to
@@ -71,7 +71,10 @@ import {
 	UsagePusher as MongoUsagePusher,
 	type UsagePushBacklog,
 } from './store/usage-push.js';
-import {projectOpencodeMessage} from './usage/usage-opencode.js';
+import {
+	projectOpencodeMessage,
+	readOpencodeDatabase,
+} from './usage/usage-opencode.js';
 import {findTranscripts, walkTranscript} from './usage/usage-transcript.js';
 import {MouseCollector} from './capture/mouse.js';
 import {
@@ -556,17 +559,22 @@ export type BackfillStore = UsageStore & {
 };
 
 /*
-What `usage backfill-claude` is handed.
+What a Backfill is handed — `usage backfill-claude`'s set and
+`usage backfill-opencode`'s, which are the same set.
 
-Most of it is the record commands' set — config, store, seam, stderr, clock —
-and the differences are what makes a Backfill the operator's command rather than
-a hook: a root to scan and a `--since` to bound it, a stdout to carry the
+Most of it is the record commands' — config, store, seam, stderr, clock — and
+the differences are what makes a Backfill the operator's command rather than a
+hook: an artifact to scan and a `--since` to bound it, a stdout to carry the
 summary, and a `dryRun` that turns the whole thing into a classify-only preview.
 The two sinks are the two faces of an operator run: the summary on stdout, every
 diagnostic on stderr.
+
+`root` and `database` are the two spellings of that positional artifact — a
+projects directory and a SQLite file — and each entry point reads only its own.
 */
 export type BackfillOptions = {
 	readonly root?: string;
+	readonly database?: string;
 	readonly since?: Date;
 	readonly dryRun?: boolean;
 	readonly stdout?: (message: string) => void;
@@ -967,8 +975,8 @@ function reportUsageBacklog(
 }
 
 /*
-`usage backfill-claude`: Claude Code's projects directory through the same
-Ingest face the live hook uses.
+`usage backfill-claude` and `usage backfill-opencode`: one Harness's own
+artifacts through the same Ingest face the live commands use.
 
 A Backfill is the operator's command, not a hook's, so it keeps the operator
 convention rather than ADR-0016: its own failure — a scan it could not make, a
@@ -979,22 +987,117 @@ in its summary.
 
 No bulk variant and no transaction around the scan: every candidate goes through
 `store.ingest` one at a time, which is what makes a re-run idempotent — a second
-pass over the same transcripts drops as duplicates by the same rule that makes a
-live hook dedup-safe, so a crash mid-Backfill is healed by running it again.
+pass over the same artifacts drops as duplicates by the same rule that makes a
+live command dedup-safe, so a crash mid-Backfill is healed by running it again.
 
 `--dry-run` drives the classify face instead of the write face: every candidate
 is compared against the real store and nothing is written or Pushed. Its known
 limit rides along — two identical candidates in one scan both report a
 would-Ingest, because neither is stored yet to be found (spec #53).
 
-`--since` is applied twice, to the same end. A file whose mtime is older than
-the bound is skipped before it is read at all, which is sound because a
-transcript's mtime is at least its last turn's time; and each surviving
-candidate's own `recorded_at` is checked, so a file touched recently enough to
-read still yields only turns at or after the bound.
+`--since` bounds each candidate by its own `recorded_at`; a source may also skip
+work before that filter (the Claude walk's file-mtime pre-skip), which is why
+the bound arrives at the source rather than only beside it.
+
+The two commands differ by a source and nothing else: which artifact the
+positional names, how it is read, which Harness literal the records carry, and
+what one scanned unit is called in the summary. Everything around that — the
+config, the store's lifetime, the classify preview, the Ingest pass, the Drain,
+the summary and the operator exit code — is `runBackfill`, once.
 */
 export async function runBackfillClaude(
 	options: BackfillOptions = {},
+): Promise<BackfillResult> {
+	return runBackfill(options, CLAUDE_BACKFILL);
+}
+
+export async function runBackfillOpencode(
+	options: BackfillOptions = {},
+): Promise<BackfillResult> {
+	return runBackfill(options, OPENCODE_BACKFILL);
+}
+
+/*
+What one scan yields: how many units it read and the candidates they produced.
+The Claude walk counts transcripts and the OpenCode read counts assistant
+message rows, and the summary prints whichever noun the source names.
+*/
+type BackfillScan = {
+	readonly scanned: number;
+	readonly candidates: readonly UsageCandidate[];
+};
+
+/*
+One Backfill's half of the difference. Everything else is the shared runner's.
+*/
+type BackfillSource = {
+	/*
+	What one scanned unit is, for the summary line.
+	*/
+	readonly scannedNoun: string;
+	/*
+	The Harness literal the command owns (CONTEXT.md, Harness).
+	*/
+	readonly harness: string;
+	/*
+	The artifact the operator named, or the Harness's own.
+	*/
+	readonly pathFrom: (options: BackfillOptions) => string;
+	/*
+	Read it. Throws on a scan the operator asked for but could not make; a row or
+	file it cannot read is a skip inside, not a throw.
+	*/
+	readonly scan: (path: string, options: BackfillOptions) => BackfillScan;
+	/*
+	How that failure reads on stderr.
+	*/
+	readonly scanFailure: (path: string, error: unknown) => string;
+};
+
+/*
+Claude Code's half: the whole projects directory, `subagents/` included, and a
+file-mtime pre-skip before `--since`'s per-record filter. A transcript's mtime is
+at least its last turn's time, so a file older than the bound cannot hold a turn
+at or after it and is skipped before it is read; a file touched recently enough
+to read still yields only its turns at or after the bound.
+*/
+const CLAUDE_BACKFILL: BackfillSource = {
+	scannedNoun: 'transcripts',
+	harness: CLAUDE_HARNESS,
+	pathFrom: ({root}) => root ?? defaultProjectsDirectory(),
+	scan(root, options) {
+		const files = findTranscripts(root);
+		const scanned = files.filter(file => !isOlderThan(file, options.since));
+		return {
+			scanned: scanned.length,
+			candidates: candidatesFrom(scanned, options),
+		};
+	},
+	scanFailure: (root, error) => `Could not scan ${root}: ${messageOf(error)}`,
+};
+
+/*
+OpenCode's half: its own SQLite database, opened read-only, one candidate per
+assistant message row. The reader is the whole of the scan — there is no
+pre-skip, because there is no file older than a bound to skip before reading a
+database that is read as one unit.
+*/
+const OPENCODE_BACKFILL: BackfillSource = {
+	scannedNoun: 'messages',
+	harness: OPENCODE_HARNESS,
+	pathFrom: ({database}) => database ?? defaultOpencodeDatabase(),
+	scan: (database, options) =>
+		readOpencodeDatabase(database, {since: options.since}),
+	scanFailure: (database, error) =>
+		`Could not read ${database}: ${messageOf(error)}`,
+};
+
+/*
+One Backfill, end to end, for either Harness.
+*/
+async function runBackfill(
+	options: BackfillOptions,
+	source: BackfillSource,
 ): Promise<BackfillResult> {
 	const report = options.stderr ?? writeStderr;
 	const writeSummary = options.stdout ?? writeStdout;
@@ -1016,30 +1119,30 @@ export async function runBackfillClaude(
 	}
 
 	try {
-		const root = options.root ?? defaultProjectsDirectory();
+		const path = source.pathFrom(options);
 
-		let files: readonly string[];
+		let scan: BackfillScan;
 		try {
-			files = findTranscripts(root);
+			scan = source.scan(path, options);
 		} catch (error) {
-			report(`Could not scan ${root}: ${messageOf(error)}`);
+			report(source.scanFailure(path, error));
 			return {failed: true};
 		}
 
-		const scanned = files.filter(file => !isOlderThan(file, options.since));
-		const candidates = candidatesFrom(scanned, options);
+		const {scanned, candidates} = scan;
 
 		if (options.dryRun === true) {
-			const classified = classifyCandidates(candidates, store);
+			const classified = classifyCandidates(candidates, source.harness, store);
 			writeSummary(
 				summaryLine({
-					scanned: scanned.length,
+					scanned,
 					candidates: candidates.length,
 					ingested: classified.wouldIngest,
 					duplicates: classified.duplicates,
 					pushed: 0,
 					remaining: 0,
 					dryRun: true,
+					noun: source.scannedNoun,
 				}),
 			);
 			return {failed: false};
@@ -1047,7 +1150,7 @@ export async function runBackfillClaude(
 
 		const {ingested, duplicates, unpricedModels} = ingestAll(
 			candidates,
-			CLAUDE_HARNESS,
+			source.harness,
 			store,
 		);
 		const unpriced = countUnpriced(unpricedModels);
@@ -1060,13 +1163,14 @@ export async function runBackfillClaude(
 
 		writeSummary(
 			summaryLine({
-				scanned: scanned.length,
+				scanned,
 				candidates: candidates.length,
 				ingested,
 				duplicates,
 				pushed,
 				remaining,
 				dryRun: false,
+				noun: source.scannedNoun,
 			}),
 		);
 
@@ -1098,6 +1202,14 @@ directory. Tests always name one, so nothing in the gate reaches `~/.claude`.
 */
 function defaultProjectsDirectory(): string {
 	return join(homedir(), '.claude', 'projects');
+}
+
+/*
+Where `backfill-opencode` reads when the operator names no database: OpenCode's
+own. Tests always name one, so nothing in the gate reaches `~/.local/share`.
+*/
+function defaultOpencodeDatabase(): string {
+	return join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
 }
 
 /*
@@ -1148,13 +1260,14 @@ a preview — it is the same classify `ingest` would run, only read.
 */
 function classifyCandidates(
 	candidates: readonly UsageCandidate[],
+	harness: string,
 	store: BackfillStore,
 ): {readonly wouldIngest: number; readonly duplicates: number} {
 	let wouldIngest = 0;
 	let duplicates = 0;
 
 	for (const candidate of candidates) {
-		if (store.duplicatesExisting({...candidate, harness: CLAUDE_HARNESS})) {
+		if (store.duplicatesExisting({...candidate, harness})) {
 			duplicates += 1;
 		} else {
 			wouldIngest += 1;
@@ -1191,9 +1304,10 @@ has no Drain to report, so its line ends at the two counts it can know —
 would-Ingest and duplicates found — and says nothing about a Push it never
 attempted.
 
-`scanned` is transcripts actually read: the `--since` pre-skip is a file not
-read, and so not scanned, which is what makes the pre-skip visible in the
-summary rather than only in the candidates it saved.
+`scanned` is what the source actually read — transcripts read, or assistant
+message rows — and `noun` is the source's name for one: the Claude walk's
+`--since` pre-skip is a file not read, and so not scanned, which is what makes
+the pre-skip visible in the summary rather than only in the candidates it saved.
 */
 type BackfillSummary = {
 	readonly scanned: number;
@@ -1203,6 +1317,7 @@ type BackfillSummary = {
 	readonly pushed: number;
 	readonly remaining: number;
 	readonly dryRun: boolean;
+	readonly noun: string;
 };
 
 function summaryLine({
@@ -1213,6 +1328,7 @@ function summaryLine({
 	pushed,
 	remaining,
 	dryRun,
+	noun,
 }: BackfillSummary): string {
 	const counts = dryRun
 		? [
@@ -1227,7 +1343,7 @@ function summaryLine({
 			];
 
 	return [
-		`scanned ${COUNT_FORMAT.format(scanned)} transcripts`,
+		`scanned ${COUNT_FORMAT.format(scanned)} ${noun}`,
 		`${COUNT_FORMAT.format(candidates)} candidates`,
 		...counts,
 	].join(', ');

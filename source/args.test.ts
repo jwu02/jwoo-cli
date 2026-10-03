@@ -132,9 +132,10 @@ test('a usage command with a stray argument is rejected', t => {
 });
 
 /*
-`backfill-claude` is the operator's command, so it is the one that carries
-flags: an optional root, `--dry-run` and `--since`. The root is positional, and
-its absence means Claude Code's own projects directory rather than an error.
+The Backfills are the operator's commands, so they are the ones that carry
+flags: an optional positional artifact, `--dry-run` and `--since`.
+`backfill-claude`'s is a projects directory, and its absence means Claude Code's
+own rather than an error.
 */
 test('backfill-claude carries its root and flags', t => {
 	t.deepEqual(parseArguments(['usage', 'backfill-claude']), {
@@ -171,6 +172,52 @@ test('a second root on backfill-claude is rejected', t => {
 		() =>
 			commandFor(
 				{flags: {}, input: ['usage', 'backfill-claude', 'a', 'b']},
+				showHelp,
+			),
+		{message: 'showHelp'},
+	);
+	t.deepEqual(calls, [2]);
+});
+
+/*
+`backfill-opencode`'s positional is a database rather than a directory, and it
+carries the same two flags. Its absence means OpenCode's own database.
+*/
+test('backfill-opencode carries its database and flags', t => {
+	t.deepEqual(parseArguments(['usage', 'backfill-opencode']), {
+		kind: 'usage',
+		command: 'backfill-opencode',
+		database: undefined,
+		dryRun: false,
+		since: undefined,
+	});
+
+	t.deepEqual(
+		parseArguments([
+			'usage',
+			'backfill-opencode',
+			'/tmp/opencode.db',
+			'--dry-run',
+			'--since',
+			'2026-08-01T00:00:00Z',
+		]),
+		{
+			kind: 'usage',
+			command: 'backfill-opencode',
+			database: '/tmp/opencode.db',
+			dryRun: true,
+			since: new Date('2026-08-01T00:00:00Z'),
+		},
+	);
+});
+
+test('a second database on backfill-opencode is rejected', t => {
+	const {calls, showHelp} = rejecting();
+
+	t.throws(
+		() =>
+			commandFor(
+				{flags: {}, input: ['usage', 'backfill-opencode', 'a', 'b']},
 				showHelp,
 			),
 		{message: 'showHelp'},
@@ -320,5 +367,26 @@ test('a Backfill whose root cannot be scanned exits 1', async t => {
 	t.is(result.code, 1);
 	t.true(result.output.includes('Could not scan'));
 	// A failed scan has no summary to print: it returns before one is due.
+	t.false(result.output.includes('scanned'));
+});
+
+/*
+The OpenCode Backfill's own failure is a database it cannot open, and it earns
+the same exit 1 through the same pairing in `cli.tsx`.
+*/
+test('a Backfill whose database cannot be opened exits 1', async t => {
+	const directory = mkdtempSync(join(tmpdir(), 'jwoo-cli-args-test-'));
+	t.teardown(() => {
+		rmSync(directory, {recursive: true, force: true});
+	});
+
+	const result = await runCli(
+		['usage', 'backfill-opencode', join(directory, 'no-such-opencode.db')],
+		// eslint-disable-next-line @typescript-eslint/naming-convention -- an environment variable's name is SCREAMING_SNAKE_CASE by definition.
+		{LOCAL_STORE_PATH: join(directory, 'telemetry.db')},
+	);
+
+	t.is(result.code, 1);
+	t.true(result.output.includes('Could not read'));
 	t.false(result.output.includes('scanned'));
 });

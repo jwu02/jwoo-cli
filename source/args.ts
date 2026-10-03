@@ -11,8 +11,8 @@ inside one.
 #53), and a group rather than three more top-level commands because they share a
 shape — each reads a Harness's own artifact and Ingests through the same store
 face — and because `usage` alone names nothing. The two record commands take
-their payload on stdin and nothing else; `backfill-claude` is the operator's,
-and carries the flags a scan takes.
+their payload on stdin and nothing else; the two Backfills are the operator's,
+and each carries a positional artifact and the flags a scan takes.
 
 Parsing is a pure function of argv, so what a given command line means is
 testable without a process. `cli.tsx` is what passes in the real `process.argv`
@@ -46,6 +46,20 @@ export type Command =
 			means no bound.
 			*/
 			readonly since: Date | undefined;
+	  }
+	| {
+			readonly kind: 'usage';
+			readonly command: 'backfill-opencode';
+			/*
+			The database to read; absent means OpenCode's own, which the entry
+			point resolves rather than this module.
+			*/
+			readonly database: string | undefined;
+			/*
+			The same two flags `backfill-claude` carries, for the same reasons.
+			*/
+			readonly dryRun: boolean;
+			readonly since: Date | undefined;
 	  };
 
 /*
@@ -61,6 +75,8 @@ export const HELP_TEXT = `
 	  $ jwoo-cli usage record-opencode     Ingest one OpenCode message, from stdin
 	  $ jwoo-cli usage backfill-claude [root]
 	                                       Ingest Claude Code transcripts from a projects dir
+	  $ jwoo-cli usage backfill-opencode [db]
+	                                       Ingest OpenCode messages from its own database
 
 	Options
 	  --help     Show this help
@@ -186,6 +202,21 @@ function usageCommandFor(
 				kind: 'usage',
 				command,
 				root,
+				dryRun: flags['dryRun'] === true,
+				since: sinceFrom(flags['since'], showHelp),
+			};
+		}
+
+		case 'backfill-opencode': {
+			const [database, ...extra] = rest;
+			if (extra.length > 0) {
+				showHelp(2);
+			}
+
+			return {
+				kind: 'usage',
+				command,
+				database,
 				dryRun: flags['dryRun'] === true,
 				since: sinceFrom(flags['since'], showHelp),
 			};
