@@ -37,6 +37,7 @@ import {
 	runPermissions,
 	runRecordClaudeHook,
 	runRecordOpencode,
+	runRecordPi,
 	type UsagePush,
 	type UsageStore,
 } from './main.js';
@@ -2814,6 +2815,127 @@ test('an unreadable OpenCode payload is a stderr line, and still drains', async 
 });
 
 /*
+`usage record-pi`, and the one document its Shim delivers
+---------------------------------------------------------
+
+The same store, seam and reporting, over the Pi Shim's document — the finished
+assistant message plus the context's `cwd` — instead of an OpenCode blob. The
+projection is `usage-pi.test.ts`'s subject and the session walk's fixture
+`piMessage` is reused here; what is driven is the command around it: the Pi
+Harness literal it owns, the `cwd` the payload carries, and the ADR-0016 paths
+it shares with its two siblings.
+*/
+
+/*
+The Shim's document: the message the event delivered and the `cwd` the context
+carried. A raw string is passed through for the malformed-stdin case.
+*/
+function piRecordPayload(
+	message: unknown = piMessage(),
+	cwd: string | undefined = '/projects/site',
+): Record<string, unknown> {
+	return {message, cwd};
+}
+
+async function runPi(
+	input: unknown,
+	{
+		config = CONFIG,
+		store = new FakeUsageStore(),
+		pusher = new FakeUsagePusher(),
+	}: {
+		readonly config?: Config;
+		readonly store?: FakeUsageStore;
+		readonly pusher?: FakeUsagePusher;
+	} = {},
+): Promise<UsageRun> {
+	const written: string[] = [];
+	let pusherBuilt = 0;
+
+	await runRecordPi({
+		config,
+		stdin: async () =>
+			typeof input === 'string' ? input : JSON.stringify(input),
+		stderr(message) {
+			written.push(message);
+		},
+		createUsageStore: () => store,
+		createUsagePusher(backlog, onAttempt) {
+			pusherBuilt += 1;
+			pusher.attach(onAttempt, backlog);
+			return pusher;
+		},
+	});
+
+	return {store, pusher, written, pusherBuilt};
+}
+
+/*
+The demoable path: one Shim document in, one Pi-attributed record out. The
+Harness literal is the command's — pi's message carries no harness field — and
+the `cwd` is the one the context handed the Shim.
+*/
+test('one Pi message is projected, Ingested and reported Recorded.', async t => {
+	const {store, pusher, written, pusherBuilt} = await runPi(piRecordPayload());
+
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.harness, 'Pi');
+	t.is(store.records[0]?.model, 'kimi-k2.7-code');
+	t.is(store.records[0]?.cwd, '/projects/site');
+	t.is(store.records[0]?.prompt_tokens, 128, 'input + both cache writes');
+	t.is(store.records[0]?.prompt_cache_hit_tokens, 20);
+	t.is(store.records[0]?.prompt_cache_miss_tokens, 108);
+	t.is(store.records[0]?.completion_tokens, 50);
+	t.is(
+		store.records[0]?.total_tokens,
+		178,
+		"prompt + completion, never pi's totalTokens",
+	);
+	t.is(
+		store.records[0]?.recordedAt.getTime(),
+		1_755_500_000_000,
+		"the message's own timestamp",
+	);
+	t.deepEqual(written, ['Recorded.']);
+	t.is(pusherBuilt, 1);
+	t.is(pusher.drains, 1, 'the invocation touches the Backlog');
+	t.is(store.closes, 1);
+});
+
+test('the same Pi message again is Duplicate., and still drains', async t => {
+	const store = new FakeUsageStore();
+
+	await runPi(piRecordPayload(), {store});
+	const second = await runPi(piRecordPayload(), {store});
+
+	t.deepEqual(second.written, ['Duplicate.']);
+	t.is(second.store.records.length, 1);
+	t.is(second.pusher.drains, 1);
+});
+
+/*
+The no-token skip: a message whose buckets are all absent or zero is a no-op
+run, not a zero-cost record — and the Backlog is still drained.
+*/
+test('a Pi message with no tokens is a no-op run that still drains', async t => {
+	const {store, written, pusher} = await runPi(
+		piRecordPayload(piMessage({usage: {}})),
+	);
+
+	t.deepEqual(store.records, []);
+	t.deepEqual(written, []);
+	t.is(pusher.drains, 1);
+});
+
+test('an unreadable Pi payload is a stderr line, and still drains', async t => {
+	const {store, written, pusher} = await runPi('not json');
+
+	t.deepEqual(store.records, []);
+	t.regex(written[0] ?? '', /Could not read the Pi input/v);
+	t.is(pusher.drains, 1);
+});
+
+/*
 `usage backfill-claude`, and the projects directory it walks
 ------------------------------------------------------------
 
@@ -3599,6 +3721,32 @@ test('re-running a Pi Backfill adds nothing', async t => {
 	t.is(first.store.records.length, 1);
 	t.is(second.store.records.length, 1, 'the drop rule held');
 	t.deepEqual(second.stdout, [
+		'scanned 1 sessions, 1 candidates, 0 ingested, 1 duplicates dropped, 0 pushed, 0 remaining',
+	]);
+});
+
+/*
+The two paths share one projection, so a record the live Shim Ingested and the
+same message read back out of the session file are the same candidate — the
+store's content fingerprint drops the second, and a Backfill run after live
+capture has begun adds nothing.
+*/
+test('a Pi Backfill after a live record adds nothing', async t => {
+	const root = piSessionsTree(t, {
+		'session.jsonl': [piHeader(), piEntry('m1')],
+	});
+	const store = new FakeBackfillStore();
+
+	const live = await runPi(piRecordPayload(), {store});
+	const backfill = await runPiBackfill({root, store});
+
+	t.is(live.store.records.length, 1);
+	t.is(
+		backfill.store.records.length,
+		1,
+		'the live record deduped the backfill',
+	);
+	t.deepEqual(backfill.stdout, [
 		'scanned 1 sessions, 1 candidates, 0 ingested, 1 duplicates dropped, 0 pushed, 0 remaining',
 	]);
 });

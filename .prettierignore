@@ -1,2 +1,3 @@
 dist
 opencode-plugin/*.mjs
+pi-extension/*.ts

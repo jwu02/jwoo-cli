@@ -19,8 +19,8 @@ hours collecting into a retry that can never succeed. The Pusher's half of the
 same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
 it, or cannot be built at all, is a run that carries on.
 
-Eight entry points stand at the top of it — `runCollect`, `runDashboard`,
-`runPermissions`, `runRecordClaudeHook`, `runRecordOpencode`,
+Nine entry points stand at the top of it — `runCollect`, `runDashboard`,
+`runPermissions`, `runRecordClaudeHook`, `runRecordOpencode`, `runRecordPi`,
 `runBackfillClaude`, `runBackfillOpencode` and `runBackfillPi` — one per
 command, each taking no
 more than the command reads and each named for what it runs. Which one a command
@@ -76,7 +76,7 @@ import {
 	projectOpencodeMessage,
 	readOpencodeDatabase,
 } from './usage/usage-opencode.js';
-import {readPiSessions} from './usage/usage-pi.js';
+import {projectPiMessage, readPiSessions} from './usage/usage-pi.js';
 import {findTranscripts, walkTranscript} from './usage/usage-transcript.js';
 import {MouseCollector} from './capture/mouse.js';
 import {
@@ -526,10 +526,10 @@ collecting commands' are: a test that could not stand these in would open a
 store, a connection and a terminal, and the ADR-0016 contract is exactly what a
 test has to be able to drive down every path of.
 
-The two record commands — `record-claude-hook` and `record-opencode` — take the
-same set, because they differ by what arrives on stdin and nothing else: one
-Harness's artifact, one walk or projection, and the same Ingest and Drain around
-it.
+The three record commands — `record-claude-hook`, `record-opencode` and
+`record-pi` — take the same set, because they differ by what arrives on stdin and
+nothing else: one Harness's artifact, one walk or projection, and the same Ingest
+and Drain around it.
 
 `stdin` and `stderr` are the two ends of that contract: the payload arrives on
 one and every diagnostic leaves on the other. Stdout is never written, and that
@@ -641,21 +641,22 @@ type HookInput = {
 };
 
 /*
-The two `usage` record entry points. Each is one Harness's artifact projected
+The three `usage` record entry points. Each is one Harness's artifact projected
 into Usage Records and handed to the same Ingest face.
 
-Both run inside their Harness's own wiring — Claude Code's hooks, OpenCode's
-Shim — so ADR-0016 decides their whole shape: exit 0 on every path of their own,
-stdout silent, every problem on stderr. Nothing here throws, and that is the
+All run inside their Harness's own wiring — Claude Code's hooks, OpenCode's and
+Pi's Shims — so ADR-0016 decides their whole shape: exit 0 on every path of their
+own, stdout silent, every problem on stderr. Nothing here throws, and that is the
 contract rather than a style: `cli.tsx` turns a throw into a non-zero code, and a
 hook that failed loudly would surface an error into the session it was hired to
 observe.
 
 What differs between them is what arrives on stdin and how it becomes
-candidates — the transcript walk that re-visits every turn, or the one OpenCode
-message the Shim sends. That is the whole of the callback each hands over; the
-store's lifetime, the Ingest, the reporting and the end-of-invocation Drain
-around it are `runUsageRecord`, one path for both.
+candidates — the transcript walk that re-visits every turn, the one OpenCode
+message the Shim sends, or the finished Pi assistant message its Shim sends. That
+is the whole of the callback each hands over; the store's lifetime, the Ingest,
+the reporting and the end-of-invocation Drain around it are `runUsageRecord`, one
+path for all three.
 */
 export async function runRecordClaudeHook(
 	options: RecordUsageOptions = {},
@@ -705,6 +706,37 @@ export async function runRecordOpencode(
 			candidate = projectOpencodeMessage(await (options.stdin ?? readStdin)());
 		} catch (error) {
 			report(`Could not read the OpenCode input: ${messageOf(error)}`);
+			return [];
+		}
+
+		return candidate === undefined ? [] : [candidate];
+	});
+}
+
+/*
+The `usage record-pi` entry point: one JSON document — the finished pi assistant
+message the Shim observed, plus the `cwd` its context carried — on stdin,
+projected through the shared Pi projection into the one Usage Record it
+represents.
+
+No event guard here either. The Shim's `message_end` guard is what makes a
+delivered payload a finished assistant message, and it lives there because pi's
+event fires for user and tool-result messages too. A message with no tokens is a
+skip, not a failure; a payload that is not a JSON object, or a usage-bearing
+message with no timestamp to place it in history, is reported, and the
+invocation drains all the same. The projection is the same pure function the
+Backfill walks sessions with, so the two paths share one flatten rule.
+*/
+export async function runRecordPi(
+	options: RecordUsageOptions = {},
+): Promise<void> {
+	await runUsageRecord(options, PI_HARNESS, async report => {
+		let candidate;
+		try {
+			const {message, cwd} = parsePiInput(await (options.stdin ?? readStdin)());
+			candidate = projectPiMessage(message, cwd);
+		} catch (error) {
+			report(`Could not read the Pi input: ${messageOf(error)}`);
 			return [];
 		}
 
@@ -1434,8 +1466,31 @@ function parseHookInput(raw: string): HookInput {
 }
 
 /*
+The Pi payload, as far as this command trusts it: the finished assistant message
+the Shim observed and the `cwd` its context carried. The message is left as it
+arrived — the shared projection is what validates it — while `cwd` is taken only
+when it is a string, because the session may have none.
+*/
+function parsePiInput(raw: string): {
+	message: unknown;
+	cwd: string | undefined;
+} {
+	const parsed: unknown = JSON.parse(raw);
+	if (typeof parsed !== 'object' || parsed === null) {
+		throw new Error('the Pi input was not a JSON object');
+	}
+
+	const {message, cwd} = parsed as Record<string, unknown>;
+	return {
+		message,
+		cwd: typeof cwd === 'string' ? cwd : undefined,
+	};
+}
+
+/*
 All of stdin, which is where the wiring delivers the one JSON payload — Claude
-Code's hook payload, or OpenCode's one `info` blob through the Shim. Decoded as
+Code's hook payload, OpenCode's one `info` blob through the Shim, or Pi's one
+message document through its Shim. Decoded as
 UTF-8 while it is read rather than after concatenation, so a multi-byte
 character split across two chunks cannot come out as replacement characters.
 */

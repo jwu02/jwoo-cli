@@ -10,7 +10,7 @@ inside one.
 `usage` is the third group: it holds the commands that Ingest AI usage (spec
 #53), and a group rather than three more top-level commands because they share a
 shape — each reads a Harness's own artifact and Ingests through the same store
-face — and because `usage` alone names nothing. The two record commands take
+face — and because `usage` alone names nothing. The three record commands take
 their payload on stdin and nothing else; the three Backfills are the operator's,
 and each carries a positional artifact and the flags a scan takes.
 
@@ -28,6 +28,7 @@ export type Command =
 	| {readonly kind: 'permissions'}
 	| {readonly kind: 'usage'; readonly command: 'record-claude-hook'}
 	| {readonly kind: 'usage'; readonly command: 'record-opencode'}
+	| {readonly kind: 'usage'; readonly command: 'record-pi'}
 	| {
 			readonly kind: 'usage';
 			readonly command: 'backfill-claude';
@@ -88,6 +89,7 @@ export const HELP_TEXT = `
 	  $ jwoo-cli permissions               report the macOS grants collection needs
 	  $ jwoo-cli usage record-claude-hook  Ingest a Claude Code hook's turns, from stdin
 	  $ jwoo-cli usage record-opencode     Ingest one OpenCode message, from stdin
+	  $ jwoo-cli usage record-pi           Ingest one Pi assistant message, from stdin
 	  $ jwoo-cli usage backfill-claude [root]
 	                                       Ingest Claude Code transcripts from a projects dir
 	  $ jwoo-cli usage backfill-opencode [db]
@@ -188,7 +190,7 @@ The command the `usage` group names. `usage` alone is rejected rather than
 defaulted to any one of its commands, for the reason a bare `dashboard` is: a
 spelling that means something only by convention is the one that drifts.
 
-The two record commands take no flags — their payload arrives on stdin — so a
+The three record commands take no flags — their payload arrives on stdin — so a
 flag on one is a typo, refused here rather than passed through.
 */
 function usageCommandFor(
@@ -201,7 +203,8 @@ function usageCommandFor(
 
 	switch (command) {
 		case 'record-claude-hook':
-		case 'record-opencode': {
+		case 'record-opencode':
+		case 'record-pi': {
 			if (rest.length > 0 || hasBackfillFlags(flags, argv)) {
 				showHelp(2);
 			}

@@ -37,8 +37,9 @@ Run lines carry `--disable-warning=ExperimentalWarning --env-file=.env` and need
 for example, the dashboard is `node --disable-warning=ExperimentalWarning --env-file=.env
 dist/cli.js`, which collects while it is open. `collect` after that runs collection headlessly;
 `permissions` reports the macOS grants and exits. The `usage` lines are the ones that are not
-that shape. `usage record-claude-hook` and `usage record-opencode` each read one Harness
-artifact on stdin (a Claude Code hook payload, or one OpenCode `info` blob the Shim delivers),
+that shape. `usage record-claude-hook`, `usage record-opencode` and `usage record-pi` each read
+one Harness artifact on stdin (a Claude Code hook payload, one OpenCode `info` blob the Shim
+delivers, or one Pi assistant-message document the Pi Shim delivers),
 Ingest it, drain the Usage Backlog, and exit 0 on every path of their own (ADR-0016) — no
 `.env` needed, so a `MONGO_URI` in the environment is the only thing an offline run has to
 avoid. `usage backfill-claude [root]`, `usage backfill-opencode [db]` and `usage backfill-pi
@@ -56,10 +57,11 @@ gate exercises is the binary committed beside it (`helper.test.ts` spawns it for
 `--preflight`, and to watch `stop()` kill it). So a rebuild left uncommitted passes the gate it
 should have failed: build by hand after changing the source and commit the binary with it.
 
-The OpenCode Shim (`opencode-plugin/jwoo.mjs`) is outside the gate the same way, excluded by
-`xo.config.js` and `.prettierignore`: OpenCode's plugin loader is what runs it, and what the gate
-exercises is the command and projection behind it. `npm run build` before the Shim can spawn
-anything — `dist/` is gitignored.
+The OpenCode Shim (`opencode-plugin/jwoo.mjs`) and the Pi Shim (`pi-extension/jwoo.ts`) are
+outside the gate the same way, excluded by `xo.config.js` and `.prettierignore`: OpenCode's plugin
+loader and pi's extension loader are what run them, and what the gate exercises is the command and
+projection behind them. `npm run build` before either Shim can spawn anything — `dist/` is
+gitignored.
 
 No test reaches the network or another installation, and none may start a server: the `ava` step
 has to pass on a clone of this repo alone. The exceptions are the Local Store and the OpenCode

@@ -118,9 +118,11 @@ its own name. DSH stays out of scope, in `ai-usage/` — see Deliberately absent
 _Avoid_: tool, client, agent (ADR-0001), provider, self-reported
 
 **Shim**:
-The OpenCode-side plugin file that observes OpenCode's `message.updated` and Ingests each
-completed assistant message by spawning the CLI command. Source lives in this repo, installed
-into OpenCode's plugin directory; it owns the guard and the spawn, nothing else.
+The harness-side file that observes its Harness's own event and Ingests each
+usage-bearing message by spawning the CLI command — OpenCode's plugin, observing
+`message.updated`, or pi's extension, observing `message_end`. Source lives in
+this repo, installed into the Harness's own extension directory; it owns the
+guard and the spawn, nothing else.
 _Avoid_: plugin, hook (Claude Code's term), bridge, adapter, watcher
 
 **Usage Record**:

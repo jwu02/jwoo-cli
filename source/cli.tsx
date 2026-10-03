@@ -37,6 +37,7 @@ import for the same reason.
     $ jwoo-cli permissions  report the macOS grants collection needs
     $ jwoo-cli usage record-claude-hook  Ingest a Claude Code hook's turns, from stdin
     $ jwoo-cli usage record-opencode  Ingest one OpenCode message, from stdin
+    $ jwoo-cli usage record-pi  Ingest one Pi assistant message, from stdin
     $ jwoo-cli usage backfill-claude [root]  Ingest Claude Code transcripts from a projects dir
     $ jwoo-cli usage backfill-opencode [db]  Ingest OpenCode messages from its own database
     $ jwoo-cli usage backfill-pi [root]  Ingest Pi sessions from a sessions dir
@@ -61,6 +62,7 @@ import {
 	runPermissions,
 	runRecordClaudeHook,
 	runRecordOpencode,
+	runRecordPi,
 } from './main.js';
 import {HelperPermissionSource} from './capture/permissions.js';
 import {type Shutdown} from './session.js';
@@ -98,7 +100,7 @@ try {
 		case 'usage': {
 			switch (command.command) {
 				/*
-				No exit code is read off either record command: the hook contract
+				No exit code is read off any record command: the hook contract
 				makes every path of its own a clean exit, and each reports through
 				stderr instead.
 				*/
@@ -109,6 +111,11 @@ try {
 
 				case 'record-opencode': {
 					await runRecordOpencode();
+					break;
+				}
+
+				case 'record-pi': {
+					await runRecordPi();
 					break;
 				}
 

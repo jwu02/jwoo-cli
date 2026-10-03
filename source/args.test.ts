@@ -94,6 +94,10 @@ test('usage names the command it runs', t => {
 		kind: 'usage',
 		command: 'record-opencode',
 	});
+	t.deepEqual(parseArguments(['usage', 'record-pi']), {
+		kind: 'usage',
+		command: 'record-pi',
+	});
 });
 
 test('the usage group alone is rejected', t => {
@@ -284,6 +288,24 @@ test('a Backfill flag on a record command is rejected', t => {
 		() =>
 			commandFor(
 				{flags: {dryRun: true}, input: ['usage', 'record-claude-hook']},
+				showHelp,
+			),
+		{message: 'showHelp'},
+	);
+	t.deepEqual(calls, [2]);
+});
+
+/*
+`record-pi` takes no flags either — its payload is stdin like the other two — so
+the same typo is refused on it rather than swallowed.
+*/
+test('a Backfill flag on record-pi is rejected', t => {
+	const {calls, showHelp} = rejecting();
+
+	t.throws(
+		() =>
+			commandFor(
+				{flags: {}, input: ['usage', 'record-pi', '--dry-run']},
 				showHelp,
 			),
 		{message: 'showHelp'},

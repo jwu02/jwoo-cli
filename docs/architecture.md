@@ -169,11 +169,14 @@ key because the collector must not be reachable only through the TUI (ADR-0001).
 **`usage` is the third group, and the commands that Ingest AI usage live under it.** A group
 rather than four more top-level commands because they share a shape — each reads a Harness's own
 artifact and Ingests through the same store face — and because `usage` alone names nothing, so a
-bare `usage` is rejected the way a bare `dashboard` is. The two live record commands are wired:
+bare `usage` is rejected the way a bare `dashboard` is. The three live record commands are wired:
 `record-claude-hook` reads a raw Claude Code hook payload on stdin and walks the transcript it
-names (always the transcript, never the proxy's non-standard `input.usage` shortcut), and
-`record-opencode` reads one `info` blob the Shim delivers and projects it into the single Usage
-Record it represents. Each Ingests with the Harness literal the command owns, and both run the
+names (always the transcript, never the proxy's non-standard `input.usage` shortcut);
+`record-opencode` reads one `info` blob the OpenCode Shim delivers and projects it into the single
+Usage Record it represents; and `record-pi` reads one document — the finished assistant message
+plus the context's `cwd` — from the Pi Shim and projects it through the same Pi projection the
+Backfill walks sessions with. Each Ingests with the Harness literal the command owns, and all
+three run the
 same Ingest-then-Drain path — `main.tsx`'s `runUsageRecord` — so only the projection differs. The
 record commands are also the ones that never throw: ADR-0016 makes exit 0 on every path of their
 own a contract, so `cli.tsx` reads no code off them and their diagnostics are stderr lines —
@@ -212,7 +215,7 @@ completion` rather than trusted; and `reasoning` is not read, because pi bills t
 `output`. The projection is pure and throws on a usage-bearing message with no instant, so the live
 command will report it and the session walk skips a message it cannot place.
 
-**The Shim is the OpenCode half of that wiring, and it lives outside the gate.**
+**The Shim is the live half of that wiring, and it lives outside the gate.**
 `opencode-plugin/jwoo.mjs` is plain JS — no `@opencode-ai/plugin` import, because the installed
 type package lags the binary — observing `message.updated` with the `assistant` + `time.completed`
 guard (`opencode-plugin/README.md` has the symlink install). The guard lives there rather than in
@@ -222,12 +225,23 @@ OpenCode's own process, so ADR-0016's contract is stronger there — at least as
 command it spawns. Like `helper/eventtap.swift`, it is excluded from the gate (`xo.config.js`,
 `.prettierignore`); what the gate exercises is the command and the projection behind it.
 
+**The Pi Shim is that same ownership line over pi's extension surface.**
+`pi-extension/jwoo.ts` is a personal pi extension — TypeScript, loaded through pi's `jiti` with no
+build step — observing `message_end` with the `assistant` + usage guard
+(`pi-extension/README.md` has the symlink install into `~/.pi/agent/extensions/`). The guard is
+there because `message_end` fires for user, assistant and tool-result messages; the zero-token
+skip stays the command's. It registers handlers only — no process in the factory, because some
+invocations load extensions without starting a session — returns nothing from the handler, so it
+can never request a continuation from a boundary event, and its one un-awaited spawn rides the
+same pinned node, absolute build and `--env-file-if-exists` line. Gate-external for the same
+reason and by the same two files.
+
 **The Claude half is wired in the user's own settings, and needs no installer.** The root
 `~/.claude/settings.json` points `Stop` and `SubagentStop` at `node
 --disable-warning=ExperimentalWarning --env-file-if-exists=<checkout>/.env dist/cli.js usage
 record-claude-hook` under the pinned node — the flip that retired `mongodb-usage-hook.mjs` is
 that one settings edit, and like the Shim the wiring dies quietly until the next `npm run
-build`, because `dist/` is gitignored. Neither Harness's wiring exports anything the CLI reads:
+build`, because `dist/` is gitignored. No Harness's wiring exports anything the CLI reads:
 the harness literal is the command's own, and `MONGO_URI` reaches the process the same way it
 reaches any other run, through the checkout's `.env` on `--env-file-if-exists` — so a record
 still Ingests without one and only the Push is lost. That flag is load-bearing: a wiring line

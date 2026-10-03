@@ -4,6 +4,8 @@
 > command lands.
 > Amended in #51 (2026-10-02): the contract extends to the OpenCode Shim — the plugin is
 > at least as quiet as the command it spawns.
+> Amended in #65 (2026-10-03): the same extends to the Pi Shim — pi's extension runs inside
+> pi's process too, and the handler is a catch-all with an un-awaited spawn.
 
 `usage record-claude-hook` runs inside Claude Code's own wiring — Stop and
 SubagentStop fire it as a child process of the agent's session. Its exit code
@@ -36,11 +38,13 @@ failure mode this contract otherwise risks.
 
 ## The Shim
 
-`usage record-opencode` is spawned by the Shim — the OpenCode-side plugin (CONTEXT.md) —
-which, unlike Claude's hook wiring, runs _inside_ the agent's own process. The command holds
+`usage record-opencode` and `usage record-pi` are spawned by their Shims — OpenCode's plugin
+and pi's extension (CONTEXT.md) — which, unlike Claude's hook wiring, run _inside_ the agent's
+own process. The commands hold
 the same contract as above: exit 0 on every path of its own, stdout silent, problems on
-stderr. The Shim holds it one notch stronger: its whole `event` handler is wrapped in a
-catch-all, so no exception escapes into OpenCode — the plugin is at least as quiet as the
+stderr. Each Shim holds it one notch stronger: its whole handler is wrapped in a
+catch-all, so no exception escapes into the agent, and its one spawn is un-awaited with its
+`error` swallowed — the plugin is at least as quiet as the
 command it spawns. Failures before either runs — a missing `dist/cli.js` — still exit
 non-zero and surface as visible non-blocking errors, as before; the spawn line's pinned node
 keeps the too-old-node case out.

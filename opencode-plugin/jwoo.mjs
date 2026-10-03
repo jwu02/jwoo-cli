@@ -79,8 +79,13 @@ export const Jwoo = async () => ({
 			and an unhandled one would come down on OpenCode. Swallowed here for
 			the same reason the catch below exists; the CLI's own diagnostics
 			still reach stderr through the inherited pipe.
+
+			The child's stdin gets the same treatment: a failed spawn destroys the
+			pipe, and `end()` on it reports asynchronously through an `error` event
+			the outer `try` cannot see.
 			*/
 			child.on('error', () => {});
+			child.stdin.on('error', () => {});
 
 			child.stdin.end(JSON.stringify(info));
 		} catch {
