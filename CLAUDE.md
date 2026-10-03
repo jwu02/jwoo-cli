@@ -41,7 +41,8 @@ that shape. `usage record-claude-hook` and `usage record-opencode` each read one
 artifact on stdin (a Claude Code hook payload, or one OpenCode `info` blob the Shim delivers),
 Ingest it, drain the Usage Backlog, and exit 0 on every path of their own (ADR-0016) — no
 `.env` needed, so a `MONGO_URI` in the environment is the only thing an offline run has to
-avoid. `usage backfill-claude [root]` takes the operator convention instead: it reads nothing on
+avoid. `usage backfill-claude [root]`, `usage backfill-opencode [db]` and `usage backfill-pi
+[root]` take the operator convention instead: each reads nothing on
 stdin, needs no `.env`, and exits 1 when its own scan or store fails, while a surviving Usage
 Backlog is not a failure.
 
@@ -76,7 +77,8 @@ set of variables per test. No `loadEnvFile` call inside it.
 `source/` is grouped by the import graph rather than by a generic layering: `capture/` (the
 helper, the wire format, the Key Label tables, the Collectors), `store/` (the Local Store, the
 Pusher and the Usage Push seam, the Range arithmetic, the Pricing table, config), `usage/` (the
-Harness artifact projections — the Claude transcript walk and the OpenCode message projection),
+Harness artifact projections — the Claude transcript walk, the OpenCode message projection, and
+the Pi session projection and walk),
 `views/` (the Ink layer).
 What is left at the root is the
 run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`,

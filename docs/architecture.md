@@ -10,8 +10,9 @@ each section names the invariants its module must hold.
 helper, the wire format, the Key Label tables — `key-labels.ts` pins what a keycode is called,
 `key-character.ts` what a key event produces — and the Collectors), `store/` (the Local Store,
 the Pusher and its sibling Usage Push seam, the Range arithmetic, the Pricing table, config),
-`usage/` (the Harness artifact projections — the Claude transcript walk and the OpenCode
-message projection and its database read), `views/` (the Ink layer). What
+`usage/` (the Harness artifact projections — the Claude transcript walk, the OpenCode
+message projection and its database read, and the Pi message projection and its session walk),
+`views/` (the Ink layer). What
 is left at the root is
 the run: `cli.tsx`, `main.tsx`, `args.ts`, `session.ts`, `telemetry.ts`, `run-log.ts`, `state.ts`
 and `format.ts` — each reads across the groups, so filing one under a group would move a
@@ -181,24 +182,35 @@ count when a Drain was attempted and left something behind. `MONGO_URI` is optio
 Ingest lands in the Local Store either way, and a config without one builds no Push seam and
 drains nothing.
 
-**The two Backfills are the group's operator commands, and they differ by a source and nothing
+**The three Backfills are the group's operator commands, and they differ by a source and nothing
 else.** `backfill-claude` walks Claude Code's whole projects directory — `subagents/` included,
-since a subagent's turns are usage like any other — and `backfill-opencode` opens OpenCode's own
+since a subagent's turns are usage like any other; `backfill-opencode` opens OpenCode's own
 SQLite database read-only and takes one candidate per assistant message, the row's `time_created`
-and its session's `directory` standing in for a blob's absent `time.created` and `path.cwd`. Each
+and its session's `directory` standing in for a blob's absent `time.created` and `path.cwd`; and
+`backfill-pi` walks pi's sessions directory recursively — a `.jsonl` file is a session iff its
+first line is a v3 session header, so nested per-run session files come in for free and
+pi-subagents' worker transcripts are excluded structurally rather than by a path pattern, and the
+header's `cwd` is the record's for the whole of that session. Each
 hands every candidate to the same Ingest face the live commands use, one record at a time: no bulk
 variant and no transaction around the scan, so a crash re-runs into the drop rule and a re-run adds
 nothing. `main.tsx`'s `runBackfill` is the whole of the run — config, store lifetime, the store's
 classify face for `--dry-run` (nothing written, no Push attempted), the Ingest pass, the Drain,
 the summary — and each entry point hands it a `BackfillSource`: the positional artifact, the scan,
-the Harness literal, and the noun the summary counts. `--since` bounds each candidate by its own
-`recorded_at`, and the Claude source additionally skips a file older than the bound before it is
-read, because a transcript's mtime is at least its last turn's time. Because these are not hooks,
+the Harness literal, and the noun the summary counts (transcripts, messages, sessions). `--since`
+bounds each candidate by its own `recorded_at`, and the Claude and Pi sources additionally skip a
+file older than the bound before it is read — the Claude one in the runner, the Pi one inside its
+own scan — because a file's mtime is at least its last turn's or message's time. Because these
+are not hooks,
 they keep the operator convention instead of ADR-0016: their own failure — a scan or store they
 could not reach — resolves `false` and `cli.tsx` turns that into exit 1, while a surviving Usage
 Backlog is not a failure at all. Their report is on stdout as one summary line — scanned,
 candidates, ingested, duplicates dropped, pushed, remaining — with the distinct unpriced models
-named once each beneath it, and only diagnostics on stderr.
+named once each beneath it, and only diagnostics on stderr. **The Pi projection shares the one
+flatten rule,** with two wrinkles of its own: `cacheWrite1h` is a bucket pi keeps apart from
+`cacheWrite` and its own `totalTokens` omits, so a record's total is recomputed as `prompt +
+completion` rather than trusted; and `reasoning` is not read, because pi bills thinking inside
+`output`. The projection is pure and throws on a usage-bearing message with no instant, so the live
+command will report it and the session walk skips a message it cannot place.
 
 **The Shim is the OpenCode half of that wiring, and it lives outside the gate.**
 `opencode-plugin/jwoo.mjs` is plain JS — no `@opencode-ai/plugin` import, because the installed

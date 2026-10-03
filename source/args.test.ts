@@ -226,6 +226,53 @@ test('a second database on backfill-opencode is rejected', t => {
 });
 
 /*
+`backfill-pi`'s positional is a sessions directory, like `backfill-claude`'s
+projects directory and unlike `backfill-opencode`'s database, and it carries the
+same two flags.
+*/
+test('backfill-pi carries its root and flags', t => {
+	t.deepEqual(parseArguments(['usage', 'backfill-pi']), {
+		kind: 'usage',
+		command: 'backfill-pi',
+		root: undefined,
+		dryRun: false,
+		since: undefined,
+	});
+
+	t.deepEqual(
+		parseArguments([
+			'usage',
+			'backfill-pi',
+			'/tmp/sessions',
+			'--dry-run',
+			'--since',
+			'2026-08-01T00:00:00Z',
+		]),
+		{
+			kind: 'usage',
+			command: 'backfill-pi',
+			root: '/tmp/sessions',
+			dryRun: true,
+			since: new Date('2026-08-01T00:00:00Z'),
+		},
+	);
+});
+
+test('a second root on backfill-pi is rejected', t => {
+	const {calls, showHelp} = rejecting();
+
+	t.throws(
+		() =>
+			commandFor(
+				{flags: {}, input: ['usage', 'backfill-pi', 'a', 'b']},
+				showHelp,
+			),
+		{message: 'showHelp'},
+	);
+	t.deepEqual(calls, [2]);
+});
+
+/*
 The record commands take no flags — their payload is stdin — so meow's knowing
 the Backfill's two does not make `--dry-run` legal on them. It is refused here,
 and the child-process test below is the same refusal through meow's own exit.
@@ -388,5 +435,26 @@ test('a Backfill whose database cannot be opened exits 1', async t => {
 
 	t.is(result.code, 1);
 	t.true(result.output.includes('Could not read'));
+	t.false(result.output.includes('scanned'));
+});
+
+/*
+The Pi Backfill's own failure is a sessions root it cannot walk, and it earns
+the same exit 1 through the same pairing in `cli.tsx`.
+*/
+test('a Backfill whose sessions root cannot be scanned exits 1', async t => {
+	const directory = mkdtempSync(join(tmpdir(), 'jwoo-cli-args-test-'));
+	t.teardown(() => {
+		rmSync(directory, {recursive: true, force: true});
+	});
+
+	const result = await runCli(
+		['usage', 'backfill-pi', join(directory, 'no-such-sessions')],
+		// eslint-disable-next-line @typescript-eslint/naming-convention -- an environment variable's name is SCREAMING_SNAKE_CASE by definition.
+		{LOCAL_STORE_PATH: join(directory, 'telemetry.db')},
+	);
+
+	t.is(result.code, 1);
+	t.true(result.output.includes('Could not scan'));
 	t.false(result.output.includes('scanned'));
 });

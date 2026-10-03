@@ -11,7 +11,7 @@ inside one.
 #53), and a group rather than three more top-level commands because they share a
 shape — each reads a Harness's own artifact and Ingests through the same store
 face — and because `usage` alone names nothing. The two record commands take
-their payload on stdin and nothing else; the two Backfills are the operator's,
+their payload on stdin and nothing else; the three Backfills are the operator's,
 and each carries a positional artifact and the flags a scan takes.
 
 Parsing is a pure function of argv, so what a given command line means is
@@ -60,6 +60,21 @@ export type Command =
 			*/
 			readonly dryRun: boolean;
 			readonly since: Date | undefined;
+	  }
+	| {
+			readonly kind: 'usage';
+			readonly command: 'backfill-pi';
+			/*
+			The sessions directory to scan; absent means pi's own, which the
+			entry point resolves rather than this module.
+			*/
+			readonly root: string | undefined;
+			/*
+			The same two flags the other two Backfills carry, for the same
+			reasons.
+			*/
+			readonly dryRun: boolean;
+			readonly since: Date | undefined;
 	  };
 
 /*
@@ -77,6 +92,8 @@ export const HELP_TEXT = `
 	                                       Ingest Claude Code transcripts from a projects dir
 	  $ jwoo-cli usage backfill-opencode [db]
 	                                       Ingest OpenCode messages from its own database
+	  $ jwoo-cli usage backfill-pi [root]
+	                                       Ingest Pi sessions from a sessions dir
 
 	Options
 	  --help     Show this help
@@ -192,7 +209,8 @@ function usageCommandFor(
 			return {kind: 'usage', command};
 		}
 
-		case 'backfill-claude': {
+		case 'backfill-claude':
+		case 'backfill-pi': {
 			const [root, ...extra] = rest;
 			if (extra.length > 0) {
 				showHelp(2);

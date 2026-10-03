@@ -19,9 +19,10 @@ hours collecting into a retry that can never succeed. The Pusher's half of the
 same order is the reverse — MongoDB is best-effort, so a Pusher that cannot reach
 it, or cannot be built at all, is a run that carries on.
 
-Seven entry points stand at the top of it — `runCollect`, `runDashboard`,
+Eight entry points stand at the top of it — `runCollect`, `runDashboard`,
 `runPermissions`, `runRecordClaudeHook`, `runRecordOpencode`,
-`runBackfillClaude` and `runBackfillOpencode` — one per command, each taking no
+`runBackfillClaude`, `runBackfillOpencode` and `runBackfillPi` — one per
+command, each taking no
 more than the command reads and each named for what it runs. Which one a command
 line means is decided a module up, in `cli.tsx`, which is also the only caller
 that supplies the real permissions source: nothing here imports the command
@@ -75,6 +76,7 @@ import {
 	projectOpencodeMessage,
 	readOpencodeDatabase,
 } from './usage/usage-opencode.js';
+import {readPiSessions} from './usage/usage-pi.js';
 import {findTranscripts, walkTranscript} from './usage/usage-transcript.js';
 import {MouseCollector} from './capture/mouse.js';
 import {
@@ -559,8 +561,7 @@ export type BackfillStore = UsageStore & {
 };
 
 /*
-What a Backfill is handed — `usage backfill-claude`'s set and
-`usage backfill-opencode`'s, which are the same set.
+What a Backfill is handed — the three Backfills' one set.
 
 Most of it is the record commands' — config, store, seam, stderr, clock — and
 the differences are what makes a Backfill the operator's command rather than a
@@ -570,7 +571,8 @@ The two sinks are the two faces of an operator run: the summary on stdout, every
 diagnostic on stderr.
 
 `root` and `database` are the two spellings of that positional artifact — a
-projects directory and a SQLite file — and each entry point reads only its own.
+projects or sessions directory, or a SQLite file — and each entry point reads
+only its own.
 */
 export type BackfillOptions = {
 	readonly root?: string;
@@ -623,6 +625,7 @@ command that Ingests decides the string (CONTEXT.md).
 */
 const CLAUDE_HARNESS = 'Claude Code';
 const OPENCODE_HARNESS = 'OpenCode';
+const PI_HARNESS = 'Pi';
 
 /*
 The fields of the hook JSON this command reads. Every one optional and read
@@ -975,8 +978,8 @@ function reportUsageBacklog(
 }
 
 /*
-`usage backfill-claude` and `usage backfill-opencode`: one Harness's own
-artifacts through the same Ingest face the live commands use.
+`usage backfill-claude`, `usage backfill-opencode` and `usage backfill-pi`: one
+Harness's own artifacts through the same Ingest face the live commands use.
 
 A Backfill is the operator's command, not a hook's, so it keeps the operator
 convention rather than ADR-0016: its own failure — a scan it could not make, a
@@ -996,10 +999,11 @@ limit rides along — two identical candidates in one scan both report a
 would-Ingest, because neither is stored yet to be found (spec #53).
 
 `--since` bounds each candidate by its own `recorded_at`; a source may also skip
-work before that filter (the Claude walk's file-mtime pre-skip), which is why
-the bound arrives at the source rather than only beside it.
+work before that filter (the Claude walk's file-mtime pre-skip, and the Pi walk's
+inside its own scan), which is why the bound arrives at the source rather than
+only beside it.
 
-The two commands differ by a source and nothing else: which artifact the
+The three commands differ by a source and nothing else: which artifact the
 positional names, how it is read, which Harness literal the records carry, and
 what one scanned unit is called in the summary. Everything around that — the
 config, the store's lifetime, the classify preview, the Ingest pass, the Drain,
@@ -1015,6 +1019,12 @@ export async function runBackfillOpencode(
 	options: BackfillOptions = {},
 ): Promise<BackfillResult> {
 	return runBackfill(options, OPENCODE_BACKFILL);
+}
+
+export async function runBackfillPi(
+	options: BackfillOptions = {},
+): Promise<BackfillResult> {
+	return runBackfill(options, PI_BACKFILL);
 }
 
 /*
@@ -1093,7 +1103,26 @@ const OPENCODE_BACKFILL: BackfillSource = {
 };
 
 /*
-One Backfill, end to end, for either Harness.
+Pi's half: its own sessions directory, walked recursively for `.jsonl` files
+that open with a v3 session header. Nested per-run session files come in for
+free and worker transcripts are excluded by that header rule rather than by a
+path — the scan is one function, because the header is what both admits the file
+and supplies the `cwd` every record of it carries.
+
+The `--since` pre-skip lives inside that walk, before a file is read, for the
+same reason the Claude source's does: a session file's mtime is at least its last
+message's time.
+*/
+const PI_BACKFILL: BackfillSource = {
+	scannedNoun: 'sessions',
+	harness: PI_HARNESS,
+	pathFrom: ({root}) => root ?? defaultPiSessionsDirectory(),
+	scan: (root, options) => readPiSessions(root, {since: options.since}),
+	scanFailure: (root, error) => `Could not scan ${root}: ${messageOf(error)}`,
+};
+
+/*
+One Backfill, end to end, for any Harness.
 */
 async function runBackfill(
 	options: BackfillOptions,
@@ -1210,6 +1239,14 @@ own. Tests always name one, so nothing in the gate reaches `~/.local/share`.
 */
 function defaultOpencodeDatabase(): string {
 	return join(homedir(), '.local', 'share', 'opencode', 'opencode.db');
+}
+
+/*
+Where `backfill-pi` scans when the operator names no root: pi's own sessions
+directory. Tests always name one, so nothing in the gate reaches `~/.pi`.
+*/
+function defaultPiSessionsDirectory(): string {
+	return join(homedir(), '.pi', 'agent', 'sessions');
 }
 
 /*

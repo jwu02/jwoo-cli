@@ -31,6 +31,7 @@ import {
 	type RunStore,
 	runBackfillClaude,
 	runBackfillOpencode,
+	runBackfillPi,
 	runCollect,
 	runDashboard,
 	runPermissions,
@@ -3417,4 +3418,272 @@ test('a database that cannot be opened fails the OpenCode Backfill', async t => 
 	t.false(ok);
 	t.regex(stderr[0] ?? '', /Could not read/v);
 	t.is(store.closes, 1, 'the store is still closed on the failing path');
+});
+
+/*
+`usage backfill-pi`, and the session logs it walks
+--------------------------------------------------
+
+The same shared runner, the same store and seam, over a tree of fixture pi
+session files. The projection and the header gate are `usage-pi.test.ts`'s
+subject; what is driven here is the command around them — the Pi Harness
+literal, the recursive scan, `--dry-run`, `--since` and the same operator
+exit-1 contract.
+*/
+
+/*
+One fixture assistant message, in pi's own field names — `cacheRead`,
+`cacheWrite1h`, `totalTokens` — with an ignored `totalTokens` so a test can
+catch the projection trusting it.
+*/
+function piMessage(
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		role: 'assistant',
+		content: [],
+		api: 'anthropic-messages',
+		provider: 'acme',
+		model: 'kimi-k2.7-code',
+		usage: {
+			input: 100,
+			output: 50,
+			cacheRead: 20,
+			cacheWrite: 5,
+			cacheWrite1h: 3,
+			totalTokens: 999,
+		},
+		stopReason: 'stop',
+		timestamp: 1_755_500_000_000,
+		...overrides,
+	};
+}
+
+function piEntry(
+	id: string,
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		type: 'message',
+		id,
+		parentId: null,
+		timestamp: '2026-08-18T07:00:01.000Z',
+		message: piMessage(overrides),
+	};
+}
+
+function piHeader(cwd = '/projects/site'): Record<string, unknown> {
+	return {
+		type: 'session',
+		version: 3,
+		id: 'sess-1',
+		timestamp: '2026-08-18T07:00:00.000Z',
+		cwd,
+	};
+}
+
+/*
+One fixture sessions root, under the OS's temp directory — never pi's own —
+with the session files the test names. Keys are relative paths, so a nested
+per-run `session.jsonl` nests the way it does on disk.
+*/
+function piSessionsTree(
+	t: ExecutionContext,
+	files: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>>,
+): string {
+	const root = mkdtempSync(join(tmpdir(), 'jwoo-cli-pi-backfill-test-'));
+	t.teardown(() => {
+		rmSync(root, {recursive: true, force: true});
+	});
+
+	for (const [relative, lines] of Object.entries(files)) {
+		const file = join(root, relative);
+		mkdirSync(dirname(file), {recursive: true});
+		writeFileSync(file, lines.map(line => JSON.stringify(line)).join('\n'));
+	}
+
+	return root;
+}
+
+/*
+One `usage backfill-pi` invocation, with everything it reaches outside itself
+stood in for.
+*/
+async function runPiBackfill({
+	root,
+	since,
+	dryRun = false,
+	config = CONFIG,
+	store = new FakeBackfillStore(),
+	pusher = new FakeUsagePusher(),
+}: {
+	readonly root: string;
+	readonly since?: Date;
+	readonly dryRun?: boolean;
+	readonly config?: Config;
+	readonly store?: FakeBackfillStore;
+	readonly pusher?: FakeUsagePusher;
+}): Promise<BackfillRun> {
+	const stdout: string[] = [];
+	const stderr: string[] = [];
+	let pusherBuilt = 0;
+
+	const result = await runBackfillPi({
+		root,
+		since,
+		dryRun,
+		config,
+		stdout(message) {
+			stdout.push(message);
+		},
+		stderr(message) {
+			stderr.push(message);
+		},
+		createUsageStore: () => store,
+		createUsagePusher(backlog, onAttempt) {
+			pusherBuilt += 1;
+			pusher.attach(onAttempt, backlog);
+			return pusher;
+		},
+	});
+
+	return {store, pusher, stdout, stderr, ok: !result.failed, pusherBuilt};
+}
+
+/*
+The demoable path: a sessions tree in, one record per pi assistant message out,
+with the Harness literal the command owns and the `cwd` the session header
+carries. The nested per-run `session.jsonl` is a v3 session like any other and
+comes in for free.
+*/
+test('a Pi Backfill reads every session and summarizes it', async t => {
+	const root = piSessionsTree(t, {
+		'project-a/2026-08-18_session.jsonl': [
+			piHeader('/projects/site'),
+			piEntry('m1'),
+		],
+		'project-a/run-1/run-0/session.jsonl': [
+			piHeader('/projects/other'),
+			piEntry('m2', {usage: {input: 5, output: 2, cacheRead: 1}}),
+		],
+	});
+
+	const {store, pusher, stdout, ok} = await runPiBackfill({root});
+
+	t.true(ok);
+	t.is(store.records.length, 2);
+	t.true(store.records.every(record => record.harness === 'Pi'));
+	t.is(store.records[0]?.cwd, '/projects/site');
+	t.is(store.records[1]?.cwd, '/projects/other');
+	t.is(store.records[0]?.prompt_tokens, 128, 'input + both cache writes');
+	t.is(store.records[0]?.total_tokens, 178, 'prompt + completion');
+	t.is(pusher.drains, 1);
+	t.is(store.closes, 1);
+	t.deepEqual(stdout, [
+		'scanned 2 sessions, 2 candidates, 2 ingested, 0 duplicates dropped, 2 pushed, 0 remaining',
+	]);
+});
+
+/*
+The drop rule is the same one, so a re-run over the same sessions adds nothing.
+*/
+test('re-running a Pi Backfill adds nothing', async t => {
+	const root = piSessionsTree(t, {
+		'session.jsonl': [piHeader(), piEntry('m1')],
+	});
+	const store = new FakeBackfillStore();
+
+	const first = await runPiBackfill({root, store});
+	const second = await runPiBackfill({root, store});
+
+	t.is(first.store.records.length, 1);
+	t.is(second.store.records.length, 1, 'the drop rule held');
+	t.deepEqual(second.stdout, [
+		'scanned 1 sessions, 1 candidates, 0 ingested, 1 duplicates dropped, 0 pushed, 0 remaining',
+	]);
+});
+
+/*
+`--dry-run` classifies against the real store and writes nothing, as it does
+for the other two.
+*/
+test('a dry run of the Pi Backfill classifies and writes nothing', async t => {
+	const root = piSessionsTree(t, {
+		'session.jsonl': [piHeader(), piEntry('m1')],
+	});
+
+	const {store, pusherBuilt, stdout, ok} = await runPiBackfill({
+		root,
+		dryRun: true,
+	});
+
+	t.true(ok);
+	t.deepEqual(store.records, []);
+	t.is(pusherBuilt, 0);
+	t.deepEqual(stdout, [
+		'scanned 1 sessions, 1 candidates, 1 would-ingest, 0 duplicates found',
+	]);
+});
+
+/*
+`--since` is both halves at once: a file whose mtime is older than the bound is
+not read — so `scanned` counts what was read — and a read file still yields only
+its messages at or after the bound.
+*/
+test('--since pre-skips a Pi session by mtime and filters each record', async t => {
+	const root = piSessionsTree(t, {
+		'project-a/old.jsonl': [piHeader(), piEntry('m1')],
+		'project-a/new.jsonl': [
+			piHeader(),
+			piEntry('m2'),
+			piEntry('m3', {timestamp: 1_700_000_000_000}),
+		],
+	});
+
+	const old = new Date(1_700_000_000_000);
+	utimesSync(join(root, 'project-a/old.jsonl'), old, old);
+
+	const {store, stdout} = await runPiBackfill({
+		root,
+		since: new Date(1_750_000_000_000),
+	});
+
+	t.is(store.records.length, 1);
+	t.deepEqual(stdout, [
+		'scanned 1 sessions, 1 candidates, 1 ingested, 0 duplicates dropped, 1 pushed, 0 remaining',
+	]);
+});
+
+/*
+A sessions root the walk cannot read is the Backfill's own failure, so it
+resolves false — which `cli.tsx` turns into exit 1 — and says why on stderr.
+*/
+test('a sessions root that cannot be scanned fails the Pi Backfill', async t => {
+	const root = join(tmpdir(), 'jwoo-cli-no-such-pi-sessions');
+
+	const {ok, stderr, store} = await runPiBackfill({root});
+
+	t.false(ok);
+	t.regex(stderr[0] ?? '', /Could not scan/v);
+	t.is(store.closes, 1, 'the store is still closed on the failing path');
+});
+
+/*
+The per-record unpriced line is suppressed on a Backfill, and each distinct
+unpriced model is named once with its count (ADR-0015).
+*/
+test('Unpriced Pi models are aggregated once each in the summary', async t => {
+	const root = piSessionsTree(t, {
+		'a.jsonl': [piHeader(), piEntry('m1')],
+		'b.jsonl': [piHeader(), piEntry('m2', {usage: {input: 1, output: 1}})],
+	});
+	const store = new FakeBackfillStore();
+	store.unpriced = true;
+
+	const {stdout} = await runPiBackfill({root, store});
+
+	t.deepEqual(stdout, [
+		'scanned 2 sessions, 2 candidates, 2 ingested, 0 duplicates dropped, 2 pushed, 0 remaining',
+		'no pricing for kimi-k2.7-code; cost left null (2 records)',
+	]);
 });

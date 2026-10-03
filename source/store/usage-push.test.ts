@@ -180,6 +180,7 @@ const config: Config = {
 
 const AT_10 = new Date('2026-09-25T10:00:00.000Z');
 const AT_11 = new Date('2026-09-25T11:00:00.000Z');
+const AT_12 = new Date('2026-09-25T12:00:00.000Z');
 
 /*
 One record, as the Local Store hands it to a drain: cost already priced at
@@ -342,20 +343,23 @@ test('an absent cwd, model or cost is null rather than a missing key', async t =
 });
 
 /*
-The harness literals are the command's, never the payload's — and they are the
-two the website groups by.
+The harness literals are the command's, never the payload's — the three
+CONTEXT.md's Harness entry names, and the three the website groups by. Pi is the
+deliberate third: the list is a one-sided pin, so a fourth Harness is an edit
+here and nowhere else that silently passes.
 */
 test('the harness literal is carried through verbatim', async t => {
 	const {pusher, database} = build([
 		record({id: 1, harness: 'Claude Code'}),
 		record({id: 2, harness: 'OpenCode', recordedAt: AT_11}),
+		record({id: 3, harness: 'Pi', recordedAt: AT_12}),
 	]);
 
 	await pusher.drain();
 
 	t.deepEqual(
 		collectionOf(database).documents.map(document => document['harness']),
-		['Claude Code', 'OpenCode'],
+		['Claude Code', 'OpenCode', 'Pi'],
 	);
 });
 

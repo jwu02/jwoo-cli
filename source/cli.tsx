@@ -39,12 +39,13 @@ import for the same reason.
     $ jwoo-cli usage record-opencode  Ingest one OpenCode message, from stdin
     $ jwoo-cli usage backfill-claude [root]  Ingest Claude Code transcripts from a projects dir
     $ jwoo-cli usage backfill-opencode [db]  Ingest OpenCode messages from its own database
+    $ jwoo-cli usage backfill-pi [root]  Ingest Pi sessions from a sessions dir
 
 Nothing here sets an exit code for a record command, and that is ADR-0016 rather
 than an omission: the record commands exit 0 on every path of their own, so they
 resolve with nothing and the process's default code stands. Their failures are
 stderr lines, which is the whole point — a non-zero code would surface inside
-the agent session the command observes. The two Backfills are the operator's
+the agent session the command observes. The Backfills are the operator's
 commands and not a hook's, so their own failure is an exit 1 here — and only
 their own, since a Usage Backlog that survives a run is not an error.
 */
@@ -54,6 +55,7 @@ import {parseArguments} from './args.js';
 import {
 	runBackfillClaude,
 	runBackfillOpencode,
+	runBackfillPi,
 	runCollect,
 	runDashboard,
 	runPermissions,
@@ -134,6 +136,20 @@ try {
 				case 'backfill-opencode': {
 					const {failed} = await runBackfillOpencode({
 						database: command.database,
+						dryRun: command.dryRun,
+						since: command.since,
+					});
+
+					if (failed) {
+						process.exitCode = 1;
+					}
+
+					break;
+				}
+
+				case 'backfill-pi': {
+					const {failed} = await runBackfillPi({
+						root: command.root,
 						dryRun: command.dryRun,
 						since: command.since,
 					});
