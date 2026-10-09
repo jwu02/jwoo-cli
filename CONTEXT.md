@@ -121,7 +121,8 @@ _Avoid_: tool (the Harness is not the assistant's Tool Call — see below), clie
 **Tool Call**:
 One invocation of a tool by the assistant — a `tool_use` block in a Claude Code turn, a
 `toolCall` block in a Pi message, a tool `part` in OpenCode. The Usage Record that spans it
-carries a count; a Skill Invocation counts as one too.
+carries a count; a Skill Invocation counts as one too when the Harness reports it as a tool
+call, as Claude's `Skill` block and OpenCode's `skill` part do.
 _Avoid_: tool (that is the Harness's banned synonym, and a capability rather than an act),
 function call, tool use
 
@@ -194,9 +195,10 @@ the Usage Backlog, whose Drain still happens at the invocation's end)
 
 **Cutover**:
 The switch from scripts writing Usage Records straight to MongoDB to the CLI's
-Ingest-then-Push path. It ends with the scripts' ObjectId-keyed documents cleared once the
-re-backfill has Pushed.
-_Avoid_: migration, cutover date (there is no single date — the wipe follows the first
+Ingest-then-Push path. It ends when the scripts' ObjectId-keyed documents a rebuild
+supersedes are cleared — and the ones no artifact can rebuild are kept — once the
+re-backfill has Pushed (ADR-0017).
+_Avoid_: migration, cutover date (there is no single date — the cleanup follows the first
 successful backfill, not the calendar)
 
 ### The reader

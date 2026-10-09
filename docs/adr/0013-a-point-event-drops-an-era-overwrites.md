@@ -3,6 +3,8 @@
 > Grilled in #44 (2026-09-30); recorded when the Push seam (#45) was specified.
 > Amended in #49 (2026-10-02): the cutover clears the ObjectId-keyed documents instead of
 > accepting their duplication.
+> Amended in #70 (2026-10-09): the cutover's cleanup is scoped by Harness and by the earliest
+> surviving transcript — the documents no artifact can rebuild survive (ADR-0017).
 
 The Local Store holds two document families, and a retry reaches each through a different
 door — so one store now carries two dedup rules, and they are deliberately not the same
@@ -49,9 +51,11 @@ Pushes the same `_id`s, and the upsert overwrites rather than duplicates.
   Snapshot. If a rule ever moves, it moves with a new ADR.
 - Records the retired `ai-usage/` scripts wrote straight to Mongo under driver-assigned
   ObjectIds carry no content `_id`, so a CLI backfill over the same turns would duplicate
-  them. The cutover clears them instead — once the re-backfill's Usage Backlog has drained,
-  the ObjectId-keyed documents are deleted by `_id` type, one command and no reconciliation
-  machinery — so the overlap window never materializes (#49).
+  them. The cutover clears the ones a rebuild supersedes instead — once the re-backfill's
+  Usage Backlog has drained, the ObjectId-keyed OpenCode documents and the ObjectId-keyed
+  Claude Code documents at or after the earliest surviving transcript are deleted, scoped by
+  Harness and `_id` type rather than wholesale so the unrebuildable ones survive (ADR-0017) —
+  so the overlap window never materializes (#49).
 - Dedup granularity is the record's own. A turn's summed tokens is one record — the
   corrected Usage Record definition — so the window's ambiguity is bounded by how the
   Harness reports.
