@@ -138,11 +138,13 @@ _Avoid_: skill use, tool call (a Skill Invocation is one, but not every Tool Cal
 Invocation)
 
 **Shim**:
-The harness-side file that observes its Harness's own event and Ingests each
+The harness-side file that observes its Harness's own events and Ingests each
 usage-bearing message by spawning the CLI command — OpenCode's plugin, observing
-`message.updated`, or pi's extension, observing `message_end`. Source lives in
-this repo, installed into the Harness's own extension directory; it owns the
-guard and the spawn, nothing else.
+`message.updated` and the `message.part.updated` events that carry each Tool Call,
+or pi's extension, observing `message_end`. Source lives in this repo, installed
+into the Harness's own extension directory; it owns the guard, whatever the
+Harness leaves out of the message itself (OpenCode's Tool Call count and Skill
+names, which live in its `part` rows), and the spawn, nothing else.
 _Avoid_: plugin, hook (Claude Code's term), bridge, adapter, watcher
 
 **Usage Record**:

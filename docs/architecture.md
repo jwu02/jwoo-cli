@@ -176,8 +176,10 @@ artifact and Ingests through the same store face — and because `usage` alone n
 bare `usage` is rejected the way a bare `dashboard` is. The three live record commands are wired:
 `record-claude-hook` reads a raw Claude Code hook payload on stdin and walks the transcript it
 names (always the transcript, never the proxy's non-standard `input.usage` shortcut);
-`record-opencode` reads one `info` blob the OpenCode Shim delivers and projects it into the single
-Usage Record it represents; and `record-pi` reads one document — the finished assistant message,
+`record-opencode` reads one document — the `info` blob the OpenCode Shim delivers, plus the
+message's Tool Call count and Skill names the Shim derived from its `part` events — and projects
+it into the single Usage Record it represents; and `record-pi` reads one document — the finished
+assistant message,
 the context's `cwd`, and the turn's Skill list — from the Pi Shim and projects it through the
 same Pi projection the Backfill walks sessions with. Each Ingests with the Harness literal the command owns, and all
 three run the
@@ -193,7 +195,9 @@ drains nothing.
 else.** `backfill-claude` walks Claude Code's whole projects directory — `subagents/` included,
 since a subagent's turns are usage like any other; `backfill-opencode` opens OpenCode's own
 SQLite database read-only and takes one candidate per assistant message, the row's `time_created`
-and its session's `directory` standing in for a blob's absent `time.created` and `path.cwd`; and
+and its session's `directory` standing in for a blob's absent `time.created` and `path.cwd`, and
+its tool `part` rows joined by message id standing in for the Tool Call count and Skill names
+the blob never held; and
 `backfill-pi` walks pi's sessions directory recursively — a `.jsonl` file is a session iff its
 first line is a v3 session header, so nested per-run session files come in for free and
 pi-subagents' worker transcripts are excluded structurally rather than by a path pattern, and the
@@ -224,11 +228,15 @@ argument, and throws on a usage-bearing message with no instant, so the live com
 it and the session walk skips a message it cannot place.
 
 **The Shim is the live half of that wiring, and it lives outside the gate.**
-`opencode-plugin/jwoo.mjs` is plain JS — no `@opencode-ai/plugin` import, because the installed
+`opencode-plugin/jwoo.js` is plain JS — no `@opencode-ai/plugin` import, because the installed
 type package lags the binary — observing `message.updated` with the `assistant` + `time.completed`
 guard (`opencode-plugin/README.md` has the symlink install). The guard lives there rather than in
 the command because the event fires on every message-row write and the command is handed one
-blob. Its whole handler is a catch-all and its one spawn is un-awaited: the plugin runs inside
+blob. Its second job is the two fields the blob cannot carry: OpenCode keeps each tool call in a
+`part` row and announces it as `message.part.updated`, so the Shim remembers those events per
+message id and, at completion, sends the count of tool parts and each `skill` part's name — the
+same shape the Backfill derives by joining the `part` table — dropping the record when the message
+completes or its session goes idle. Its whole handler is a catch-all and its one spawn is un-awaited: the plugin runs inside
 OpenCode's own process, so ADR-0016's contract is stronger there — at least as quiet as the
 command it spawns. Like `helper/eventtap.swift`, it is excluded from the gate (`xo.config.js`,
 `.prettierignore`); what the gate exercises is the command and the projection behind it.

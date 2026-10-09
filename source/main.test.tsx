@@ -2815,6 +2815,36 @@ test('an unreadable OpenCode payload is a stderr line, and still drains', async 
 });
 
 /*
+The Shim's document: the `info` blob plus the two fields it derived from the
+message's `part` events. Both reach the record, unchanged — repeats kept.
+*/
+test('an OpenCode payload carries its Tool Call count and Skill list', async t => {
+	const info: unknown = JSON.parse(opencodeMessage());
+	const {store} = await runOpencode({
+		info,
+		toolCalls: 3,
+		skills: ['commit', 'implement', 'commit'],
+	});
+
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.toolCalls, 3);
+	t.deepEqual(store.records[0]?.skills, ['commit', 'implement', 'commit']);
+});
+
+/*
+An older Shim sends the bare `info` blob, with no tool data; that absence is
+unknown for both fields, not none, and the payload must still Ingest.
+*/
+test('an OpenCode payload with no tool data still Ingests, leaving both unknown', async t => {
+	const {store, written} = await runOpencode(opencodeMessage());
+
+	t.deepEqual(written, ['Recorded.']);
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.toolCalls, undefined);
+	t.is(store.records[0]?.skills, undefined);
+});
+
+/*
 `usage record-pi`, and the one document its Shim delivers
 ---------------------------------------------------------
 
@@ -3389,6 +3419,11 @@ function opencodeDatabase(
 		readonly data: string;
 		readonly timeCreated?: number;
 	}>,
+	parts: ReadonlyArray<{
+		readonly id: string;
+		readonly messageId: string;
+		readonly data: string;
+	}> = [],
 ): string {
 	const directory = mkdtempSync(join(tmpdir(), 'jwoo-cli-backfill-test-'));
 	t.teardown(() => {
@@ -3408,6 +3443,14 @@ function opencodeDatabase(
 			time_created INTEGER NOT NULL,
 			data TEXT NOT NULL
 		);
+		CREATE TABLE part (
+			id TEXT PRIMARY KEY,
+			message_id TEXT NOT NULL REFERENCES message(id),
+			session_id TEXT NOT NULL REFERENCES session(id),
+			time_created INTEGER NOT NULL,
+			time_updated INTEGER NOT NULL,
+			data TEXT NOT NULL
+		);
 		INSERT INTO session (id, directory) VALUES ('ses_1', '/home/me/project');
 	`);
 
@@ -3421,6 +3464,15 @@ function opencodeDatabase(
 			message.timeCreated ?? 1_755_500_000_000,
 			message.data,
 		);
+	}
+
+	const insertPart = db.prepare(
+		'INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)',
+	);
+	let time = 1_755_500_000_000;
+	for (const part of parts) {
+		insertPart.run(part.id, part.messageId, 'ses_1', time, time, part.data);
+		time += 1;
 	}
 
 	db.close();
@@ -3499,6 +3551,44 @@ test('an OpenCode Backfill reads every assistant message and summarizes it', asy
 	t.deepEqual(stdout, [
 		'scanned 2 messages, 2 candidates, 2 ingested, 0 duplicates dropped, 2 pushed, 0 remaining',
 	]);
+});
+
+/*
+The same join the projection's tests drive: a message's tool `part` rows become
+its stored Tool Call count, and a `skill` part contributes its name on the way
+through the Backfill.
+*/
+test('an OpenCode Backfill stores the Tool Calls and Skills of each message', async t => {
+	const database = opencodeDatabase(
+		t,
+		[{id: 'msg_1', data: opencodeMessage()}],
+		[
+			{
+				id: 'prt_1',
+				messageId: 'msg_1',
+				data: JSON.stringify({
+					type: 'tool',
+					tool: 'read',
+					state: {status: 'completed', input: {}},
+				}),
+			},
+			{
+				id: 'prt_2',
+				messageId: 'msg_1',
+				data: JSON.stringify({
+					type: 'tool',
+					tool: 'skill',
+					state: {status: 'completed', input: {name: 'implement'}},
+				}),
+			},
+		],
+	);
+
+	const {store} = await runOpencodeBackfill({database});
+
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.toolCalls, 2);
+	t.deepEqual(store.records[0]?.skills, ['implement']);
 });
 
 /*

@@ -193,14 +193,37 @@ test('the payload wins over a caller-supplied fallback', t => {
 });
 
 /*
+The count and the Skill names are not in the `info` blob: they arrive as
+projection input, from the database read's joined parts or the Shim's payload.
+Supplying them carries them through; omitting them stays unknown, which is what
+an older Shim's bare blob means.
+*/
+test('a caller-supplied Tool Call count and Skill list are carried through', t => {
+	const flat = projectOpencodeMessage(message(), {
+		toolCalls: 3,
+		skills: ['commit', 'implement', 'commit'],
+	});
+
+	t.is(flat?.toolCalls, 3);
+	t.deepEqual(flat?.skills, ['commit', 'implement', 'commit']);
+});
+
+test('absent Tool Call and Skill data stays unknown, not zero', t => {
+	const flat = projectOpencodeMessage(message());
+
+	t.is(flat?.toolCalls, undefined);
+	t.is(flat?.skills, undefined);
+});
+
+/*
 The database read, against a fixture DB built with `node:sqlite`.
 ---------------------------------------------------------------
 
-The schema is the two columns this module reads plus the join between them —
-OpenCode's real `message` and `session` tables carry far more, none of which the
-Backfill touches. Rows are written through `node:sqlite` exactly as OpenCode
-would, so the reader is exercised against a real database rather than a fake of
-one.
+The schema is the columns this module reads plus the joins between them —
+OpenCode's real `message`, `session` and `part` tables carry far more, none of
+which the Backfill touches. Rows are written through `node:sqlite` exactly as
+OpenCode would, so the reader is exercised against a real database rather than a
+fake of one.
 */
 
 type FixtureMessage = {
@@ -233,12 +256,52 @@ function row(
 }
 
 /*
+One `part` row: a tool call is a `part` whose `data` is a `ToolPart`, with the
+message it belongs to in `message_id`. A `skill` part is the same row with
+`tool: 'skill'` and the Skill's name in `state.input.name`.
+*/
+type FixturePart = {
+	readonly id: string;
+	readonly messageId: string;
+	readonly data: string;
+};
+
+function toolPart(
+	id: string,
+	messageId: string,
+	tool: string,
+	skillName?: string,
+): FixturePart {
+	return {
+		id,
+		messageId,
+		data: JSON.stringify({
+			type: 'tool',
+			tool,
+			state: {
+				status: 'completed',
+				input: skillName === undefined ? {} : {name: skillName},
+			},
+		}),
+	};
+}
+
+function textPart(id: string, messageId: string): FixturePart {
+	return {
+		id,
+		messageId,
+		data: JSON.stringify({type: 'text', text: 'not a tool'}),
+	};
+}
+
+/*
 Build a fixture database under the OS's temp directory — never OpenCode's own —
 and hand back its path. `INSERT OR IGNORE` so several rows can share a session.
 */
 function database(
 	t: ExecutionContext,
 	rows: readonly FixtureMessage[],
+	parts: readonly FixturePart[] = [],
 ): string {
 	const directory = mkdtempSync(join(tmpdir(), 'jwoo-cli-opencode-test-'));
 	t.teardown(() => {
@@ -258,6 +321,14 @@ function database(
 			time_created INTEGER NOT NULL,
 			data TEXT NOT NULL
 		);
+		CREATE TABLE part (
+			id TEXT PRIMARY KEY,
+			message_id TEXT NOT NULL REFERENCES message(id),
+			session_id TEXT NOT NULL REFERENCES session(id),
+			time_created INTEGER NOT NULL,
+			time_updated INTEGER NOT NULL,
+			data TEXT NOT NULL
+		);
 	`);
 
 	const insertSession = db.prepare(
@@ -265,6 +336,9 @@ function database(
 	);
 	const insertMessage = db.prepare(
 		'INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)',
+	);
+	const insertPart = db.prepare(
+		'INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)',
 	);
 
 	for (const fixture of rows) {
@@ -275,6 +349,12 @@ function database(
 			fixture.timeCreated,
 			fixture.data,
 		);
+	}
+
+	let time = 1_755_500_000_000;
+	for (const part of parts) {
+		insertPart.run(part.id, part.messageId, 'ses_1', time, time, part.data);
+		time += 1;
 	}
 
 	db.close();
@@ -303,6 +383,65 @@ test('reads one candidate per assistant message', t => {
 	t.true(
 		scan.candidates.every(candidate => candidate.model === 'kimi-k2.7-code'),
 	);
+});
+
+/*
+The parts join: a message's tool `part` rows become its Tool Call count, and a
+`skill` part also contributes the Skill's name, in the order the parts were
+written. A part that is not a tool contributes neither.
+*/
+test("joins each message's tool parts into a count and Skill names", t => {
+	const path = database(
+		t,
+		[row('msg_1', message()), row('msg_2', message({id: 'msg_2'}))],
+		[
+			toolPart('prt_1', 'msg_1', 'read'),
+			toolPart('prt_2', 'msg_1', 'bash'),
+			toolPart('prt_3', 'msg_1', 'skill', 'implement'),
+			textPart('prt_4', 'msg_1'),
+			toolPart('prt_5', 'msg_2', 'grep'),
+		],
+	);
+
+	const scan = readOpencodeDatabase(path);
+
+	t.is(scan.candidates[0]?.toolCalls, 3, 'only tool parts count');
+	t.deepEqual(scan.candidates[0]?.skills, ['implement']);
+	t.is(scan.candidates[1]?.toolCalls, 1);
+	t.deepEqual(scan.candidates[1]?.skills, []);
+});
+
+/*
+A `skill` part is a Tool Call like any other *and* contributes its name: the two
+are not exclusive, and repeats are kept in invocation order.
+*/
+test('a skill part counts inside the count and contributes its name', t => {
+	const path = database(
+		t,
+		[row('msg_1', message())],
+		[
+			toolPart('prt_1', 'msg_1', 'skill', 'commit'),
+			toolPart('prt_2', 'msg_1', 'skill', 'commit'),
+		],
+	);
+
+	const scan = readOpencodeDatabase(path);
+
+	t.is(scan.candidates[0]?.toolCalls, 2);
+	t.deepEqual(scan.candidates[0]?.skills, ['commit', 'commit'], 'repeats kept');
+});
+
+/*
+A message with no tool parts made none — `0` and `[]`, not unknown — because the
+read sees the whole `part` table and knows there were none.
+*/
+test('a message with no tool parts projects zero and an empty list', t => {
+	const path = database(t, [row('msg_1', message())]);
+
+	const scan = readOpencodeDatabase(path);
+
+	t.is(scan.candidates[0]?.toolCalls, 0);
+	t.deepEqual(scan.candidates[0]?.skills, []);
 });
 
 /*

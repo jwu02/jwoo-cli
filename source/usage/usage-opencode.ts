@@ -1,7 +1,8 @@
 /*
-The OpenCode half: one raw `info` JSON — an `AssistantMessage` as OpenCode's
-`message.updated` event carries it — projected into the candidate Usage Record
-it represents, and the database read that finds those blobs in the first place.
+The OpenCode half: one `info` document — an `AssistantMessage` as OpenCode's
+`message.updated` event carries it, as the JSON text a database row holds or the
+object the Shim's payload carries — projected into the candidate Usage Record it
+represents, and the database read that finds those blobs in the first place.
 
 The projection is pure, like the transcript walk beside it: no store, no
 command, no network. `usage record-opencode` hands the Shim's payload here and
@@ -22,6 +23,12 @@ one request per message, the Shim fires once per completed message, and there is
 no chunk dedup to do — the guard that makes `time.completed` the end-of-turn
 signal lives in the Shim, because the event fires on every message-row write.
 
+Tool Calls and Skills are not in that message at all: OpenCode keeps them in
+`part` rows, one per tool call, with a Skill Invocation a `skill`-named tool
+part. So they cannot be derived from the blob — they arrive as projection input,
+from the Backfill's joined parts or the Shim's payload — and a payload that
+carries neither leaves both absent, which is unknown rather than none.
+
 `info.cost` is never read (ADR-0014): the Pricing table is the only cost source
 for both Harnesses, and a caller-supplied cost could contradict the record's own
 tokens.
@@ -39,26 +46,31 @@ decide.
 export type OpencodeCandidate = Omit<UsageRecord, 'harness'>;
 
 /*
-What a caller can supply that the payload itself cannot: the two fields a
-database row carries and a live `info` blob does not.
+What a caller supplies alongside the `info` blob, because the blob cannot carry
+it: the two fields OpenCode keeps in `part` rows rather than in the message, and
+the row fallbacks a live payload always carries and a database row sometimes
+cannot.
 
-The Shim delivers a message as OpenCode broadcast it, so `time.created` and
-`path.cwd` are the only places those two values exist and a payload without them
-is one the live command cannot place. A database row has its own `time_created`
-column and a session `directory` beside it, and the Backfill passes both here so
-its rows resolve the way the retired script resolved them. The live command
-passes neither, so its contract is unchanged.
+A database row has its own `time_created` column and a session `directory`
+beside it, and the Backfill passes both so its rows resolve the way the retired
+script resolved them. The message's tool parts are rows in `part` too, so the
+Backfill joins them and the Shim accumulates the same count and names from the
+part events it observes; either way they arrive here, the one projection input
+both paths share. A payload that carries neither leaves both undefined —
+unknown, not none.
 */
 export type OpencodeContext = {
 	readonly fallbackRecordedAt?: Date;
 	readonly fallbackCwd?: string;
+	readonly toolCalls?: number;
+	readonly skills?: readonly string[];
 };
 
 /*
-Project one raw `info` payload, or `undefined` when the message carries no
-tokens at all.
+Project one `info` document — JSON text or an already-parsed object — or
+`undefined` when the message carries no tokens at all.
 
-A payload that is not a JSON object, or one that carries tokens but no instant
+A document that is not a JSON object, or one that carries tokens but no instant
 to place it at — `time.created`, or the caller's `fallbackRecordedAt` — throws;
 the command reports it on stderr. A message whose token buckets are all absent
 or zero is a skip rather than a failure: the no-token-data guard the walk
@@ -66,10 +78,10 @@ applies, not a total-guard, so an errored or summarized message that still
 carries tokens Ingests like any other (spec #53).
 */
 export function projectOpencodeMessage(
-	raw: string,
+	raw: unknown,
 	context: OpencodeContext = {},
 ): OpencodeCandidate | undefined {
-	const parsed: unknown = JSON.parse(raw);
+	const parsed: unknown = typeof raw === 'string' ? JSON.parse(raw) : raw;
 	if (!isRecord(parsed)) {
 		throw new Error('the OpenCode message was not a JSON object');
 	}
@@ -134,6 +146,8 @@ export function projectOpencodeMessage(
 		total_tokens: total,
 		prompt_cache_hit_tokens: hit,
 		prompt_cache_miss_tokens: miss,
+		toolCalls: context.toolCalls,
+		skills: context.skills,
 	};
 	/* eslint-enable @typescript-eslint/naming-convention */
 }
@@ -207,10 +221,12 @@ row this module cannot read is skipped, because the file is OpenCode's and one
 bad row must not cost the rest.
 
 The row's `data` blob is the same `AssistantMessage` the Shim delivers, so the
-projection above is the whole of the reading and this function is the query and
+projection above is the whole of the reading and this function is the queries and
 the two fallbacks the row carries that a live payload does not: the row's own
 `time_created` for `time.created`, and its session's `directory` for `path.cwd`
-(the retired script's mapping, kept).
+(the retired script's mapping, kept). Its tool parts are `part` rows, so the
+second query joins them by message id and supplies each message's Tool Call
+count and Skill names to the projection.
 */
 export function readOpencodeDatabase(
 	databasePath: string,
@@ -221,6 +237,9 @@ export function readOpencodeDatabase(
 	try {
 		const candidates: OpencodeCandidate[] = [];
 		let scanned = 0;
+		const summaries = toolSummariesByMessage(
+			db.prepare(OPENCODE_TOOL_PARTS_QUERY).all(),
+		);
 
 		for (const row of db.prepare(OPENCODE_MESSAGES_QUERY).all()) {
 			const data = row['message_data'];
@@ -230,11 +249,17 @@ export function readOpencodeDatabase(
 
 			scanned += 1;
 
+			const messageId = row['message_id'];
+			const summary =
+				typeof messageId === 'string' ? summaries.get(messageId) : undefined;
+
 			let candidate: OpencodeCandidate | undefined;
 			try {
 				candidate = projectOpencodeMessage(data, {
 					fallbackRecordedAt: instantAt(row['time_created']),
 					fallbackCwd: textAt(row['session_directory']),
+					toolCalls: summary?.toolCalls ?? 0,
+					skills: summary?.skills ?? [],
 				});
 			} catch {
 				// A row the projection cannot place is not a candidate.
@@ -259,19 +284,73 @@ export function readOpencodeDatabase(
 }
 
 /*
-The one query. It reads a row's own instant and blob, and the session it belongs
-to for the cwd fallback. Ordered by `time_created`, with the row id breaking
-ties, so the candidates arrive in a stable order — which is what makes a scan's
-summary and the order it Ingests in independent of the order the database
-happens to hand rows back.
+One message's tool parts, summed: how many `tool` parts it has, and the name of
+each `skill` part in invocation order (repeats kept).
+
+The rows arrive already filtered to tool parts and ordered by `time_created`,
+so this is only the grouping by message id and the two counters. A `skill` part
+is itself a Tool Call, so it is counted before its name is read.
+*/
+type ToolSummary = {
+	toolCalls: number;
+	skills: string[];
+};
+
+function toolSummariesByMessage(
+	rows: ReadonlyArray<Record<string, unknown>>,
+): Map<string, ToolSummary> {
+	const summaries = new Map<string, ToolSummary>();
+
+	for (const row of rows) {
+		const messageId = row['message_id'];
+		if (typeof messageId !== 'string') {
+			continue;
+		}
+
+		const summary = summaries.get(messageId) ?? {toolCalls: 0, skills: []};
+		summary.toolCalls += 1;
+
+		const skillName = row['skill_name'];
+		if (typeof skillName === 'string' && row['tool'] === 'skill') {
+			summary.skills.push(skillName);
+		}
+
+		summaries.set(messageId, summary);
+	}
+
+	return summaries;
+}
+
+/*
+The messages query. It reads a row's id and blob, its own instant, and the
+session it belongs to for the cwd fallback. Ordered by `time_created`, with the
+row id breaking ties, so the candidates arrive in a stable order — which is what
+makes a scan's summary and the order it Ingests in independent of the order the
+database happens to hand rows back.
 */
 const OPENCODE_MESSAGES_QUERY = `
-	SELECT m.time_created AS time_created,
+	SELECT m.id AS message_id,
+	       m.time_created AS time_created,
 	       m.data AS message_data,
 	       s.directory AS session_directory
 	FROM message m
 	JOIN session s ON s.id = m.session_id
 	ORDER BY m.time_created ASC, m.id ASC
+`;
+
+/*
+The parts query: only tool parts, and only the two fields a summary needs.
+`json_extract` keeps a tool's output — often the bulk of the row — out of
+memory, and the ordering, with the part id breaking ties, is what makes a
+message's Skill names come out in invocation order.
+*/
+const OPENCODE_TOOL_PARTS_QUERY = `
+	SELECT p.message_id AS message_id,
+	       json_extract(p.data, '$.tool') AS tool,
+	       json_extract(p.data, '$.state.input.name') AS skill_name
+	FROM part p
+	WHERE json_extract(p.data, '$.type') = 'tool'
+	ORDER BY p.time_created ASC, p.id ASC
 `;
 
 /*

@@ -57,7 +57,7 @@ gate exercises is the binary committed beside it (`helper.test.ts` spawns it for
 `--preflight`, and to watch `stop()` kill it). So a rebuild left uncommitted passes the gate it
 should have failed: build by hand after changing the source and commit the binary with it.
 
-The OpenCode Shim (`opencode-plugin/jwoo.mjs`) and the Pi Shim (`pi-extension/jwoo.ts`) are
+The OpenCode Shim (`opencode-plugin/jwoo.js`) and the Pi Shim (`pi-extension/jwoo.ts`) are
 outside the gate the same way, excluded by `xo.config.js` and `.prettierignore`: OpenCode's plugin
 loader and pi's extension loader are what run them, and what the gate exercises is the command and
 projection behind them. `npm run build` before either Shim can spawn anything — `dist/` is

@@ -1,6 +1,6 @@
 # OpenCode live hook: can a shell command run when a turn completes?
 
-> Shipped as the **Shim**: `opencode-plugin/jwoo.mjs` in this repo, symlinked into
+> Shipped as the **Shim**: `opencode-plugin/jwoo.js` in this repo, symlinked into
 > `~/.config/opencode/plugins/`. The plugin registers the `event` hook, filters on
 > `message.updated` for an assistant message whose `info.time.completed` is set, and spawns
 > `usage record-opencode` with the `info` blob on stdin.

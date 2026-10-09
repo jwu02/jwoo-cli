@@ -688,14 +688,18 @@ export async function runRecordClaudeHook(
 }
 
 /*
-The `usage record-opencode` entry point: one raw `info` JSON — an
-`AssistantMessage` — on stdin, projected to the one Usage Record it represents.
+The `usage record-opencode` entry point: one JSON document — the `info` blob the
+Shim's `message.updated` event carried, plus the Tool Call count and Skill names
+it derived from the message's `part` events — on stdin, projected to the one
+Usage Record it represents.
 
 No event guard here. The Shim's `time.completed` guard is what makes a delivered
 payload a finished turn, and it lives there because OpenCode's event fires on
 every message-row write. A message with no tokens is a skip, not a failure; a
 payload that is not a JSON object, or one with no `time.created` to place it in
-history, is reported, and the invocation drains all the same.
+history, is reported, and the invocation drains all the same. A payload from a
+Shim that predates the two extra fields is the bare `info` blob, and both fields
+stay unknown.
 */
 export async function runRecordOpencode(
 	options: RecordUsageOptions = {},
@@ -703,7 +707,10 @@ export async function runRecordOpencode(
 	await runUsageRecord(options, OPENCODE_HARNESS, async report => {
 		let candidate;
 		try {
-			candidate = projectOpencodeMessage(await (options.stdin ?? readStdin)());
+			const {info, toolCalls, skills} = parseOpencodeInput(
+				await (options.stdin ?? readStdin)(),
+			);
+			candidate = projectOpencodeMessage(info, {toolCalls, skills});
 		} catch (error) {
 			report(`Could not read the OpenCode input: ${messageOf(error)}`);
 			return [];
@@ -1468,6 +1475,16 @@ function parseHookInput(raw: string): HookInput {
 }
 
 /*
+An array of strings, taking only its string entries. Anything else is undefined,
+which the callers read as unknown rather than an empty list.
+*/
+function stringArray(value: unknown): string[] | undefined {
+	return Array.isArray(value)
+		? value.filter((item): item is string => typeof item === 'string')
+		: undefined;
+}
+
+/*
 The Pi payload, as far as this command trusts it: the finished assistant message
 the Shim observed, the `cwd` its context carried, and the Skill list the Shim
 built from the turn's user messages. The message is left as it arrived — the
@@ -1489,9 +1506,38 @@ function parsePiInput(raw: string): {
 	return {
 		message,
 		cwd: typeof cwd === 'string' ? cwd : undefined,
-		skills: Array.isArray(skills)
-			? skills.filter((skill): skill is string => typeof skill === 'string')
-			: undefined,
+		skills: stringArray(skills),
+	};
+}
+
+/*
+The OpenCode payload, as far as this command trusts it: the `info` document the
+Shim delivered and the two fields it derived from the message's `part` events.
+A Shim that predates those fields sent the bare `info` object, so `info` may be
+the whole payload; either way the projection takes the two fields from the
+context, and a payload that carries neither leaves both undefined, which is
+unknown rather than none.
+*/
+function parseOpencodeInput(raw: string): {
+	info: unknown;
+	toolCalls: number | undefined;
+	skills: string[] | undefined;
+} {
+	const parsed: unknown = JSON.parse(raw);
+	if (typeof parsed !== 'object' || parsed === null) {
+		throw new Error('the OpenCode input was not a JSON object');
+	}
+
+	const record = parsed as Record<string, unknown>;
+	const {info, toolCalls, skills} = record;
+	if (typeof info !== 'object' || info === null) {
+		return {info: parsed, toolCalls: undefined, skills: undefined};
+	}
+
+	return {
+		info,
+		toolCalls: typeof toolCalls === 'number' ? toolCalls : undefined,
+		skills: stringArray(skills),
 	};
 }
 
