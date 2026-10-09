@@ -3,15 +3,19 @@ The Pi Shim: pi's side of `usage record-pi`.
 
 Pi has no config-level shell hook, only extensions (spec #63: pi's extension surface), so this
 file is the wiring Claude Code gets from `settings.json` and
-OpenCode gets from its plugin directory. It observes `message_end`, keeps the
-event that is a finished assistant message, and hands the message — plus the
-context's `cwd` — to the CLI on stdin.
+OpenCode gets from its plugin directory. It observes `message_end` and owns two
+message kinds: a finished assistant message is handed to the CLI — with the
+context's `cwd` and the turn's Skill list — and a user message is scanned for the
+`<skill name=…>` tags pi injects into it, keyed by session so a subagent's user
+message cannot leak into the parent's.
 
 It owns exactly two things, and the guard is one of them. `message_end` fires
 for user, assistant and tool-result messages, so the guard is `role ===
 "assistant"` with a usage object present. That is pi's closest analogue of
 OpenCode's `message.updated` + `time.completed`; the zero-token skip is the
 command's, because the command is the one that knows what a billable bucket is.
+The user-message branch is the second: it records the turn's Skill list, which
+the assistant message it precedes cannot carry itself.
 
 TypeScript rather than plain JS, because pi loads extensions through jiti and
 does not need a build step. The type import is type-only and erased at load, so
@@ -31,6 +35,17 @@ import {spawn} from 'node:child_process';
 import {homedir} from 'node:os';
 import {join} from 'node:path';
 import type {ExtensionAPI} from '@earendil-works/pi-coding-agent';
+
+/*
+The turn's Skill list, per session id. Pi injects a loaded Skill into the user
+message as a `<skill name="…" location="…">` tag, so the tag is where the
+turn's Skill Invocations are; the assistant message that follows carries none.
+Keyed by session because a subagent runs its own session and its user message
+must not become the parent's Skill list.
+*/
+const pendingSkills = new Map<string, string[]>();
+
+const SKILL_TAG = /<skill name="([^"]+)"/g;
 
 /*
 The pinned runtime and this checkout's build. The node version tracks `.nvmrc`,
@@ -62,9 +77,26 @@ export default function (pi: ExtensionAPI) {
 	pi.on('message_end', (event, ctx) => {
 		try {
 			const message = event.message;
+
+			/*
+			A user message opens a turn: scan it for Skill tags and hold the list
+			under this session until the next user message replaces it. Setting
+			even an empty list is the point — a tagless turn must not inherit the
+			previous one's Skills.
+			*/
+			if (message?.role === 'user') {
+				pendingSkills.set(
+					ctx.sessionManager.getSessionId(),
+					skillNamesIn(message.content),
+				);
+				return;
+			}
+
 			if (message?.role !== 'assistant' || message.usage == null) {
 				return;
 			}
+
+			const skills = pendingSkills.get(ctx.sessionManager.getSessionId());
 
 			const child = spawn(
 				NODE,
@@ -92,9 +124,58 @@ export default function (pi: ExtensionAPI) {
 			child.on('error', () => {});
 			child.stdin.on('error', () => {});
 
-			child.stdin.end(JSON.stringify({message, cwd: ctx.cwd}));
+			child.stdin.end(
+				JSON.stringify({
+					message,
+					cwd: ctx.cwd,
+					...(skills === undefined ? {} : {skills}),
+				}),
+			);
 		} catch {
 			// ADR-0016: no exception escapes into pi.
 		}
 	});
+}
+
+/*
+A user message's Skill tags, in order with repeats kept. Content is a string or
+an array of text and image blocks, so the tags are in the text parts; anything
+that is not a string or text block contributes none.
+*/
+function skillNamesIn(content: unknown): string[] {
+	const names: string[] = [];
+
+	for (const text of textsIn(content)) {
+		for (const match of text.matchAll(SKILL_TAG)) {
+			if (match[1] !== undefined) {
+				names.push(match[1]);
+			}
+		}
+	}
+
+	return names;
+}
+
+function textsIn(content: unknown): string[] {
+	if (typeof content === 'string') {
+		return [content];
+	}
+
+	if (!Array.isArray(content)) {
+		return [];
+	}
+
+	const texts: string[] = [];
+	for (const block of content) {
+		if (typeof block !== 'object' || block === null) {
+			continue;
+		}
+
+		const {type, text} = block as {type?: unknown; text?: unknown};
+		if (type === 'text' && typeof text === 'string') {
+			texts.push(text);
+		}
+	}
+
+	return texts;
 }

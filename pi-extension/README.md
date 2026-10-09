@@ -2,10 +2,11 @@
 
 `jwoo.ts` is the pi-side extension that gives pi the live capture Claude Code
 gets from its `settings.json` hook wiring and OpenCode gets from its plugin
-directory. It observes `message_end`, keeps the events whose message is an
-assistant message carrying usage, and spawns `jwoo-cli usage record-pi` with the
-message and the context's `cwd` on stdin. It owns the guard and the spawn,
-nothing else.
+directory. It observes `message_end` and keeps two things: a user message is
+scanned for the `<skill name=…>` tags pi injects into it, the list keyed by
+session and held for the turn, and an assistant message carrying usage spawns
+`jwoo-cli usage record-pi` with the message, the context's `cwd` and that Skill
+list on stdin. It owns the guard, the Skill scan and the spawn, nothing else.
 
 Pi discovers personal extensions in `~/.pi/agent/extensions/`, so installing it
 is a symlink — the file stays in this repo and is picked up on pi's next start:

@@ -177,9 +177,9 @@ bare `usage` is rejected the way a bare `dashboard` is. The three live record co
 `record-claude-hook` reads a raw Claude Code hook payload on stdin and walks the transcript it
 names (always the transcript, never the proxy's non-standard `input.usage` shortcut);
 `record-opencode` reads one `info` blob the OpenCode Shim delivers and projects it into the single
-Usage Record it represents; and `record-pi` reads one document — the finished assistant message
-plus the context's `cwd` — from the Pi Shim and projects it through the same Pi projection the
-Backfill walks sessions with. Each Ingests with the Harness literal the command owns, and all
+Usage Record it represents; and `record-pi` reads one document — the finished assistant message,
+the context's `cwd`, and the turn's Skill list — from the Pi Shim and projects it through the
+same Pi projection the Backfill walks sessions with. Each Ingests with the Harness literal the command owns, and all
 three run the
 same Ingest-then-Drain path — `main.tsx`'s `runUsageRecord` — so only the projection differs. The
 record commands are also the ones that never throw: ADR-0016 makes exit 0 on every path of their
@@ -216,8 +216,12 @@ named once each beneath it, and only diagnostics on stderr. **The Pi projection 
 flatten rule,** with two wrinkles of its own: `cacheWrite1h` is a bucket pi keeps apart from
 `cacheWrite` and its own `totalTokens` omits, so a record's total is recomputed as `prompt +
 completion` rather than trusted; and `reasoning` is not read, because pi bills thinking inside
-`output`. The projection is pure and throws on a usage-bearing message with no instant, so the live
-command will report it and the session walk skips a message it cannot place.
+`output`. It also counts the message's `toolCall` blocks as the record's Tool Calls, while the
+Skill list is not in the message at all: pi injects a loaded Skill into the _user_ message as a
+`<skill name=…>` tag, so the session walk derives the turn's list from its user messages and the
+live payload carries the list the Shim observed. The projection is pure, takes that list as an
+argument, and throws on a usage-bearing message with no instant, so the live command will report
+it and the session walk skips a message it cannot place.
 
 **The Shim is the live half of that wiring, and it lives outside the gate.**
 `opencode-plugin/jwoo.mjs` is plain JS — no `@opencode-ai/plugin` import, because the installed
@@ -234,7 +238,11 @@ command it spawns. Like `helper/eventtap.swift`, it is excluded from the gate (`
 build step — observing `message_end` with the `assistant` + usage guard
 (`pi-extension/README.md` has the symlink install into `~/.pi/agent/extensions/`). The guard is
 there because `message_end` fires for user, assistant and tool-result messages; the zero-token
-skip stays the command's. It registers handlers only — no process in the factory, because some
+skip stays the command's. It also reads the user messages the guard skips: a `<skill name=…>` tag
+in one is scanned into a pending list keyed by session id, so the assistant message that follows
+carries the turn's Skills and a subagent's user message cannot leak into the parent's. The list
+rides the same stdin document as the message, and a payload from a Shim that predates it still
+Ingests with Skills unknown. It registers handlers only — no process in the factory, because some
 invocations load extensions without starting a session — returns nothing from the handler, so it
 can never request a continuation from a boundary event, and its one un-awaited spawn rides the
 same pinned node, absolute build and `--env-file-if-exists` line. Gate-external for the same

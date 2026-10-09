@@ -715,9 +715,9 @@ export async function runRecordOpencode(
 
 /*
 The `usage record-pi` entry point: one JSON document — the finished pi assistant
-message the Shim observed, plus the `cwd` its context carried — on stdin,
-projected through the shared Pi projection into the one Usage Record it
-represents.
+message the Shim observed, the `cwd` its context carried, and the turn's Skill
+list — on stdin, projected through the shared Pi projection into the one Usage
+Record it represents.
 
 No event guard here either. The Shim's `message_end` guard is what makes a
 delivered payload a finished assistant message, and it lives there because pi's
@@ -733,8 +733,10 @@ export async function runRecordPi(
 	await runUsageRecord(options, PI_HARNESS, async report => {
 		let candidate;
 		try {
-			const {message, cwd} = parsePiInput(await (options.stdin ?? readStdin)());
-			candidate = projectPiMessage(message, cwd);
+			const {message, cwd, skills} = parsePiInput(
+				await (options.stdin ?? readStdin)(),
+			);
+			candidate = projectPiMessage(message, cwd, skills);
 		} catch (error) {
 			report(`Could not read the Pi input: ${messageOf(error)}`);
 			return [];
@@ -1467,23 +1469,29 @@ function parseHookInput(raw: string): HookInput {
 
 /*
 The Pi payload, as far as this command trusts it: the finished assistant message
-the Shim observed and the `cwd` its context carried. The message is left as it
-arrived — the shared projection is what validates it — while `cwd` is taken only
-when it is a string, because the session may have none.
+the Shim observed, the `cwd` its context carried, and the Skill list the Shim
+built from the turn's user messages. The message is left as it arrived — the
+shared projection is what validates it — while `cwd` is taken only when it is a
+string, because the session may have none, and `skills` only when it is an array
+of strings. An older Shim sends no Skill list, and undefined is that unknown.
 */
 function parsePiInput(raw: string): {
 	message: unknown;
 	cwd: string | undefined;
+	skills: string[] | undefined;
 } {
 	const parsed: unknown = JSON.parse(raw);
 	if (typeof parsed !== 'object' || parsed === null) {
 		throw new Error('the Pi input was not a JSON object');
 	}
 
-	const {message, cwd} = parsed as Record<string, unknown>;
+	const {message, cwd, skills} = parsed as Record<string, unknown>;
 	return {
 		message,
 		cwd: typeof cwd === 'string' ? cwd : undefined,
+		skills: Array.isArray(skills)
+			? skills.filter((skill): skill is string => typeof skill === 'string')
+			: undefined,
 	};
 }
 

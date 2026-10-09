@@ -27,6 +27,12 @@ is not output is miss — with two wrinkles of its own:
 time — is the record's own `recorded_at`. `usage.cost` is never read (ADR-0014):
 the Pricing table is the only cost source, and a provider-supplied cost could
 contradict the record's own tokens.
+
+Tool Calls are the message's `toolCall` content blocks, counted here because
+they are in the message. Skill Invocations are not: pi injects a loaded Skill
+into the *user* message as a `<skill name=…>` tag, so the walk derives the
+turn's list and the Shim hands its own list in — both as `skills` input, the
+one derivation point the two paths share.
 */
 
 import {readFileSync, readdirSync, statSync} from 'node:fs';
@@ -61,6 +67,7 @@ no wall-clock fallback, because pricing keys on the record's own instant
 export function projectPiMessage(
 	message: unknown,
 	cwd: string | undefined,
+	skills?: readonly string[],
 ): PiCandidate | undefined {
 	if (!isRecord(message)) {
 		throw new Error('the pi message was not a JSON object');
@@ -99,7 +106,7 @@ export function projectPiMessage(
 		throw new Error('the pi message had no timestamp');
 	}
 
-	/* eslint-disable @typescript-eslint/naming-convention -- the five buckets keep the wire's column names. */
+	/* eslint-disable @typescript-eslint/naming-convention -- the five buckets keep the wire's snake_case column names. */
 	return {
 		cwd,
 		model: stringAt(message, 'model'),
@@ -109,8 +116,74 @@ export function projectPiMessage(
 		total_tokens: prompt + completion,
 		prompt_cache_hit_tokens: hit,
 		prompt_cache_miss_tokens: miss,
+		toolCalls: toolCallCount(message['content']),
+		skills,
 	};
 	/* eslint-enable @typescript-eslint/naming-convention */
+}
+
+/*
+How many `toolCall` blocks the message's content holds. A string content, or
+none at all, holds none: the message is the projection's own to read, so a
+missing block is `0` (none), never unknown.
+*/
+function toolCallCount(content: unknown): number {
+	if (!Array.isArray(content)) {
+		return 0;
+	}
+
+	return content.filter(
+		block => isRecord(block) && block['type'] === 'toolCall',
+	).length;
+}
+
+/*
+The Skill names one user message's text carries, in order with repeats kept. Pi
+injects a loaded Skill into the user message as a `<skill name="…" location="…">`
+tag — the header is the Skill's name — so the tag is the only place a Skill
+Invocation is recorded.
+*/
+function skillNamesIn(message: Record<string, unknown>): string[] {
+	const names: string[] = [];
+
+	for (const text of userTexts(message['content'])) {
+		for (const match of text.matchAll(/<skill name="(?<name>[^"]+)"/gv)) {
+			const name = match.groups?.['name'];
+			if (name !== undefined) {
+				names.push(name);
+			}
+		}
+	}
+
+	return names;
+}
+
+/*
+A user message's text parts. Content is a string or an array of text and image
+blocks (message-types.md); anything else is no text, and so no tag.
+*/
+function userTexts(content: unknown): string[] {
+	if (typeof content === 'string') {
+		return [content];
+	}
+
+	if (!Array.isArray(content)) {
+		return [];
+	}
+
+	const texts: string[] = [];
+	for (const block of content) {
+		if (!isRecord(block) || block['type'] !== 'text') {
+			continue;
+		}
+
+		const {text} = block;
+		if (typeof text === 'string') {
+			texts.push(text);
+		}
+	}
+
+	return texts;
 }
 
 /*
@@ -146,8 +219,9 @@ root the operator asked for but that cannot be read throws, because that is the
 Backfill's own failure rather than a file's.
 
 `usage` (any `kind`) and `compaction` entries are excluded by construction, in
-silence: the walk reads only `message` entries whose role is `assistant`, so no
-other entry kind is ever projected. Zero exist on this machine; billed cache-warm
+silence: only `message` entries are projected, and only an assistant one becomes a
+candidate — a user message is read solely for the turn's Skill tags, and no other
+entry kind is projected at all. Zero exist on this machine; billed cache-warm
 usage arriving would be a data change and a ticket, not a per-run stderr nag.
 */
 export function readPiSessions(
@@ -168,16 +242,44 @@ export function readPiSessions(
 		}
 
 		scanned += 1;
-
-		for (const entry of session.entries) {
-			const candidate = candidateFrom(entry, session.cwd, options.since);
-			if (candidate !== undefined) {
-				candidates.push(candidate);
-			}
-		}
+		candidates.push(...candidatesFromSession(session, options.since));
 	}
 
 	return {scanned, candidates};
+}
+
+/*
+Every candidate one session's entries produce, in order. A user message opens a
+turn and carries its Skill tags; every assistant message until the next user
+message belongs to that turn, so the list is threaded through the walk rather
+than re-derived per message. A session with no tag anywhere yields `[]` (none),
+because the walk read it.
+*/
+function candidatesFromSession(
+	session: PiSession,
+	since: Date | undefined,
+): PiCandidate[] {
+	const candidates: PiCandidate[] = [];
+	let skills: string[] = [];
+
+	for (const entry of session.entries) {
+		const {message} = entry;
+		if (
+			entry['type'] === 'message' &&
+			isRecord(message) &&
+			message['role'] === 'user'
+		) {
+			skills = skillNamesIn(message);
+			continue;
+		}
+
+		const candidate = candidateFrom(entry, session.cwd, since, skills);
+		if (candidate !== undefined) {
+			candidates.push(candidate);
+		}
+	}
+
+	return candidates;
 }
 
 /*
@@ -191,6 +293,7 @@ function candidateFrom(
 	entry: Record<string, unknown>,
 	cwd: string | undefined,
 	since: Date | undefined,
+	skills: readonly string[],
 ): PiCandidate | undefined {
 	const {message} = entry;
 	if (
@@ -203,7 +306,7 @@ function candidateFrom(
 
 	let candidate: PiCandidate | undefined;
 	try {
-		candidate = projectPiMessage(message, cwd);
+		candidate = projectPiMessage(message, cwd, skills);
 	} catch {
 		return undefined;
 	}

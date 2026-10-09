@@ -2833,8 +2833,9 @@ carried. A raw string is passed through for the malformed-stdin case.
 function piRecordPayload(
 	message: unknown = piMessage(),
 	cwd: string | undefined = '/projects/site',
+	skills?: readonly string[],
 ): Record<string, unknown> {
-	return {message, cwd};
+	return skills === undefined ? {message, cwd} : {message, cwd, skills};
 }
 
 async function runPi(
@@ -2900,6 +2901,43 @@ test('one Pi message is projected, Ingested and reported Recorded.', async t => 
 	t.is(pusherBuilt, 1);
 	t.is(pusher.drains, 1, 'the invocation touches the Backlog');
 	t.is(store.closes, 1);
+});
+
+/*
+The Shim's Skill list and the message's own toolCall blocks both reach the
+record. The list is the Shim's derivation (it observed the user message) and is
+carried through unchanged, repeats kept.
+*/
+test('a Pi payload carries its Skill list and its Tool Call count', async t => {
+	const {store} = await runPi(
+		piRecordPayload(
+			piMessage({
+				content: [
+					{type: 'toolCall', id: 'c1', name: 'bash', arguments: {}},
+					{type: 'toolCall', id: 'c2', name: 'read', arguments: {}},
+				],
+			}),
+			'/projects/site',
+			['commit', 'review', 'commit'],
+		),
+	);
+
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.toolCalls, 2);
+	t.deepEqual(store.records[0]?.skills, ['commit', 'review', 'commit']);
+});
+
+/*
+An older Shim sends no Skill list, and that absence is unknown, not none: the
+payload must still Ingest.
+*/
+test('a Pi payload with no Skill list still Ingests, leaving Skills unknown', async t => {
+	const {store, written} = await runPi(piRecordPayload());
+
+	t.deepEqual(written, ['Recorded.']);
+	t.is(store.records.length, 1);
+	t.is(store.records[0]?.skills, undefined);
+	t.is(store.records[0]?.toolCalls, 0);
 });
 
 test('the same Pi message again is Duplicate., and still drains', async t => {
@@ -3737,7 +3775,9 @@ test('a Pi Backfill after a live record adds nothing', async t => {
 	});
 	const store = new FakeBackfillStore();
 
-	const live = await runPi(piRecordPayload(), {store});
+	const live = await runPi(piRecordPayload(piMessage(), '/projects/site', []), {
+		store,
+	});
 	const backfill = await runPiBackfill({root, store});
 
 	t.is(live.store.records.length, 1);

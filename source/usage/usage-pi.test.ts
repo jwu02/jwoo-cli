@@ -74,6 +74,56 @@ test('flattens the five buckets and recomputes the total', t => {
 });
 
 /*
+Tool Calls are the `toolCall` blocks of the message the projection is handed.
+Each assistant message is one record, so its own blocks are its own count.
+*/
+test('counts the toolCall blocks of the message', t => {
+	const flat = projectPiMessage(
+		message({
+			content: [
+				{type: 'text', text: 'working'},
+				{type: 'toolCall', id: 'c1', name: 'bash', arguments: {}},
+				{type: 'toolCall', id: 'c2', name: 'read', arguments: {}},
+			],
+		}),
+		undefined,
+	);
+
+	t.is(flat?.toolCalls, 2);
+});
+
+/*
+A message with no `toolCall` block made none: the message is what the projection
+counts, so its content is known even when it holds nothing to count.
+*/
+test('a message with no toolCall blocks counts zero, not unknown', t => {
+	const flat = projectPiMessage(
+		message({content: [{type: 'text', text: 'just talking'}]}),
+		undefined,
+	);
+
+	t.is(flat?.toolCalls, 0);
+});
+
+/*
+The Skill list is not in the message — the walk derives it from the turn's user
+message and the Shim from the user message it observed — so it arrives as
+projection input. Supplying it carries it through; omitting it stays unknown,
+which is what an older Shim's payload means.
+*/
+test('the Skill list is carried through, and absent stays unknown', t => {
+	const withSkills = projectPiMessage(message(), undefined, [
+		'commit',
+		'review',
+		'commit',
+	]);
+	const without = projectPiMessage(message(), undefined);
+
+	t.deepEqual(withSkills?.skills, ['commit', 'review', 'commit']);
+	t.is(without?.skills, undefined, 'unknown, not an empty list');
+});
+
+/*
 The 1h cache write is the whole reason the total is recomputed: pi's
 `totalTokens` omits it, so a message whose only usage is a long-lived cache write
 must still Ingest and still bill.
@@ -203,6 +253,24 @@ function messageEntry(
 		parentId: null,
 		timestamp: '2026-08-18T07:00:01.000Z',
 		message: message(overrides),
+	};
+}
+
+/*
+One user message entry, its content the text block pi injects a loaded Skill
+into. The skill tags are the test's; `text` is the whole content.
+*/
+function userEntry(id: string, text: string): Record<string, unknown> {
+	return {
+		type: 'message',
+		id,
+		parentId: null,
+		timestamp: '2026-08-18T07:00:00.000Z',
+		message: {
+			role: 'user',
+			content: [{type: 'text', text}],
+			timestamp: 1_755_500_000_000,
+		},
 	};
 }
 
@@ -368,6 +436,80 @@ test('--since pre-skips by mtime and filters each record', t => {
 	t.is(scan.scanned, 1, 'the pre-skipped file was not read');
 	t.is(scan.candidates.length, 1);
 	t.is(scan.candidates[0]?.recordedAt.getTime(), 1_755_500_000_000);
+});
+
+/*
+A user message's Skill tag is the turn's, so every assistant message that turn
+produces carries it — several messages included — until the next user message
+starts a turn of its own, tagless and so skill-free.
+*/
+test('a Skill tag is attributed to every assistant message of its turn', t => {
+	const root = sessionsTree(t, {
+		'session.jsonl': [
+			header(),
+			userEntry(
+				'u1',
+				'<skill name="commit" location="/skills/commit/SKILL.md">do it</skill>\ncommit this',
+			),
+			messageEntry('m1'),
+			{
+				type: 'message',
+				id: 't1',
+				parentId: 'm1',
+				message: {role: 'toolResult'},
+			},
+			messageEntry('m2'),
+			userEntry('u2', 'plain follow-up'),
+			messageEntry('m3'),
+		],
+	});
+
+	const scan = readPiSessions(root);
+
+	t.is(scan.candidates.length, 3);
+	t.deepEqual(scan.candidates[0]?.skills, ['commit'], 'the tag opens the turn');
+	t.deepEqual(
+		scan.candidates[1]?.skills,
+		['commit'],
+		'it spans a second message',
+	);
+	t.deepEqual(scan.candidates[2]?.skills, [], 'the next turn is tagless');
+});
+
+/*
+A session with no Skill tag anywhere made no Skill Invocation: the walk scanned
+it, so that is `[]` (none), never unknown.
+*/
+test('a session with no Skill tag yields an empty list, not unknown', t => {
+	const root = sessionsTree(t, {
+		'session.jsonl': [header(), messageEntry('m1')],
+	});
+
+	const scan = readPiSessions(root);
+
+	t.deepEqual(scan.candidates[0]?.skills, []);
+	t.is(scan.candidates[0]?.toolCalls, 0);
+});
+
+/*
+Multiple Skill tags on one user message are kept in order, repeats included —
+the list is the record of what was invoked, not a set.
+*/
+test('every Skill tag on a user message is kept, in order', t => {
+	const root = sessionsTree(t, {
+		'session.jsonl': [
+			header(),
+			userEntry(
+				'u1',
+				'<skill name="commit" location="…"><skill name="review" location="…"><skill name="commit" location="…">',
+			),
+			messageEntry('m1'),
+		],
+	});
+
+	const scan = readPiSessions(root);
+
+	t.deepEqual(scan.candidates[0]?.skills, ['commit', 'review', 'commit']);
 });
 
 /*
