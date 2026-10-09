@@ -768,11 +768,11 @@ test('a file this CLI did not write fails at open', t => {
 test('a file from a newer CLI fails at open', t => {
 	const path = storePath(t);
 	const db = new DatabaseSync(path);
-	db.exec('PRAGMA user_version = 3');
+	db.exec('PRAGMA user_version = 4');
 	db.close();
 
 	t.throws(() => new LocalStore(configAt(path)), {
-		message: /schema version 3/v,
+		message: /schema version 4/v,
 	});
 });
 
@@ -793,7 +793,7 @@ test('a file whose version lies about its tables fails at open', t => {
 	/*
 	And it is left exactly as it was. The probe runs inside the migration
 	transaction, so a version-1 file with no era family is refused instead of
-	being half-migrated to version 2 with a usage table and no eras — which
+	being half-migrated to the current version with a usage table and no eras — which
 	would be a file this CLI could then never open again.
 	*/
 	t.is(
@@ -891,6 +891,9 @@ test('an Ingest writes one usage row, priced from its own tokens', t => {
 			total_tokens: 1100,
 			prompt_cache_hit_tokens: 200,
 			prompt_cache_miss_tokens: 300,
+			// Unknown, not none: the caller reported no Tool Calls or Skills.
+			tool_calls: null,
+			skills: null,
 			// NULL until a Push acknowledges the record.
 			pushed_at: null,
 		},
@@ -1093,6 +1096,8 @@ test('the Usage Backlog is every unacknowledged record, oldest recorded_at first
 		total_tokens: 1100,
 		prompt_cache_hit_tokens: 200,
 		prompt_cache_miss_tokens: 300,
+		toolCalls: undefined,
+		skills: undefined,
 	});
 });
 
@@ -1129,6 +1134,132 @@ test('an acknowledgement takes a record out of the Usage Backlog', t => {
 		)[0]?.['pushed_at'],
 		4_000_000,
 	);
+});
+
+test('a v3 store round-trips a Tool Call count and a Skill list', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	const result = store.ingest(
+		usageRecord({
+			model: 'kimi-k2.5',
+			toolCalls: 4,
+			skills: ['commit', 'review', 'commit'],
+		}),
+	);
+	const backlog = store.usageBacklog();
+	store.close();
+
+	t.is(result.status, 'ingested');
+	// Order and repeats are the record: the list's length is the distinct count's
+	// derivation, so nothing here may reorder or collapse it.
+	t.is(backlog[0]?.toolCalls, 4);
+	t.deepEqual(backlog[0]?.skills, ['commit', 'review', 'commit']);
+});
+
+test('a row written without either field reads back unknown, not zero', t => {
+	const path = storePath(t);
+	const store = new LocalStore(configAt(path));
+
+	store.ingest(usageRecord());
+	const backlog = store.usageBacklog();
+	store.close();
+
+	/*
+	Absent is unknown, not none. `0` and `[]` are the Harness that reported
+	genuinely no tools, which is a different fact from a Harness that never
+	reported at all.
+	*/
+	t.is(backlog[0]?.toolCalls, undefined);
+	t.is(backlog[0]?.skills, undefined);
+	t.is(
+		query(path, 'SELECT tool_calls, skills FROM usage_records')[0]?.[
+			'tool_calls'
+		],
+		null,
+	);
+});
+
+test('a v2 store migrates to v3 in place, its usage rows reading back unknown', t => {
+	const path = storePath(t);
+	const db = new DatabaseSync(path);
+	/*
+	The version-2 schema, written out as history rather than imported: this is
+	the file the CLI that wrote version 2 leaves, with a usage row that predates
+	the two new fields.
+	*/
+	db.exec(`
+		CREATE TABLE eras (
+			stamp           INTEGER PRIMARY KEY NOT NULL,
+			left_clicks     INTEGER NOT NULL,
+			right_clicks    INTEGER NOT NULL,
+			movement_meters REAL    NOT NULL,
+			press_total     INTEGER NOT NULL,
+			pushed_at       INTEGER
+		);
+		CREATE TABLE era_key_counts (
+			era_stamp INTEGER NOT NULL REFERENCES eras(stamp),
+			label     TEXT    NOT NULL,
+			count     INTEGER NOT NULL,
+			PRIMARY KEY (era_stamp, label)
+		);
+		CREATE TABLE usage_records (
+			id                       INTEGER PRIMARY KEY,
+			recorded_at              INTEGER NOT NULL,
+			harness                  TEXT    NOT NULL,
+			cwd                      TEXT,
+			model                    TEXT,
+			cost_yuan                REAL,
+			prompt_tokens            INTEGER NOT NULL,
+			completion_tokens        INTEGER NOT NULL,
+			total_tokens             INTEGER NOT NULL,
+			prompt_cache_hit_tokens  INTEGER NOT NULL,
+			prompt_cache_miss_tokens INTEGER NOT NULL,
+			pushed_at                INTEGER
+		);
+		INSERT INTO eras VALUES (1000, 1, 2, 0.5, 3, NULL);
+		INSERT INTO era_key_counts VALUES (1000, 'A', 3);
+		INSERT INTO usage_records VALUES (
+			1, 1000000, 'Claude Code', NULL, 'kimi-k2.5', NULL,
+			1000, 100, 1100, 200, 300, NULL
+		);
+		PRAGMA user_version = 2;
+	`);
+	db.close();
+
+	const store = new LocalStore(configAt(path));
+	const backlog = store.usageBacklog();
+	store.close();
+
+	t.is(
+		query(path, 'SELECT user_version FROM pragma_user_version')[0]?.[
+			'user_version'
+		],
+		3,
+	);
+
+	// The era family is exactly as it was: nothing aged out and nothing moved.
+	t.deepEqual(query(path, 'SELECT * FROM eras'), [
+		{
+			stamp: 1000,
+			left_clicks: 1,
+			right_clicks: 2,
+			movement_meters: 0.5,
+			press_total: 3,
+			pushed_at: null,
+		},
+	]);
+
+	/*
+	The pre-existing row survives the additive migration and its two new columns
+	are NULL — the unknown state, not a zero the CLI invented.
+	*/
+	t.is(backlog.length, 1);
+	t.is(backlog[0]?.toolCalls, undefined);
+	t.is(backlog[0]?.skills, undefined);
+	t.deepEqual(query(path, 'SELECT tool_calls, skills FROM usage_records'), [
+		{tool_calls: null, skills: null},
+	]);
 });
 
 test('a v1 store is migrated in place, keeping the era family', t => {
@@ -1173,7 +1304,7 @@ test('a v1 store is migrated in place, keeping the era family', t => {
 		query(path, 'SELECT user_version FROM pragma_user_version')[0]?.[
 			'user_version'
 		],
-		2,
+		3,
 	);
 
 	// The era family is exactly as it was: nothing aged out and nothing moved.

@@ -228,11 +228,13 @@ function collectionOf(database: FakeDatabase): FakeCollection {
 /*
 The wire pin, one-sided per ADR-0004: the website is not compiled against this,
 so a change here is a deliberate edit on both sides or not at all. The keys are
-closed — an eleventh field fails the pin — and every value's type is asserted
+closed — a thirteenth field fails the pin — and every value's type is asserted
 because the website's aggregation reads them as those types.
 */
-test('a record Pushes as the ten-field wire document, and nothing else', async t => {
-	const {pusher, database} = build([record()]);
+test('a record Pushes as the twelve-field wire document, and nothing else', async t => {
+	const {pusher, database} = build([
+		record({toolCalls: 4, skills: ['commit', 'review', 'commit']}),
+	]);
 
 	await pusher.drain();
 
@@ -251,6 +253,8 @@ test('a record Pushes as the ten-field wire document, and nothing else', async t
 			'prompt_cache_hit_tokens',
 			'prompt_cache_miss_tokens',
 			'recorded_at',
+			'tool_calls',
+			'skills',
 		].toSorted(),
 		'the exact key set: no createdAt, no TTL field, no extra',
 	);
@@ -259,6 +263,8 @@ test('a record Pushes as the ten-field wire document, and nothing else', async t
 	t.is(document!['cwd'], '/Users/jwu02/Developer');
 	t.is(document!['model'], 'claude-sonnet-4-5');
 	t.is(document!['cost_yuan'], 1.23);
+	t.is(document!['tool_calls'], 4);
+	t.deepEqual(document!['skills'], ['commit', 'review', 'commit']);
 
 	// A real BSON Date, not the epoch milliseconds the Local Store holds.
 	t.true(document!['recorded_at'] instanceof Date);
@@ -310,12 +316,19 @@ test('the seam writes the default ai_usage collection', async t => {
 
 /*
 The absent half of the wire doc: a nullable field is `null` and never missing,
-so the key set is the same ten whichever record went out — and `cost_yuan` is
-`number | null`, the Unpriced marker (ADR-0015).
+so the key set is the same twelve whichever record went out — `cost_yuan` is
+`number | null`, the Unpriced marker (ADR-0015), and `tool_calls` / `skills`
+are unknown rather than zero or an empty list.
 */
-test('an absent cwd, model or cost is null rather than a missing key', async t => {
+test('an absent cwd, model, cost, tool count or skill list is null rather than a missing key', async t => {
 	const {pusher, database} = build([
-		record({cwd: undefined, model: undefined, costYuan: undefined}),
+		record({
+			cwd: undefined,
+			model: undefined,
+			costYuan: undefined,
+			toolCalls: undefined,
+			skills: undefined,
+		}),
 	]);
 
 	await pusher.drain();
@@ -324,6 +337,8 @@ test('an absent cwd, model or cost is null rather than a missing key', async t =
 	t.is(document!['cwd'], null);
 	t.is(document!['model'], null);
 	t.is(document!['cost_yuan'], null);
+	t.is(document!['tool_calls'], null);
+	t.is(document!['skills'], null);
 	t.deepEqual(
 		Object.keys(document!).toSorted(),
 		[
@@ -338,6 +353,8 @@ test('an absent cwd, model or cost is null rather than a missing key', async t =
 			'prompt_cache_hit_tokens',
 			'prompt_cache_miss_tokens',
 			'recorded_at',
+			'tool_calls',
+			'skills',
 		].toSorted(),
 	);
 });

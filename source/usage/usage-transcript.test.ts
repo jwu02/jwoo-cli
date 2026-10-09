@@ -103,6 +103,8 @@ test('a turn flattens Anthropic buckets into the store five', t => {
 			total_tokens: 200,
 			prompt_cache_hit_tokens: 20,
 			prompt_cache_miss_tokens: 130, // Prompt − hit.
+			toolCalls: 0,
+			skills: [],
 		},
 	]);
 });
@@ -196,6 +198,54 @@ test('a zero-token turn produces no candidate', t => {
 	]);
 
 	t.deepEqual(walkTranscript(file), []);
+});
+
+test('a turn counts every tool_use block across its assistant entries', t => {
+	const file = transcript(t, [
+		user(),
+		assistant({
+			content: [
+				{type: 'tool_use', name: 'Bash', input: {}},
+				{type: 'tool_use', name: 'Read', input: {}},
+			],
+		}),
+		// A second chunk of the same request: same usage (counted once), but its
+		// own tool_use block.
+		assistant({
+			content: [{type: 'tool_use', name: 'Edit', input: {}}],
+			timestamp: '2026-08-18T07:00:02.000Z',
+		}),
+	]);
+
+	t.is(walkTranscript(file)[0]?.toolCalls, 3);
+});
+
+test('a Skill invocation lands in the list in order, repeats kept, and counts', t => {
+	const file = transcript(t, [
+		user(),
+		assistant({
+			content: [
+				{type: 'tool_use', name: 'Skill', input: {skill: 'commit'}},
+				{type: 'tool_use', name: 'Bash', input: {}},
+				{type: 'tool_use', name: 'Skill', input: {skill: 'commit'}},
+			],
+		}),
+	]);
+
+	const candidate = walkTranscript(file)[0];
+	// Invocation order, repeats kept: the list is the record, and the count is
+	// its length rather than a second stored number.
+	t.deepEqual(candidate?.skills, ['commit', 'commit']);
+	t.is(candidate?.toolCalls, 3);
+});
+
+test('a turn that used no tools projects zero and an empty list', t => {
+	const file = transcript(t, [user(), assistant()]);
+
+	const candidate = walkTranscript(file)[0];
+	// None, never unknown: the walk saw the whole turn and it held no tools.
+	t.is(candidate?.toolCalls, 0);
+	t.deepEqual(candidate?.skills, []);
 });
 
 test('sidechain lines are dropped from a main transcript', t => {

@@ -115,7 +115,27 @@ _Avoid_: catch-up, retry loop, sync
 The coding agent whose usage a record attributes: Claude Code, OpenCode or Pi. The CLI names
 the harness — the command that Ingests decides the string; a Harness never self-reports
 its own name. DSH stays out of scope, in `ai-usage/` — see Deliberately absent.
-_Avoid_: tool, client, agent (ADR-0001), provider, self-reported
+_Avoid_: tool (the Harness is not the assistant's Tool Call — see below), client, agent
+(ADR-0001), provider, self-reported
+
+**Tool Call**:
+One invocation of a tool by the assistant — a `tool_use` block in a Claude Code turn, a
+`toolCall` block in a Pi message, a tool `part` in OpenCode. The Usage Record that spans it
+carries a count; a Skill Invocation counts as one too.
+_Avoid_: tool (that is the Harness's banned synonym, and a capability rather than an act),
+function call, tool use
+
+**Skill**:
+A named reusable instruction set a Harness can load. The name a Skill Invocation records is
+the Skill's own, not the file's that holds it.
+_Avoid_: plugin, agent, prompt, template
+
+**Skill Invocation**:
+One load of a Skill by the assistant: its name in the Usage Record's ordered `skills` list,
+repeats kept. The list is the record — the distinct count is its length, so no second number
+encodes the same fact.
+_Avoid_: skill use, tool call (a Skill Invocation is one, but not every Tool Call is a Skill
+Invocation)
 
 **Shim**:
 The harness-side file that observes its Harness's own event and Ingests each
@@ -127,9 +147,11 @@ _Avoid_: plugin, hook (Claude Code's term), bridge, adapter, watcher
 
 **Usage Record**:
 One LLM usage event as the Harness reports it — a turn's summed tokens or a single request's
-— with its cost and its own `recorded_at`. A point event: identity is content, so a
-re-Ingest near the same instant is dropped rather than rewritten (ADR-0013). An unpriced
-model still Ingests: the record's cost is null, not the record absent.
+— with its cost and its own `recorded_at`. It also carries how many Tool Calls the assistant
+made in that span and the names of the Skill Invocations it made; both are optional, and
+absent means unknown, while `0` and `[]` mean genuinely none. A point event: identity is
+content, so a re-Ingest near the same instant is dropped rather than rewritten (ADR-0013).
+An unpriced model still Ingests: the record's cost is null, not the record absent.
 _Avoid_: usage event (that is the helper's wire format), request, turn (neither names the
 record), document (a Telemetry Document family word), invalid, incomplete (an unpriced
 record is a record)

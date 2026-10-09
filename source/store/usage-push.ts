@@ -16,8 +16,8 @@ value. The one client this seam opens comes from `createMongoClient`, which
 What makes a re-Push converge is the `_id`: derived from the record's content
 (ADR-0013), so a store wiped and re-Ingested from the same transcripts writes the
 same ids and the upsert overwrites what a lost acknowledgement landed rather
-than adding a second copy beside it. The wire document itself is exactly the ten
-fields the website already reads — no TTL, no `createdAt` (spec #53).
+than adding a second copy beside it. The wire document itself is exactly the
+twelve fields the website already reads — no TTL, no `createdAt` (spec #53).
 */
 
 import {createHash} from 'node:crypto';
@@ -109,11 +109,13 @@ function documentId(record: BackloggedUsage): string {
 
 /*
 One record, as the driver's `replaceOne` operation writes it: the content-keyed
-`_id`, and the wire document — exactly the ten fields the website reads, absent
-values written as `null` so every document carries all ten.
+`_id`, and the wire document — exactly the twelve fields the website reads, absent
+values written as `null` so every document carries all twelve.
 
 `recorded_at` is a real BSON `Date`, not the epoch milliseconds the Local Store
-holds: the website's aggregation groups on it as a date.
+holds: the website's aggregation groups on it as a date. `tool_calls` and
+`skills` are the eleventh and twelfth fields, and an unknown one is `null` rather
+than a missing key.
 */
 function writeOf(record: BackloggedUsage): UsageWrite {
 	const id = documentId(record);
@@ -135,6 +137,8 @@ function writeOf(record: BackloggedUsage): UsageWrite {
 				prompt_cache_hit_tokens: record.prompt_cache_hit_tokens,
 				prompt_cache_miss_tokens: record.prompt_cache_miss_tokens,
 				recorded_at: record.recordedAt,
+				tool_calls: record.toolCalls ?? null,
+				skills: record.skills ?? null,
 			},
 		},
 	};

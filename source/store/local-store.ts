@@ -65,6 +65,42 @@ function optionalStringAt(row: Row, column: string): string | undefined {
 }
 
 /*
+A nullable INTEGER or REAL column: the number, or `undefined` for the driver's
+NULL and for anything that is not a number. The sibling of `optionalStringAt`,
+and the answer `cost_yuan` and `tool_calls` share — absence is `undefined`, not
+a zero this module invented.
+*/
+function optionalNumberAt(row: Row, column: string): number | undefined {
+	const value = row[column];
+	return typeof value === 'number' ? value : undefined;
+}
+
+/*
+The Skill list column: a JSON array of names, or `undefined` for the driver's
+NULL and for anything that is not the array this module wrote. A row this CLI
+wrote holds a string it can parse; a NULL is unknown, and a value that will not
+parse is treated the same way rather than thrown, for the reason `optionalStringAt`
+does not stringify: `undefined` is the honest answer for a column whose whole
+contract is that it may be absent.
+*/
+function optionalSkillsAt(row: Row, column: string): string[] | undefined {
+	const value = row[column];
+	if (typeof value !== 'string') {
+		return undefined;
+	}
+
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return Array.isArray(parsed) &&
+			parsed.every(item => typeof item === 'string')
+			? parsed
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/*
 The dedup window, in milliseconds: a record whose model and five token buckets
 match one already stored within this distance of its own `recorded_at` is the
 same point event arriving again (ADR-0013). Symmetric and inclusive, the window
@@ -116,7 +152,7 @@ function inTransaction<T>(
 	}
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /*
 The era family: the schema models the **era**, not the wire.
@@ -193,6 +229,20 @@ CREATE INDEX usage_records_fingerprint ON usage_records (
 `;
 
 /*
+The two Tool Call and Skill columns, added at version 3.
+
+An additive migration: `ALTER TABLE ... ADD COLUMN` leaves every existing row
+as it was, and a NULL in either column is the absent, unknown state — `0` and
+`[]` are what a Harness that reported none writes. `skills` holds a JSON array
+of names as TEXT because SQLite has no array type, and this module is the only
+reader and writer of that encoding.
+*/
+const USAGE_V3_SCHEMA = `
+ALTER TABLE usage_records ADD COLUMN tool_calls INTEGER;
+ALTER TABLE usage_records ADD COLUMN skills    TEXT;
+`;
+
+/*
 The file's schema version, and the drift guard beside it.
 
 A store this CLI has never written to reports `user_version` 0 — and so does an
@@ -202,8 +252,9 @@ to build around, because a file that already has an `eras` table this module did
 not make is not a file this module can safely write to.
 
 The step from version 1 to 2 is additive — the era family is untouched, and the
-usage family is created beside it — so the whole migration is one transaction
-and an existing store upgrades in place.
+usage family is created beside it — and version 3 adds two usage columns the same
+way. So the whole migration is one transaction and an existing store upgrades in
+place.
 */
 function migrate(db: DatabaseSync): void {
 	const version = numberAt(
@@ -238,6 +289,10 @@ function migrate(db: DatabaseSync): void {
 
 		if (version < 2) {
 			db.exec(USAGE_SCHEMA);
+		}
+
+		if (version < 3) {
+			db.exec(USAGE_V3_SCHEMA);
 		}
 
 		db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -323,6 +378,15 @@ export type UsageRecord = {
 	readonly total_tokens: number;
 	readonly prompt_cache_hit_tokens: number;
 	readonly prompt_cache_miss_tokens: number;
+	/*
+	How many Tool Calls the assistant made in this record's span, and the
+	Skill Invocations it made, in order with repeats kept. Both are optional:
+	absent means the Harness never reported them (unknown), while `0` and `[]`
+	mean genuinely none. The distinct Skill count is the list's length, so no
+	second number is stored.
+	*/
+	readonly toolCalls?: number | undefined;
+	readonly skills?: readonly string[] | undefined;
 };
 
 /*
@@ -604,13 +668,15 @@ export class LocalStore implements HistorySource {
 				INSERT INTO usage_records (
 					recorded_at, harness, cwd, model, cost_yuan,
 					prompt_tokens, completion_tokens, total_tokens,
-					prompt_cache_hit_tokens, prompt_cache_miss_tokens, pushed_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+					prompt_cache_hit_tokens, prompt_cache_miss_tokens,
+					tool_calls, skills, pushed_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
 			`);
 			this.#selectUsageBacklog = prepare(`
 				SELECT id, recorded_at, harness, cwd, model, cost_yuan,
 					prompt_tokens, completion_tokens, total_tokens,
-					prompt_cache_hit_tokens, prompt_cache_miss_tokens
+					prompt_cache_hit_tokens, prompt_cache_miss_tokens,
+					tool_calls, skills
 				FROM usage_records
 				WHERE pushed_at IS NULL
 				ORDER BY recorded_at, id
@@ -897,6 +963,8 @@ export class LocalStore implements HistorySource {
 					record.total_tokens,
 					record.prompt_cache_hit_tokens,
 					record.prompt_cache_miss_tokens,
+					record.toolCalls ?? null,
+					record.skills === undefined ? null : JSON.stringify(record.skills),
 				);
 
 				return {status: 'ingested', id: Number(lastInsertRowid), costYuan};
@@ -915,20 +983,21 @@ export class LocalStore implements HistorySource {
 	by different keys: an era by its stamp, a record by `recorded_at`.
 	*/
 	usageBacklog(): readonly BackloggedUsage[] {
-		/* eslint-disable @typescript-eslint/naming-convention -- the five buckets keep the wire's column names. */
+		/* eslint-disable @typescript-eslint/naming-convention -- the five buckets keep the wire's column names; the two new fields are the record's own. */
 		return this.#selectUsageBacklog.all().map(row => ({
 			id: numberAt(row, 'id'),
 			recordedAt: new Date(numberAt(row, 'recorded_at')),
 			harness: stringAt(row, 'harness'),
 			cwd: optionalStringAt(row, 'cwd'),
 			model: optionalStringAt(row, 'model'),
-			costYuan:
-				typeof row['cost_yuan'] === 'number' ? row['cost_yuan'] : undefined,
+			costYuan: optionalNumberAt(row, 'cost_yuan'),
 			prompt_tokens: numberAt(row, 'prompt_tokens'),
 			completion_tokens: numberAt(row, 'completion_tokens'),
 			total_tokens: numberAt(row, 'total_tokens'),
 			prompt_cache_hit_tokens: numberAt(row, 'prompt_cache_hit_tokens'),
 			prompt_cache_miss_tokens: numberAt(row, 'prompt_cache_miss_tokens'),
+			toolCalls: optionalNumberAt(row, 'tool_calls'),
+			skills: optionalSkillsAt(row, 'skills'),
 		}));
 		/* eslint-enable @typescript-eslint/naming-convention */
 	}

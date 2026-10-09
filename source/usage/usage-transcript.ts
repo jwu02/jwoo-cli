@@ -21,6 +21,11 @@ cacheCreate, hit = cacheRead, miss = prompt − hit, completion = output; the
 store's `total_tokens` is prompt + completion, which the Anthropic shape never
 reports.
 
+The turn's Tool Calls are every `tool_use` block its assistant entries carry, a
+`Skill` invocation contributing its name to the ordered Skill list as well as
+counting as one — so a turn that used no tools projects `0` and `[]`, never
+unknown.
+
 The `input.usage` shortcut the retired hook took when the proxy filled it in is
 not ported. The walk is the superset: it sees every turn, gives each its own real
 `recorded_at`, and re-walks safely because Ingest drops duplicates.
@@ -153,7 +158,7 @@ export function walkTranscript(
 		const turnStart = walked[start];
 		const recordedAt = totals.timestamp ?? entryInstant(turnStart) ?? clock();
 
-		/* eslint-disable @typescript-eslint/naming-convention -- the five buckets keep the wire's column names. */
+		/* eslint-disable @typescript-eslint/naming-convention -- the five buckets keep the wire's column names; the two new fields are the record's own. */
 		candidates.push({
 			cwd,
 			model: totals.model,
@@ -163,6 +168,8 @@ export function walkTranscript(
 			total_tokens: total,
 			prompt_cache_hit_tokens: hit,
 			prompt_cache_miss_tokens: miss,
+			toolCalls: totals.toolCalls,
+			skills: totals.skills,
 		});
 		/* eslint-enable @typescript-eslint/naming-convention */
 	}
@@ -222,6 +229,8 @@ function accumulateTurn(
 	readonly cacheCreate: number;
 	readonly model?: string;
 	readonly timestamp?: Date;
+	readonly toolCalls: number;
+	readonly skills: readonly string[];
 } {
 	let input = 0;
 	let output = 0;
@@ -229,38 +238,69 @@ function accumulateTurn(
 	let cacheCreate = 0;
 	let model: string | undefined;
 	let timestamp: Date | undefined;
+	let toolCalls = 0;
+	const skills: string[] = [];
 	const seenRequests = new Set<string>();
 
 	for (let index = start + 1; index < end; index++) {
-		const request = countableRequest(walked[index], seenRequests);
-		if (request === undefined) {
-			continue;
+		const entry = walked[index];
+		const request = countableRequest(entry, seenRequests);
+		if (request !== undefined) {
+			input += request.usage?.input_tokens ?? 0;
+			output += request.usage?.output_tokens ?? 0;
+			cacheRead += request.usage?.cache_read_input_tokens ?? 0;
+			cacheCreate += request.usage?.cache_creation_input_tokens ?? 0;
+
+			if (request.model !== undefined) {
+				model = request.model;
+			}
+
+			if (request.timestamp !== undefined) {
+				timestamp = request.timestamp;
+			}
 		}
 
-		input += request.usage?.input_tokens ?? 0;
-		output += request.usage?.output_tokens ?? 0;
-		cacheRead += request.usage?.cache_read_input_tokens ?? 0;
-		cacheCreate += request.usage?.cache_creation_input_tokens ?? 0;
-
-		if (request.model !== undefined) {
-			model = request.model;
-		}
-
-		if (request.timestamp !== undefined) {
-			timestamp = request.timestamp;
+		/*
+		Tool Calls are counted apart from the usage dedup: chunks of one request
+		share a `message.id` *and* its usage object, but each chunk carries its own
+		`tool_use` block, so counting only the first would lose the turn's real
+		tool activity.
+		*/
+		for (const call of toolCallBlocksIn(entry)) {
+			toolCalls += 1;
+			const skill = call.name === 'Skill' ? skillName(call.input) : undefined;
+			if (skill !== undefined) {
+				skills.push(skill);
+			}
 		}
 	}
 
-	return {input, output, cacheRead, cacheCreate, model, timestamp};
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheCreate,
+		model,
+		timestamp,
+		toolCalls,
+		skills,
+	};
+}
+
+/*
+An assistant entry that is not harness plumbing: the one kind of entry whose
+usage and Tool Calls both count. A `<synthetic>` message is skipped before
+anything else, so it can neither count nor hijack the turn's model.
+*/
+function isCountableAssistant(entry: Entry | undefined): entry is Entry {
+	return entry?.type === 'assistant' && !entry.message?.model?.startsWith('<');
 }
 
 /*
 The one assistant entry in a turn's range that counts — or `undefined` when it
 does not.
 
-A `<synthetic>` message is harness plumbing with no usage, so it is skipped
-before anything else: it can neither count nor hijack the turn's model. A
-request id already seen means this is another chunk of an API request whose
+A request id already seen means this is another chunk of an API request whose
 usage was counted once already.
 */
 function countableRequest(
@@ -269,14 +309,11 @@ function countableRequest(
 ):
 	| {readonly model?: string; readonly usage?: Usage; readonly timestamp?: Date}
 	| undefined {
-	if (entry?.type !== 'assistant') {
+	if (!isCountableAssistant(entry)) {
 		return undefined;
 	}
 
 	const {message} = entry;
-	if (message?.model?.startsWith('<')) {
-		return undefined;
-	}
 
 	const requestId = message?.id;
 	if (requestId !== undefined) {
@@ -292,6 +329,54 @@ function countableRequest(
 		usage: message?.usage,
 		timestamp: entryInstant(entry),
 	};
+}
+
+/*
+Every `tool_use` block one entry carries, as its tool name and its input.
+
+Counted across all of a turn's assistant entries rather than only the one the
+usage dedup kept: chunks of one request share its `message.id` and usage object,
+but each carries its own content block.
+*/
+function toolCallBlocksIn(
+	entry: Entry | undefined,
+): ReadonlyArray<{name: string; input: unknown}> {
+	if (!isCountableAssistant(entry)) {
+		return [];
+	}
+
+	const content = entry.message?.content;
+	if (!Array.isArray(content)) {
+		return [];
+	}
+
+	const calls: Array<{name: string; input: unknown}> = [];
+	for (const block of content) {
+		if (typeof block !== 'object' || block === null) {
+			continue;
+		}
+
+		const part = block as {type?: unknown; name?: unknown; input?: unknown};
+		if (part.type === 'tool_use' && typeof part.name === 'string') {
+			calls.push({name: part.name, input: part.input});
+		}
+	}
+
+	return calls;
+}
+
+/*
+A `Skill` block's Skill name, from the block's own `input.skill`, or `undefined`
+when the input does not carry one. A Skill invocation with no name still counts
+as a Tool Call; it just contributes nothing to the list.
+*/
+function skillName(input: unknown): string | undefined {
+	if (typeof input !== 'object' || input === null) {
+		return undefined;
+	}
+
+	const {skill} = input as {skill?: unknown};
+	return typeof skill === 'string' ? skill : undefined;
 }
 
 /*

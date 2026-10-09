@@ -47,8 +47,10 @@ stored rather than overwriting it (ADR-0013). The columns are named as the wire 
 Push seam maps a stored row to a document without renaming. The family has its own backlog
 query beside the era one: `usageBacklog()` is `pushed_at IS NULL` ordered by oldest
 `recorded_at` first with the rowid breaking ties, and `markUsagePushed(id, at)` acknowledges
-one. The file is schema version 2; a version-1 store migrates in place, inside the one migrate
-transaction, and `busy_timeout` is set so a hook process and a dashboard run can share it.
+one. The file is schema version 3; a version-1 or version-2 store migrates in place, inside the
+one migrate transaction, and `busy_timeout` is set so a hook process and a dashboard run can
+share it. Version 3 is additive: `tool_calls` and `skills` are two more usage columns, NULL on
+every row that predates them, and NULL is the unknown state — `0` and `[]` are genuinely none.
 
 **Opening the store is the one thing in a run that fails fast** — in `main.tsx`, before the
 preflight and before anything is drawn, because the Local Store is the only write a Flush is
@@ -71,10 +73,12 @@ the in-flight pass out, asking for one more, then counting the store afterwards 
 to do and is stated once, in `push.ts`.
 
 **The Usage Backlog drains through a sibling seam, one-shot rather than interval-driven.**
-`store/usage-push.ts` carries Ingested Usage Records to `ai_usage` in exactly the ten-field
-shape the website already reads — `harness`, `cwd`, `model`, `cost_yuan`, the five token buckets
-and a real BSON `recorded_at`, no TTL and no `createdAt` (spec #53). Each document is keyed by
-`<recorded_at>#<sha256 of the model and the five buckets>` and written through a `replaceOne`
+`store/usage-push.ts` carries Ingested Usage Records to `ai_usage` in exactly the twelve-field
+wire shape — `harness`, `cwd`, `model`, `cost_yuan`, the five token buckets, a real BSON
+`recorded_at`, and `tool_calls` / `skills` (the last two land in the website with the companion
+site change) — no TTL and no `createdAt` (spec #53).
+Each document is keyed by `<recorded_at>#<sha256 of the model and the five buckets>` and written
+through a `replaceOne`
 upsert inside an ordered `bulkWrite` of ~500, so a re-Push converges (ADR-0013) and a
 ~1,800-record first drain is a handful of round trips instead of per-document ones. The drain
 stops at the first failed batch — the tail rule the era drain has — and reuses `PushAttempt`,
