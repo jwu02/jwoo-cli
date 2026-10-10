@@ -203,8 +203,9 @@ export const FIXED_KEY_LABELS: ReadonlyMap<number, string> = new Map(
 Fn chords whose label is not their key's label.
 
 The website gives each of these a Physical Key of its own — 'Forward Delete' sits
-on the Delete key, and Home, Page Up and Page Down on the arrows — which is what
-pynput reported for them and what the Python `_SPECIAL_KEY_LABELS` table listed.
+on the Delete key, and Home, End, Page Up and Page Down on the arrows — which is
+what pynput reported for them and what the Python `_SPECIAL_KEY_LABELS` table
+listed.
 From a raw keycode they are the same key with the SecondaryFn bit set.
 
 F1-F12 are absent, and that is ADR-0006's trap rather than an omission. They set
@@ -215,6 +216,7 @@ bare F1 falls through it to its own fixed label rather than being overlaid.
 const FN_OVERLAYS: ReadonlyMap<number, string> = new Map([
 	[51, 'Forward Delete'],
 	[123, 'Home'],
+	[124, 'End'],
 	[125, 'Page Down'],
 	[126, 'Page Up'],
 ]);

@@ -562,6 +562,7 @@ test('Fn chords record the label of the chord', t => {
 	for (const [keycode, label] of [
 		[KEYS.del, 'Forward Delete'],
 		[KEYS.left, 'Home'],
+		[KEYS.right, 'End'],
 		[KEYS.up, 'Page Up'],
 		[KEYS.down, 'Page Down'],
 	] as const) {

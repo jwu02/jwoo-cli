@@ -139,9 +139,9 @@ test('shift does not change a non-printing key', t => {
 // Fn overlays
 //
 // The website maps these to Physical Keys of their own: 'Forward Delete' on the
-// Delete key, and Home/Page Up/Page Down on the arrows. pynput handed them back
-// as distinct Key members; from a raw keycode they are an overlay read off the
-// SecondaryFn bit.
+// Delete key, and Home/End/Page Up/Page Down on the arrows. pynput handed them
+// back as distinct Key members; from a raw keycode they are an overlay read off
+// the SecondaryFn bit.
 // ---------------------------------------------------------------------------
 
 test('Fn turns Delete into Forward Delete', t => {
@@ -149,13 +149,15 @@ test('Fn turns Delete into Forward Delete', t => {
 	t.is(label(51, BARE | SECONDARY_FN), 'Forward Delete');
 });
 
-test('Fn turns the vertical arrows into their navigation labels', t => {
+test('Fn turns the arrows into their navigation labels', t => {
 	t.is(label(126), 'Up Arrow');
 	t.is(label(126, BARE | SECONDARY_FN), 'Page Up');
 	t.is(label(125), 'Down Arrow');
 	t.is(label(125, BARE | SECONDARY_FN), 'Page Down');
 	t.is(label(123), 'Left Arrow');
 	t.is(label(123, BARE | SECONDARY_FN), 'Home');
+	t.is(label(124), 'Right Arrow');
+	t.is(label(124, BARE | SECONDARY_FN), 'End');
 });
 
 /*
