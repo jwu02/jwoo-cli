@@ -12,10 +12,11 @@ message cannot leak into the parent's.
 It owns exactly two things, and the guard is one of them. `message_end` fires
 for user, assistant and tool-result messages, so the guard is `role ===
 "assistant"` with a usage object present. That is pi's closest analogue of
-OpenCode's `message.updated` + `time.completed`; the zero-token skip is the
-command's, because the command is the one that knows what a billable bucket is.
-The user-message branch is the second: it records the turn's Skill list, which
-the assistant message it precedes cannot carry itself.
+OpenCode's `message.updated` + `time.completed`. The user-message branch is the
+second: it records the turn's Skill list, which the assistant message it
+precedes cannot carry itself, and hands that list over once — on the turn's
+first message the command will store, which is why `willBeStored` repeats the
+projection's own two rules rather than leaving the whole skip to the command.
 
 TypeScript rather than plain JS, because pi loads extensions through jiti and
 does not need a build step. The type import is type-only and erased at load, so
@@ -37,13 +38,19 @@ import {join} from 'node:path';
 import type {ExtensionAPI} from '@earendil-works/pi-coding-agent';
 
 /*
-The turn's Skill list, per session id. Pi injects a loaded Skill into the user
-message as a `<skill name="…" location="…">` tag, so the tag is where the
-turn's Skill Invocations are; the assistant message that follows carries none.
-Keyed by session because a subagent runs its own session and its user message
-must not become the parent's Skill list.
+The turn's Skill list, per session id, and whether the turn's first billable
+message has taken it. Pi injects a loaded Skill into the user message as a
+`<skill name="…" location="…">` tag, so the tag is where the turn's Skill
+Invocations are; the assistant message that follows carries none, so the list is
+reported once for the turn and never again (usage-pi.ts's walk claims it the
+same way, and the two must agree or one load lands on two records). Keyed by
+session because a subagent runs its own session and its user message must not
+become the parent's Skill list.
 */
-const pendingSkills = new Map<string, string[]>();
+const pendingSkills = new Map<
+	string,
+	{skills: string[]; claimed: boolean}
+>();
 
 const SKILL_TAG = /<skill name="([^"]+)"/g;
 
@@ -85,10 +92,10 @@ export default function (pi: ExtensionAPI) {
 			previous one's Skills.
 			*/
 			if (message?.role === 'user') {
-				pendingSkills.set(
-					ctx.sessionManager.getSessionId(),
-					skillNamesIn(message.content),
-				);
+				pendingSkills.set(ctx.sessionManager.getSessionId(), {
+					skills: skillNamesIn(message.content),
+					claimed: false,
+				});
 				return;
 			}
 
@@ -96,7 +103,30 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const skills = pendingSkills.get(ctx.sessionManager.getSessionId());
+			const sessionId = ctx.sessionManager.getSessionId();
+			const turn = pendingSkills.get(sessionId);
+
+			/*
+			The list is handed over once, on the turn's first message the CLI will
+			actually store; every later message of the turn reports `[]` (none),
+			because one tag is one load and pi writes one record per message. A
+			message the command refuses — no bucket to bill, or no instant to place
+			it at — must not claim the list, or the turn's loads are lost: no later
+			record restates them.
+
+			A turn whose user message was never observed — a session pi resumed with
+			the Shim loading after it — reports nothing at all, which is unknown
+			rather than none.
+			*/
+			let skills: readonly string[] | undefined;
+			if (turn !== undefined) {
+				if (turn.claimed || !willBeStored(message)) {
+					skills = [];
+				} else {
+					skills = turn.skills;
+					turn.claimed = true;
+				}
+			}
 
 			const child = spawn(
 				NODE,
@@ -178,4 +208,25 @@ function textsIn(content: unknown): string[] {
 	}
 
 	return texts;
+}
+
+/*
+Whether the CLI will store this message — the two rules `projectPiMessage`
+applies (usage-pi.ts): a numeric instant, and at least one of the five buckets
+that is a non-zero number. A message that fails either is thrown on or skipped
+there, so nothing is stored and the turn's Skill list must not be claimed by it.
+Repeated here by hand because the Shim runs inside pi's process and the CLI is a
+separate one; the pair is a pair, and editing one without the other loses loads.
+shortcut: the rule is copied, not imported — the Shim cannot load the CLI's
+build — upgrade when a third caller needs it.
+*/
+function willBeStored(message: {timestamp?: unknown; usage?: unknown}): boolean {
+	if (typeof message.timestamp !== 'number') {
+		return false;
+	}
+
+	const usage = (message.usage ?? {}) as Record<string, unknown>;
+	return ['input', 'output', 'cacheRead', 'cacheWrite', 'cacheWrite1h'].some(
+		bucket => typeof usage[bucket] === 'number' && usage[bucket] !== 0,
+	);
 }

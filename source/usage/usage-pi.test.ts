@@ -439,11 +439,13 @@ test('--since pre-skips by mtime and filters each record', t => {
 });
 
 /*
-A user message's Skill tag is the turn's, so every assistant message that turn
-produces carries it — several messages included — until the next user message
-starts a turn of its own, tagless and so skill-free.
+A user message's Skill tag is one load, and a turn produces one record per
+assistant message — so the list rides the turn's first one. Copying it onto
+every message counts one load once per request, which is what made the
+dashboard's Skill Invocations read 27× high. The next user message starts a turn
+of its own, tagless, and stays skill-free.
 */
-test('a Skill tag is attributed to every assistant message of its turn', t => {
+test('a Skill tag is attributed to the first assistant message of its turn', t => {
 	const root = sessionsTree(t, {
 		'session.jsonl': [
 			header(),
@@ -470,8 +472,8 @@ test('a Skill tag is attributed to every assistant message of its turn', t => {
 	t.deepEqual(scan.candidates[0]?.skills, ['commit'], 'the tag opens the turn');
 	t.deepEqual(
 		scan.candidates[1]?.skills,
-		['commit'],
-		'it spans a second message',
+		[],
+		'the second message of the turn carries none',
 	);
 	t.deepEqual(scan.candidates[2]?.skills, [], 'the next turn is tagless');
 });
@@ -493,7 +495,8 @@ test('a session with no Skill tag yields an empty list, not unknown', t => {
 
 /*
 Multiple Skill tags on one user message are kept in order, repeats included —
-the list is the record of what was invoked, not a set.
+the list is the record of what was invoked, not a set — and the whole list rides
+the turn's first message, not each of them.
 */
 test('every Skill tag on a user message is kept, in order', t => {
 	const root = sessionsTree(t, {
@@ -504,12 +507,49 @@ test('every Skill tag on a user message is kept, in order', t => {
 				'<skill name="commit" location="…"><skill name="review" location="…"><skill name="commit" location="…">',
 			),
 			messageEntry('m1'),
+			messageEntry('m2'),
 		],
 	});
 
 	const scan = readPiSessions(root);
 
 	t.deepEqual(scan.candidates[0]?.skills, ['commit', 'review', 'commit']);
+	t.deepEqual(
+		scan.candidates[1]?.skills,
+		[],
+		'the second message carries none',
+	);
+});
+
+/*
+The claim is structural, not window-dependent. A turn whose first record falls
+before `--since` gives the load up rather than handing it to a later message,
+because the carrier has to be the record a full Backfill would have chosen:
+otherwise one load would sit on two records, and the drop rule compares records
+rather than loads, so both would be stored.
+*/
+test('--since does not move a Skill list to a later message of the turn', t => {
+	const root = sessionsTree(t, {
+		'session.jsonl': [
+			header(),
+			userEntry(
+				'u1',
+				'<skill name="commit" location="/skills/commit/SKILL.md">do it</skill>',
+			),
+			messageEntry('m1', {timestamp: 1_755_500_000_000}),
+			messageEntry('m2', {timestamp: 1_755_500_100_000}),
+		],
+	});
+
+	const scan = readPiSessions(root, {since: new Date(1_755_500_050_000)});
+
+	t.is(scan.candidates.length, 1, 'only the in-window message is a candidate');
+	t.is(scan.candidates[0]?.recordedAt.getTime(), 1_755_500_100_000);
+	t.deepEqual(
+		scan.candidates[0]?.skills,
+		[],
+		'the load rode the out-of-window first message',
+	);
 });
 
 /*

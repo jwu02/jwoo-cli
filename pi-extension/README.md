@@ -8,6 +8,14 @@ session and held for the turn, and an assistant message carrying usage spawns
 `jwoo-cli usage record-pi` with the message, the context's `cwd` and that Skill
 list on stdin. It owns the guard, the Skill scan and the spawn, nothing else.
 
+The Skill list is delivered **once per turn**: the turn's first message that
+carries billable usage reports the list, and every later message of the turn
+reports `[]`. One tag is one load — one Skill Invocation — and pi writes one
+record per assistant message, so repeating the list would count a single load
+once per request. `usage-pi.ts`'s session walk claims the turn's list the same
+way, and the two have to agree: the store's drop rule compares records, so a
+load recorded against two messages would be stored twice.
+
 Pi discovers personal extensions in `~/.pi/agent/extensions/`, so installing it
 is a symlink — the file stays in this repo and is picked up on pi's next start:
 

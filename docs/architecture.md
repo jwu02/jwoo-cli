@@ -223,9 +223,12 @@ completion` rather than trusted; and `reasoning` is not read, because pi bills t
 `output`. It also counts the message's `toolCall` blocks as the record's Tool Calls, while the
 Skill list is not in the message at all: pi injects a loaded Skill into the _user_ message as a
 `<skill name=…>` tag, so the session walk derives the turn's list from its user messages and the
-live payload carries the list the Shim observed. The projection is pure, takes that list as an
-argument, and throws on a usage-bearing message with no instant, so the live command will report
-it and the session walk skips a message it cannot place.
+live payload carries the list the Shim observed. One tag is one load and a turn is one record per
+assistant message, so the list rides the turn's **first** candidate — claimed before the `--since`
+window is applied, so a windowed Backfill attributes a load to the same record a full one does.
+The projection is pure, takes that list as an argument, and throws on a usage-bearing message with
+no instant, so the live command will report it and the session walk skips a message it cannot
+place.
 
 **The Shim is the live half of that wiring, and it lives outside the gate.**
 `opencode-plugin/jwoo.js` is plain JS — no `@opencode-ai/plugin` import, because the installed
@@ -245,12 +248,14 @@ command it spawns. Like `helper/eventtap.swift`, it is excluded from the gate (`
 `pi-extension/jwoo.ts` is a personal pi extension — TypeScript, loaded through pi's `jiti` with no
 build step — observing `message_end` with the `assistant` + usage guard
 (`pi-extension/README.md` has the symlink install into `~/.pi/agent/extensions/`). The guard is
-there because `message_end` fires for user, assistant and tool-result messages; the zero-token
-skip stays the command's. It also reads the user messages the guard skips: a `<skill name=…>` tag
-in one is scanned into a pending list keyed by session id, so the assistant message that follows
-carries the turn's Skills and a subagent's user message cannot leak into the parent's. The list
-rides the same stdin document as the message, and a payload from a Shim that predates it still
-Ingests with Skills unknown. It registers handlers only — no process in the factory, because some
+there because `message_end` fires for user, assistant and tool-result messages. It also reads the
+user messages the guard skips: a `<skill name=…>` tag in one is scanned into a pending list keyed
+by session id, so a subagent's user message cannot leak into the parent's. That list is handed
+over once, on the turn's first message the command will store: the Shim repeats the projection's
+own two rules — a numeric instant and at least one non-zero bucket — rather than leaving the whole
+skip to the command, because a list claimed by a message the command drops is a load no later
+record restates. The list rides the same stdin document as the message, and a payload from a Shim
+that predates it still Ingests with Skills unknown. It registers handlers only — no process in the factory, because some
 invocations load extensions without starting a session — returns nothing from the handler, so it
 can never request a continuation from a boundary event, and its one un-awaited spawn rides the
 same pinned node, absolute build and `--env-file-if-exists` line. Gate-external for the same

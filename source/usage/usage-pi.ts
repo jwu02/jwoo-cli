@@ -32,7 +32,8 @@ Tool Calls are the message's `toolCall` content blocks, counted here because
 they are in the message. Skill Invocations are not: pi injects a loaded Skill
 into the *user* message as a `<skill name=…>` tag, so the walk derives the
 turn's list and the Shim hands its own list in — both as `skills` input, the
-one derivation point the two paths share.
+one derivation point the two paths share — and both hang that list on the turn's
+first billable message, so one load counts once rather than once per request.
 */
 
 import {readFileSync, readdirSync, statSync} from 'node:fs';
@@ -201,7 +202,8 @@ export type PiScanOptions = {
 	/*
 	Only messages at or after this instant, compared on each candidate's own
 	`recorded_at`. A file whose mtime is older than the bound cannot hold one and
-	is skipped before it is read.
+	is skipped before it is read. The turn's Skill list is claimed before this
+	filter, so a windowed scan puts it on the record a full one would.
 	*/
 	readonly since?: Date;
 };
@@ -250,10 +252,15 @@ export function readPiSessions(
 
 /*
 Every candidate one session's entries produce, in order. A user message opens a
-turn and carries its Skill tags; every assistant message until the next user
-message belongs to that turn, so the list is threaded through the walk rather
-than re-derived per message. A session with no tag anywhere yields `[]` (none),
-because the walk read it.
+turn and carries its Skill tags; the list rides the turn's **first** record and
+no other, because one tag is one load and pi's records are one per assistant
+message — carrying it on each would count a single load once per request. The
+claim is taken on the first candidate the turn produces whatever `since` says,
+so a windowed Backfill attributes a load to the same record a full one does; a
+window-dependent carrier would let one load land on two records, and the drop
+rule compares records rather than loads.
+
+A session with no tag anywhere yields `[]` (none), because the walk read it.
 */
 function candidatesFromSession(
 	session: PiSession,
@@ -261,6 +268,7 @@ function candidatesFromSession(
 ): PiCandidate[] {
 	const candidates: PiCandidate[] = [];
 	let skills: string[] = [];
+	let hasClaimed = false;
 
 	for (const entry of session.entries) {
 		const {message} = entry;
@@ -270,13 +278,29 @@ function candidatesFromSession(
 			message['role'] === 'user'
 		) {
 			skills = skillNamesIn(message);
+			hasClaimed = false;
 			continue;
 		}
 
-		const candidate = candidateFrom(entry, session.cwd, since, skills);
-		if (candidate !== undefined) {
-			candidates.push(candidate);
+		const candidate = candidateFrom(
+			entry,
+			session.cwd,
+			hasClaimed ? [] : skills,
+		);
+		if (candidate === undefined) {
+			continue;
 		}
+
+		hasClaimed = true;
+
+		if (
+			since !== undefined &&
+			candidate.recordedAt.getTime() < since.getTime()
+		) {
+			continue;
+		}
+
+		candidates.push(candidate);
 	}
 
 	return candidates;
@@ -292,7 +316,6 @@ its own bad payload.)
 function candidateFrom(
 	entry: Record<string, unknown>,
 	cwd: string | undefined,
-	since: Date | undefined,
 	skills: readonly string[],
 ): PiCandidate | undefined {
 	const {message} = entry;
@@ -308,13 +331,6 @@ function candidateFrom(
 	try {
 		candidate = projectPiMessage(message, cwd, skills);
 	} catch {
-		return undefined;
-	}
-
-	if (
-		candidate === undefined ||
-		(since !== undefined && candidate.recordedAt.getTime() < since.getTime())
-	) {
 		return undefined;
 	}
 
